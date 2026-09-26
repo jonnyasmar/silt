@@ -547,7 +547,17 @@ static void *worker_main(void *arg) {
 
 // MARK: Public API
 
+static silt_scanner *scanner_create(silt_tree *t, int threads, bool scan_root);
+
 silt_scanner *silt_scanner_start(silt_tree *t, int threads) {
+  return scanner_create(t, threads, true);
+}
+
+silt_scanner *silt_scanner_start_idle(silt_tree *t, int threads) {
+  return scanner_create(t, threads, false);
+}
+
+static silt_scanner *scanner_create(silt_tree *t, int threads, bool scan_root) {
   // Never pull iCloud placeholders down just because we looked at them.
   setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS,
                  IOPOL_MATERIALIZE_DATALESS_FILES_OFF);
@@ -562,12 +572,16 @@ silt_scanner *silt_scanner_start(silt_tree *t, int threads) {
   s->threads = calloc((size_t)s->nthreads, sizeof *s->threads);
   if (!s->threads) abort();
 
-  char path[4096];
-  silt_tree_lock(t);
-  silt_path(t, 0, path, sizeof path);
-  silt_tree_unlock(t);
   s->scan_start = now_ns();
-  enqueue_locked(s, (work){.path = strdup(path), .dir = 0, .deep = false});
+  if (scan_root) {
+    char path[4096];
+    silt_tree_lock(t);
+    silt_path(t, 0, path, sizeof path);
+    silt_tree_unlock(t);
+    enqueue_locked(s, (work){.path = strdup(path), .dir = 0, .deep = false});
+  } else {
+    s->scan_end = s->scan_start;
+  }
 
   pthread_attr_t attr;
   pthread_attr_init(&attr);

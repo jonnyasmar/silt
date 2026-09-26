@@ -202,3 +202,54 @@ final class Fixture {
     }
     #expect(found == 2) // nested matches are not descended into
 }
+
+@Test func snapshotRoundTripCompactsAndStaysRefreshable() throws {
+    let f = try Fixture(["a/one.bin": 100_000, "a/deep/two.bin": 50_000, "b/gone/x.bin": 300_000, "c.txt": 10])
+    // Churn the tree first so the snapshot has garbage to drop.
+    try Fixture.write(f.root.appendingPathComponent("a/new.bin"), size: 20_000)
+    f.refresh("a")
+    silt_tree_lock(f.tree)
+    let gone = silt_lookup(f.tree, f.root.appendingPathComponent("b/gone").path)
+    silt_tree_unlock(f.tree)
+    silt_tree_remove(f.tree, gone)
+    let before = f.size("")
+
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("silt-\(UUID().uuidString).snap").path
+    defer { unlink(file) }
+    var meta = silt_snapshot_meta()
+    meta.event_id = 12345
+    meta.flags = 1
+    #expect(silt_tree_save(f.tree, file, &meta))
+
+    var loadedMeta = silt_snapshot_meta()
+    let t = try #require(silt_tree_load(file, &loadedMeta))
+    defer { silt_tree_destroy(t) }
+    #expect(loadedMeta.event_id == 12345 && loadedMeta.flags == 1)
+    silt_tree_lock(t)
+    #expect(silt_entry_at(t, 0).pointee.size == before)
+    #expect(t.pointee.entry_count < f.tree.pointee.entry_count) // garbage dropped
+    #expect(silt_lookup(t, f.root.appendingPathComponent("b/gone").path) == 0xFFFF_FFFF)
+    let deep = silt_lookup(t, f.root.appendingPathComponent("a/deep/two.bin").path)
+    #expect(deep != 0xFFFF_FFFF && silt_is_live(t, deep))
+    let a = silt_entry_at(t, silt_lookup(t, f.root.appendingPathComponent("a").path)).pointee
+    silt_tree_unlock(t)
+
+    // A restored tree takes refreshes like a scanned one.
+    try Fixture.write(f.root.appendingPathComponent("a/later.bin"), size: 400_000)
+    let s = silt_scanner_start_idle(t, 2)!
+    silt_scanner_refresh(s, a.aux, false)
+    silt_scanner_wait_idle(s)
+    silt_tree_lock(t)
+    let aAfter = silt_entry_at(t, silt_lookup(t, f.root.appendingPathComponent("a").path)).pointee
+    #expect(aAfter.size == f.expected("a"))
+    #expect(silt_dir_at(t, 0).pointee.pending == 0)
+    silt_tree_unlock(t)
+    silt_scanner_destroy(s)
+}
+
+@Test func damagedSnapshotIsRejected() throws {
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("silt-bad.snap").path
+    defer { unlink(file) }
+    try Data("not a snapshot at all".utf8).write(to: URL(fileURLWithPath: file))
+    #expect(silt_tree_load(file, nil) == nil)
+}

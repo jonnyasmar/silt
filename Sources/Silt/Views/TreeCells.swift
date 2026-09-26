@@ -4,7 +4,12 @@ import SiltCore
 /// Everything a row displays that can change while it is on screen.
 struct RowValues {
     var size: Int64 = 0
+    /// What the percentage is "of".
     var parentSize: Int64 = 0
+    /// What the bar is scaled to (the parent, or a list's largest row).
+    var barBase: Int64 = 0
+    /// Rows standing for several identical files.
+    var copies = 0
     var items: Int = 0
     var modified: UInt32 = 0
     var flags: UInt8 = 0
@@ -13,6 +18,7 @@ struct RowValues {
     var hasItems = false
 
     var share: Double { parentSize > 0 ? min(1, max(0, Double(size) / Double(parentSize))) : 0 }
+    var bar: Double { barBase > 0 ? min(1, max(0, Double(size) / Double(barBase))) : 0 }
 }
 
 protocol ValueCell: AnyObject {
@@ -56,7 +62,7 @@ final class NameCell: NSTableCellView, ValueCell {
     private let icon = NSImageView()
     private let label = NSTextField(labelWithString: "")
     private let badge = NSTextField(labelWithString: "")
-    private let revealButton = NameCell.makeButton("magnifyingglass", tip: "Show in Finder")
+    private let revealButton = NameCell.makeButton("arrow.up.right.square", tip: "Show in Finder")
     private let trashButton = NameCell.makeButton("trash", tip: "Move to Trash")
     private var hovered = false
     private weak var node: Node?
@@ -70,7 +76,7 @@ final class NameCell: NSTableCellView, ValueCell {
         label.lineBreakMode = .byTruncatingMiddle
         label.font = .systemFont(ofSize: 13)
         label.cell?.truncatesLastVisibleLine = true
-        badge.font = .systemFont(ofSize: 11, weight: .medium)
+        badge.font = .systemFont(ofSize: 11)
         badge.textColor = .secondaryLabelColor
         badge.isHidden = true
         for v in [icon, label, badge, revealButton, trashButton] as [NSView] { addSubview(v) }
@@ -110,7 +116,8 @@ final class NameCell: NSTableCellView, ValueCell {
     func apply(_ values: RowValues, node: Node) {
         let f = values.flags
         let hidden = f & UInt8(SILT_FLAG_HIDDEN) != 0
-        label.textColor = node.isReal ? (hidden ? .secondaryLabelColor : .labelColor) : .secondaryLabelColor
+        let primary = node.isReal || node.kind == .group
+        label.textColor = primary ? (hidden ? .secondaryLabelColor : .labelColor) : .secondaryLabelColor
         let text: String?
         var color = NSColor.secondaryLabelColor
         if f & UInt8(SILT_FLAG_DENIED) != 0 {
@@ -122,6 +129,8 @@ final class NameCell: NSTableCellView, ValueCell {
             text = "In iCloud"
         } else if f & UInt8(SILT_FLAG_HARDLINK) != 0 {
             text = "Hard link"
+        } else if values.copies > 1 {
+            text = "\(values.copies) copies"
         } else {
             text = nil
         }
@@ -171,12 +180,12 @@ final class NameCell: NSTableCellView, ValueCell {
 final class ShareCell: NSTableCellView, ValueCell {
     static let id = NSUserInterfaceItemIdentifier("share")
 
-    private var fraction: Double = 0
+    private var fraction: Double = .nan // forces the first apply to draw
+    private var bar: Double = 0
     private var color: NSColor = Brand.ochre
     private var growing = false
-    private var visible = true
     private static let percentAttrs: [NSAttributedString.Key: Any] = [
-        .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+        .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular),
         .foregroundColor: NSColor.secondaryLabelColor,
     ]
 
@@ -191,12 +200,15 @@ final class ShareCell: NSTableCellView, ValueCell {
         let c: NSColor
         switch node.kind {
         case .dir: c = Brand.ochre
-        case .file: c = FileCategory.of(name: node.nameForColor).nsColor
+        case .file, .group: c = FileCategory.of(name: node.nameForColor).nsColor
         case .more, .unseen, .list: c = .tertiaryLabelColor
         }
         let f = values.share
-        if abs(f - fraction) < 0.0005 && c == color && values.growing == growing { return }
+        if abs(f - fraction) < 0.0005 && abs(values.bar - bar) < 0.0005 && c == color && values.growing == growing {
+            return
+        }
         fraction = f
+        bar = values.bar
         color = c
         growing = values.growing
         needsDisplay = true
@@ -211,13 +223,36 @@ final class ShareCell: NSTableCellView, ValueCell {
         let track = NSBezierPath(roundedRect: NSRect(x: barX, y: y, width: barW, height: barH), xRadius: 3, yRadius: 3)
         NSColor.labelColor.withAlphaComponent(0.07).setFill()
         track.fill()
-        if fraction > 0 {
-            let w = max(barH, barW * CGFloat(fraction))
-            let fill = NSBezierPath(roundedRect: NSRect(x: barX, y: y, width: w, height: barH), xRadius: 3, yRadius: 3)
-            color.withAlphaComponent(growing ? 0.5 : 0.9).setFill()
-            fill.fill()
+        if bar > 0 {
+            let w = max(barH, barW * CGFloat(bar))
+            let rect = NSRect(x: barX, y: y, width: w, height: barH)
+            let fill = NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3)
+            if growing {
+                // Still being scanned: a hatched bar, like an indeterminate
+                // progress fill.
+                color.withAlphaComponent(0.35).setFill()
+                fill.fill()
+                NSGraphicsContext.saveGraphicsState()
+                fill.addClip()
+                color.withAlphaComponent(0.9).setFill()
+                var x = rect.minX - barH
+                while x < rect.maxX {
+                    let stripe = NSBezierPath()
+                    stripe.move(to: NSPoint(x: x, y: rect.minY))
+                    stripe.line(to: NSPoint(x: x + 2.5, y: rect.minY))
+                    stripe.line(to: NSPoint(x: x + 2.5 + barH, y: rect.maxY))
+                    stripe.line(to: NSPoint(x: x + barH, y: rect.maxY))
+                    stripe.close()
+                    stripe.fill()
+                    x += 5
+                }
+                NSGraphicsContext.restoreGraphicsState()
+            } else {
+                color.withAlphaComponent(0.9).setFill()
+                fill.fill()
+            }
         }
-        let text = Fmt.percent(fraction) as NSString
+        let text = Fmt.percent(fraction.isNaN ? 0 : fraction) as NSString
         let size = text.size(withAttributes: Self.percentAttrs)
         text.draw(at: NSPoint(x: bounds.width - size.width - 2, y: (bounds.height - size.height) / 2),
                   withAttributes: Self.percentAttrs)
@@ -238,10 +273,10 @@ final class TextCell: NSTableCellView, ValueCell {
         self.identifier = identifier
         switch column {
         case .size:
-            label.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .medium)
+            label.font = .monospacedDigitSystemFont(ofSize: 13, weight: .medium)
             label.alignment = .right
         case .items, .modified:
-            label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            label.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
             label.alignment = .right
             label.textColor = .secondaryLabelColor
         case .location:
@@ -269,7 +304,7 @@ final class TextCell: NSTableCellView, ValueCell {
         case .items:
             text = v.hasItems ? Fmt.count(v.items) : ""
         case .modified:
-            text = node.isReal ? Fmt.age(v.modified) : ""
+            text = node.isReal || node.kind == .group ? Fmt.age(v.modified) : ""
         case .location:
             return
         }

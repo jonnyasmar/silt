@@ -9,28 +9,12 @@ struct ReclaimView: View {
     @State private var expanded: Set<String> = []
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                header
-                if analyzing && findings.isEmpty {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text(session.phase == .scanning ? "Waiting for the scan to finish…" : "Looking for space to reclaim…")
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.top, 12)
-                } else if findings.isEmpty {
-                    Text("Nothing obvious to clean up here. Try the Largest Files view.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    group("Safe to clear", subtitle: "Caches and build output that rebuild themselves", .safe)
-                    group("Worth a look", subtitle: "Probably unneeded, but only you can say", .review)
-                }
+        VStack(spacing: 0) {
+            header
+            Divider()
+            ScrollView {
+                list
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 20)
-            .frame(maxWidth: 860, alignment: .leading)
-            .frame(maxWidth: .infinity)
         }
         .task(id: analysisKey) {
             guard session.phase == .live else { return }
@@ -48,6 +32,29 @@ struct ReclaimView: View {
         }
     }
 
+    private var list: some View {
+            VStack(alignment: .leading, spacing: 22) {
+                if analyzing && findings.isEmpty {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(session.phase == .scanning ? "Waiting for the scan to finish…" : "Looking for space to reclaim…")
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.top, 12)
+                } else if findings.isEmpty {
+                    Text("Nothing obvious to clean up here. Try the Largest Files view.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    group("Safe to clear", subtitle: "Caches and build output that rebuild themselves", .safe)
+                    group("Worth a look", subtitle: "Probably unneeded, but only you can say", .review)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 18)
+            .frame(maxWidth: 860, alignment: .leading)
+            .frame(maxWidth: .infinity)
+    }
+
     private var analysisKey: String {
         "\(session.focus)-\(session.phase == .live)-\(session.version / 3)"
     }
@@ -55,22 +62,19 @@ struct ReclaimView: View {
     private var header: some View {
         let safe = findings.filter { $0.safety == .safe }.reduce(Int64(0)) { $0 + $1.bytes }
         let review = findings.filter { $0.safety == .review }.reduce(Int64(0)) { $0 + $1.bytes }
-        return VStack(alignment: .leading, spacing: 10) {
-            Text("Reclaim")
-                .font(.system(size: 24, weight: .bold, design: .rounded))
+        let place = session.focus == 0 ? session.title : "this folder"
+        return PaneHeader(
+            title: "Reclaim",
+            subtitle: safe + review > 0
+                ? "Up to \(Fmt.bytes(safe + review)) you could get back in \(place)"
+                : "Caches, build output, installers, and forgotten large files",
+            busy: analyzing && session.phase == .live
+        ) {
             if safe + review > 0 {
-                (Text("Silt found up to ") + Text(Fmt.bytes(safe + review)).fontWeight(.semibold).foregroundColor(.primary)
-                    + Text(" you could get back in \(session.focus == 0 ? session.title : "this folder")."))
-                    .font(.system(size: 13.5))
-                    .foregroundStyle(.secondary)
-                HStack(spacing: 10) {
-                    Chip(color: .green, title: "Safe to clear", value: Fmt.bytes(safe))
-                    Chip(color: .orange, title: "Worth a look", value: Fmt.bytes(review))
+                HStack(spacing: 8) {
+                    Chip(color: .green, title: "Safe", value: Fmt.bytes(safe))
+                    Chip(color: .orange, title: "Review", value: Fmt.bytes(review))
                 }
-            } else {
-                Text("Known caches, build output, installers, and forgotten large files, found from the scan.")
-                    .font(.system(size: 13.5))
-                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -81,7 +85,7 @@ struct ReclaimView: View {
         if !items.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(title).font(.system(size: 15, weight: .semibold))
+                    Text(title).font(.system(size: 13, weight: .semibold))
                     Text(subtitle).font(.system(size: 12)).foregroundStyle(.secondary)
                 }
                 VStack(spacing: 8) {
@@ -111,9 +115,9 @@ private struct Chip: View {
             Text(title).foregroundStyle(.secondary)
             Text(value).fontWeight(.semibold).monospacedDigit()
         }
-        .font(.system(size: 12))
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
+.font(.system(size: 12))
+        .padding(.horizontal, 9)
+        .padding(.vertical, 3)
         .background(color.opacity(0.1), in: Capsule())
     }
 }
@@ -136,7 +140,7 @@ private struct FindingCard: View {
                     .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        Text(finding.title).font(.system(size: 13.5, weight: .semibold))
+                        Text(finding.title).font(.system(size: 13, weight: .semibold))
                         if finding.entries.count > 1 || finding.isTrash {
                             Text(countLabel)
                                 .font(.system(size: 11))
@@ -150,7 +154,7 @@ private struct FindingCard: View {
                 }
                 Spacer(minLength: 12)
                 Text(Fmt.bytes(finding.bytes))
-                    .font(.system(size: 15, weight: .semibold, design: .rounded).monospacedDigit())
+                    .font(.system(size: 15, weight: .semibold).monospacedDigit())
                 actions
                 Image(systemName: "chevron.right")
                     .font(.system(size: 11, weight: .semibold))
@@ -187,7 +191,7 @@ private struct FindingCard: View {
                 Button {
                     session.reveal(Array(refs.prefix(20)))
                 } label: {
-                    Image(systemName: "magnifyingglass")
+                    Image(systemName: "arrow.up.right.square")
                 }
                 .help("Show in Finder")
                 .controlSize(.small)
@@ -203,7 +207,6 @@ private struct FindingCard: View {
             }
         }
         .buttonStyle(.bordered)
-        .opacity(hovering || expanded ? 1 : 0.55)
     }
 
     private var refs: [ItemRef] {
@@ -273,7 +276,7 @@ private struct Members: View {
             }
             if entries.count > rows.count {
                 Text("and \(Fmt.count(entries.count - rows.count)) more")
-                    .font(.system(size: 11.5))
+                    .font(.system(size: 12))
                     .foregroundStyle(.tertiary)
                     .padding(.vertical, 6)
             }
@@ -313,16 +316,16 @@ private struct MemberRow: View {
                 .foregroundStyle(isDir ? Brand.color : FileCategory.of(name: name).color)
                 .frame(width: 16)
             Text(name)
-                .font(.system(size: 12.5))
+                .font(.system(size: 13))
                 .lineLimit(1)
             Text(location)
-                .font(.system(size: 11.5))
+                .font(.system(size: 12))
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
                 .truncationMode(.head)
             Spacer(minLength: 8)
             if hovering {
-                Button { session.reveal([ref]) } label: { Image(systemName: "magnifyingglass") }
+                Button { session.reveal([ref]) } label: { Image(systemName: "arrow.up.right.square") }
                     .buttonStyle(.borderless)
                     .help("Show in Finder")
                 Button { session.moveToTrash([ref]) } label: { Image(systemName: "trash") }

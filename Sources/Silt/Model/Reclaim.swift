@@ -193,7 +193,7 @@ enum Reclaim {
         let modelBytes = sizes(models)
         if modelBytes > 200_000_000 {
             findings.append(Finding(id: "models", title: "Model weights",
-                                    detail: "Local AI model files scattered around your disk.",
+                                    detail: "Local AI model files found in this scan.",
                                     symbol: "brain", safety: .review, entries: models, bytes: modelBytes))
         }
 

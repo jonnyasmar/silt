@@ -7,7 +7,7 @@ struct RootView: View {
     var body: some View {
         NavigationSplitView {
             Sidebar(model: model)
-                .navigationSplitViewColumnWidth(min: 210, ideal: 236, max: 320)
+                .navigationSplitViewColumnWidth(min: 200, ideal: 236, max: 300)
         } detail: {
             Detail(model: model)
                 .inspector(isPresented: inspectorBinding) {
@@ -18,9 +18,9 @@ struct RootView: View {
                 }
         }
         .navigationTitle(model.current?.title ?? "Silt")
-        .navigationSubtitle(subtitle)
+        .navigationSubtitle(model.current?.phase == .scanning ? "Scanning…" : "")
         .toolbar { toolbar }
-        .searchable(text: $model.search, placement: .toolbar, prompt: "Search names")
+        .modifier(SearchWhenScanned(model: model))
         .focusedSceneValue(\.windowModel, model)
         .background(WindowAccessor { model.window = $0 })
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
@@ -39,50 +39,65 @@ struct RootView: View {
         Binding(get: { model.showInspector && model.current != nil }, set: { model.showInspector = $0 })
     }
 
-    private var subtitle: String {
-        guard let s = model.current else { return "" }
-        switch s.phase {
-        case .scanning: return "Scanning…"
-        case .live: return "\(Fmt.bytes(s.stats.bytes)) · \(Fmt.compactCount(s.stats.items)) items"
+    @ToolbarContentBuilder
+    private var toolbar: some ToolbarContent {
+        if model.current != nil {
+            ToolbarItem(placement: .navigation) {
+                Button {
+                    model.perform(.up)
+                } label: {
+                    Label("Enclosing Folder", systemImage: "chevron.up")
+                }
+                .help("Enclosing folder (⌘↑)")
+                .disabled(model.current?.focus == 0 || model.pane != .files)
+            }
+            ToolbarItem(placement: .principal) {
+                Picker("View", selection: paneBinding) {
+                    ForEach(Pane.allCases) { Text($0.shortTitle).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .help("Files ⌘1 · Largest ⌘2 · Reclaim ⌘3 · Types ⌘4")
+            }
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button {
+                    model.rescan()
+                } label: {
+                    Label("Rescan", systemImage: "arrow.clockwise")
+                }
+                .help("Rescan (⇧⌘R)")
+                Button {
+                    model.showInspector.toggle()
+                } label: {
+                    Label("Inspector", systemImage: "sidebar.trailing")
+                }
+                .help("Show or hide the inspector")
+            }
         }
     }
 
-    @ToolbarContentBuilder
-    private var toolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .navigation) {
-            Button {
-                model.perform(.up)
-            } label: {
-                Label("Enclosing Folder", systemImage: "chevron.up")
-            }
-            .help("Enclosing folder (⌘↑)")
-            .disabled(model.current == nil || model.current?.focus == 0)
-        }
-        ToolbarItemGroup(placement: .primaryAction) {
-            Button {
-                model.rescan()
-            } label: {
-                Label("Rescan", systemImage: "arrow.clockwise")
-            }
-            .help("Rescan (⇧⌘R)")
-            .disabled(model.current == nil)
-            Button {
-                model.showInspector.toggle()
-            } label: {
-                Label("Inspector", systemImage: "sidebar.trailing")
-            }
-            .help("Show or hide the inspector")
-            .disabled(model.current == nil)
+    private var paneBinding: Binding<Pane> {
+        Binding(get: { model.pane }, set: {
+            model.pane = $0
+            model.search = ""
+        })
+    }
+}
+
+/// The search field only exists once there's a scan to search.
+private struct SearchWhenScanned: ViewModifier {
+    @Bindable var model: WindowModel
+
+    func body(content: Content) -> some View {
+        if model.current != nil {
+            content.searchable(text: $model.search, placement: .toolbar, prompt: "Search names")
+        } else {
+            content
         }
     }
 }
 
 // MARK: Sidebar
-
-private enum SidebarItem: Hashable {
-    case location(String)
-    case pane(Pane)
-}
 
 struct Sidebar: View {
     @Bindable var model: WindowModel
@@ -91,47 +106,34 @@ struct Sidebar: View {
         List(selection: selection) {
             Section("Locations") {
                 ForEach(model.locations) { loc in
-                    LocationRow(location: loc, session: model.sessions.first { $0.url.path == loc.url.path },
-                                current: model.current?.url.path == loc.url.path)
-                        .tag(SidebarItem.location(loc.url.path))
+                    LocationRow(location: loc, session: model.sessions.first { $0.url.path == loc.url.path })
+                        .tag(loc.url.path)
                 }
                 ForEach(model.sessions.filter { s in !model.locations.contains { $0.url.path == s.url.path } }) { s in
-                    FolderSessionRow(session: s, current: model.current === s) { model.closeSession(s) }
-                        .tag(SidebarItem.location(s.url.path))
+                    FolderSessionRow(session: s) { model.closeSession(s) }
+                        .tag(s.url.path)
                 }
+            }
+            Section {
                 Button {
                     model.chooseFolder()
                 } label: {
-                    Label("Scan Folder…", systemImage: "plus.circle")
+                    Label("Scan Folder…", systemImage: "plus")
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
             }
-            if model.current != nil {
-                Section("Explore") {
-                    ForEach(Pane.allCases) { pane in
-                        Label(pane.title, systemImage: pane.symbol)
-                            .tag(SidebarItem.pane(pane))
-                    }
-                }
-            }
         }
         .listStyle(.sidebar)
-        .defaultScrollAnchor(.top)
         .onAppear { model.refreshLocations() }
     }
 
-    private var selection: Binding<SidebarItem?> {
+    private var selection: Binding<String?> {
         Binding(
-            get: { model.current == nil ? nil : (model.search.isEmpty ? .pane(model.pane) : nil) },
-            set: { item in
-                switch item {
-                case .location(let path): model.scan(URL(fileURLWithPath: path))
-                case .pane(let p):
-                    model.pane = p
-                    model.search = ""
-                case nil: break
-                }
+            get: { model.current?.url.path },
+            set: { path in
+                guard let path, path != model.current?.url.path else { return }
+                model.scan(URL(fileURLWithPath: path))
             }
         )
     }
@@ -140,60 +142,44 @@ struct Sidebar: View {
 private struct LocationRow: View {
     let location: Location
     let session: Session?
-    let current: Bool
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: location.symbol)
-                .font(.system(size: 14))
-                .foregroundStyle(current ? Brand.color : .secondary)
-                .frame(width: 20)
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 4) {
-                    Text(location.name)
-                        .fontWeight(current ? .semibold : .regular)
-                        .lineLimit(1)
-                    Spacer(minLength: 4)
-                    if let session, session.phase == .scanning {
-                        ProgressView().controlSize(.mini)
-                    } else if let session {
-                        Text(Fmt.bytes(session.stats.bytes))
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                if let f = location.usedFraction, let avail = location.available {
-                    CapacityBar(fraction: f)
-                        .frame(height: 4)
-                    Text("\(Fmt.bytes(avail)) available")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            }
+            Label(location.name, systemImage: location.symbol)
+                .lineLimit(1)
+            Spacer(minLength: 6)
+            trailing
+                .font(.system(size: 11).monospacedDigit())
+                .foregroundStyle(.secondary)
         }
-        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private var trailing: some View {
+        if let session, session.phase == .scanning {
+            ProgressView().controlSize(.mini)
+        } else if let avail = location.available {
+            Text("\(Fmt.bytesShort(avail)) free")
+        } else if let session {
+            Text(Fmt.bytes(session.stats.bytes))
+        }
     }
 }
 
 private struct FolderSessionRow: View {
     let session: Session
-    let current: Bool
     let close: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: "folder")
-                .foregroundStyle(current ? Brand.color : .secondary)
-                .frame(width: 20)
-            Text(session.title)
-                .fontWeight(current ? .semibold : .regular)
+            Label(session.title, systemImage: "folder")
                 .lineLimit(1)
-            Spacer(minLength: 4)
+            Spacer(minLength: 6)
             if session.phase == .scanning {
                 ProgressView().controlSize(.mini)
             } else {
                 Text(Fmt.bytes(session.stats.bytes))
-                    .font(.caption.monospacedDigit())
+                    .font(.system(size: 11).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
         }
@@ -213,6 +199,36 @@ struct CapacityBar: View {
                     .frame(width: max(4, geo.size.width * min(1, fraction)))
             }
         }
+    }
+}
+
+/// The strip at the top of every pane: a title, a line of context, and
+/// optional trailing content.
+struct PaneHeader<Trailing: View>: View {
+    let title: String
+    let subtitle: String
+    var busy = false
+    @ViewBuilder var trailing: () -> Trailing
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(title).font(.system(size: 15, weight: .semibold))
+            Text(subtitle)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            if busy { ProgressView().controlSize(.mini) }
+            Spacer(minLength: 8)
+            trailing()
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 38)
+    }
+}
+
+extension PaneHeader where Trailing == EmptyView {
+    init(title: String, subtitle: String, busy: Bool = false) {
+        self.init(title: title, subtitle: subtitle, busy: busy) { EmptyView() }
     }
 }
 
@@ -290,7 +306,7 @@ struct PathBar: View {
                     session.focus = c.id
                 } label: {
                     Text(c.name)
-                        .font(.system(size: 12.5, weight: i == crumbs.count - 1 ? .semibold : .regular))
+                        .font(.system(size: 13, weight: i == crumbs.count - 1 ? .semibold : .regular))
                         .foregroundStyle(i == crumbs.count - 1 ? .primary : .secondary)
                         .lineLimit(1)
                         .padding(.horizontal, 5)
@@ -310,7 +326,7 @@ struct PathBar: View {
             }
         }
         .padding(.horizontal, 12)
-        .frame(height: 34)
+        .frame(height: 38)
     }
 
     private func chain() -> [Crumb] {
@@ -359,12 +375,17 @@ struct StatusBar: View {
                 }
             }
         }
-        .font(.system(size: 11.5))
+        .font(.system(size: 11))
         .foregroundStyle(.secondary)
         .padding(.horizontal, 12)
         .frame(height: 28)
         .background(.bar)
         .overlay(alignment: .top) { Divider() }
+    }
+
+    private var restoredAge: String {
+        guard let d = session.restoredFrom else { return "" }
+        return Fmt.age(UInt32(max(0, d.timeIntervalSince1970)))
     }
 
     @ViewBuilder
@@ -377,16 +398,26 @@ struct StatusBar: View {
                     Text("Waiting on macOS — look for a permission prompt")
                         .foregroundStyle(.orange)
                 } else {
-                    Text("Scanning  \(Fmt.count(s.items)) items · \(Fmt.bytes(s.bytes)) · \(Fmt.duration(s.elapsed))")
+                    Text("Scanning · \(Fmt.count(s.items)) items · \(Fmt.bytes(s.bytes)) · \(Fmt.duration(s.elapsed))")
                         .monospacedDigit()
                 }
             }
         case .live:
             HStack(spacing: 6) {
-                Circle().fill(.green).frame(width: 6, height: 6)
-                    .help("Watching for changes")
-                Text("Live · \(Fmt.count(s.items)) items scanned in \(Fmt.duration(s.finished))")
-                    .monospacedDigit()
+                if session.catchingUp {
+                    ProgressView().controlSize(.mini)
+                    Text("Restored the scan from \(restoredAge) · catching up on changes")
+                } else {
+                    Circle().fill(.green).frame(width: 6, height: 6)
+                        .help("Watching for changes")
+                    if session.restoredFrom != nil {
+                        Text("Live · \(Fmt.count(s.items)) items · restored from \(restoredAge) and caught up")
+                            .monospacedDigit()
+                    } else {
+                        Text("Live · \(Fmt.count(s.items)) items scanned in \(Fmt.duration(s.finished))")
+                            .monospacedDigit()
+                    }
+                }
             }
         }
     }
@@ -403,7 +434,7 @@ struct ToastView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(toast.title).font(.system(size: 13, weight: .semibold))
                 if let d = toast.detail {
-                    Text(d).font(.system(size: 11.5)).foregroundStyle(.secondary)
+                    Text(d).font(.system(size: 12)).foregroundStyle(.secondary)
                 }
             }
         }

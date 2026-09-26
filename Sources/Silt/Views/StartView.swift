@@ -4,7 +4,7 @@ import SwiftUI
 struct StartView: View {
     @Bindable var model: WindowModel
 
-    private let columns = [GridItem(.adaptive(minimum: 220, maximum: 280), spacing: 14)]
+    private let columns = [GridItem(.adaptive(minimum: 196, maximum: 250), spacing: 12)]
 
     var body: some View {
         ScrollView {
@@ -15,16 +15,16 @@ struct StartView: View {
                         .frame(width: 88, height: 88)
                         .shadow(color: .black.opacity(0.12), radius: 10, y: 4)
                     Text("Where did the space go?")
-                        .font(.system(size: 26, weight: .bold, design: .rounded))
+                        .font(.system(size: 22, weight: .semibold))
                     Text("Pick a place to scan. Silt reads it in parallel, shows results as they arrive, and stays live as files change.")
-                        .font(.system(size: 13.5))
+                        .font(.system(size: 13))
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: 440)
                 }
                 .padding(.top, 36)
 
-                LazyVGrid(columns: columns, spacing: 14) {
+                LazyVGrid(columns: columns, spacing: 12) {
                     ForEach(model.locations) { loc in
                         LocationCard(location: loc) { model.scan(loc.url) }
                     }
@@ -34,7 +34,7 @@ struct StartView: View {
 
                 if !model.hasFullDiskAccess {
                     FullDiskAccessCard(compact: false) { model.refreshLocations() }
-                        .frame(maxWidth: 560)
+                        .frame(maxWidth: 900)
                 }
 
                 Text("Tip: drop any folder onto this window or the Dock icon to scan it.")
@@ -66,11 +66,10 @@ private struct LocationCard: View {
                         .background(Brand.color.opacity(0.14), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                     VStack(alignment: .leading, spacing: 1) {
                         Text(location.name)
-                            .font(.system(size: 14, weight: .semibold))
+                            .font(.system(size: 13, weight: .semibold))
                             .lineLimit(1)
-                        Text(location.isVolume ? "Volume" : location.url.path.replacingOccurrences(
-                            of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~"))
-                            .font(.system(size: 11.5))
+                        Text(location.isVolume ? "Volume" : "Your home folder")
+                            .font(.system(size: 12))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
@@ -92,10 +91,8 @@ private struct LocationCard: View {
                         .foregroundStyle(.secondary)
                     }
                 } else {
-                    Text("Your home folder")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .frame(height: 22, alignment: .bottom)
+                    // Keeps every card the same height.
+                    Color.clear.frame(height: 25)
                 }
             }
             .padding(14)
@@ -150,13 +147,13 @@ struct FullDiskAccessCard: View {
                 Image(systemName: "lock.shield")
                     .font(.system(size: compact ? 13 : 17))
                     .foregroundStyle(.orange)
-                Text("See everything")
-                    .font(.system(size: compact ? 12 : 14, weight: .semibold))
+                Text("Some folders are hidden")
+                    .font(.system(size: compact ? 12 : 13, weight: .semibold))
             }
             Text(compact
                  ? "Grant Full Disk Access so Silt can include Mail, Messages, and app containers."
-                 : "macOS hides some folders (Mail, Messages, other apps’ containers) until you grant Full Disk Access. Without it, those folders show as locked. Add Silt in System Settings, then reopen it.")
-                .font(.system(size: compact ? 11 : 12.5))
+                 : "macOS hides Mail, Messages and other apps’ data until you grant Full Disk Access, and asks separately before Silt reads Desktop, Documents and Downloads. Add Silt in System Settings, then reopen it.")
+                .font(.system(size: compact ? 11 : 12))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {

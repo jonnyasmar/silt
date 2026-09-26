@@ -26,6 +26,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        MainActor.assumeIsolated { WindowModel.saveAll() }
+    }
 }
 
 enum Pane: String, CaseIterable, Identifiable {
@@ -39,6 +43,15 @@ enum Pane: String, CaseIterable, Identifiable {
         case .largest: "Largest Files"
         case .reclaim: "Reclaim"
         case .types: "File Types"
+        }
+    }
+
+    var shortTitle: String {
+        switch self {
+        case .files: "Files"
+        case .largest: "Largest"
+        case .reclaim: "Reclaim"
+        case .types: "Types"
         }
     }
 
@@ -90,6 +103,13 @@ final class WindowModel {
         }
     }
 
+    /// Snapshots every live scan in every window (at quit).
+    static func saveAll() {
+        for m in active.compactMap(\.model) {
+            for s in m.sessions { s.saveSnapshotNow() }
+        }
+    }
+
     /// Opens `url` in the frontmost window (Dock drops, `open -a Silt dir`).
     static func open(_ url: URL) {
         active.removeAll { $0.model == nil }
@@ -131,6 +151,41 @@ final class WindowModel {
             return
         }
         refreshLocations()
+        if !hasFullDiskAccess, touchesPrivateFolders(path), !UserDefaults.standard.bool(forKey: "scanWithoutFDA") {
+            askForFullDiskAccess(then: url)
+            return
+        }
+        start(url)
+    }
+
+    /// Home and whole volumes contain folders macOS guards with a prompt each.
+    private func touchesPrivateFolders(_ path: String) -> Bool {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return path == "/" || path == "/Users" || path == home || path.hasPrefix("/Volumes/")
+    }
+
+    private func askForFullDiskAccess(then url: URL) {
+        let alert = NSAlert()
+        alert.messageText = "Give Silt Full Disk Access?"
+        alert.informativeText = "Without it, macOS asks separately for Desktop, Documents, Downloads and other folders during the scan, and hides Mail, Messages and app data entirely. Grant access in System Settings, then reopen Silt."
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Scan Without It")
+        alert.addButton(withTitle: "Cancel")
+        let run: (NSApplication.ModalResponse) -> Void = { [weak self] r in
+            switch r {
+            case .alertFirstButtonReturn:
+                FullDiskAccess.openSettings()
+            case .alertSecondButtonReturn:
+                UserDefaults.standard.set(true, forKey: "scanWithoutFDA")
+                self?.start(url)
+            default:
+                break
+            }
+        }
+        if let window { alert.beginSheetModal(for: window, completionHandler: run) } else { run(alert.runModal()) }
+    }
+
+    private func start(_ url: URL) {
         let session = Session(url: url, guardPrivateFolders: !hasFullDiskAccess)
         sessions.append(session)
         current = session
@@ -141,7 +196,7 @@ final class WindowModel {
         guard let old = current, let i = sessions.firstIndex(where: { $0 === old }) else { return }
         old.close()
         refreshLocations()
-        let fresh = Session(url: old.url, guardPrivateFolders: !hasFullDiskAccess)
+        let fresh = Session(url: old.url, guardPrivateFolders: !hasFullDiskAccess, fresh: true)
         sessions[i] = fresh
         current = fresh
     }

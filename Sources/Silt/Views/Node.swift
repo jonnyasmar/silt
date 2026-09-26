@@ -6,7 +6,7 @@ import UniformTypeIdentifiers
 /// NSOutlineView's expansion and selection (which key on object identity)
 /// survive refreshes. File nodes are recreated when their folder is relisted.
 final class Node: NSObject {
-    enum Kind { case file, dir, more, unseen, list }
+    enum Kind { case file, dir, more, unseen, list, group }
 
     let kind: Kind
     /// Files: fixed entry index. Folders: resolved through `dir`.
@@ -27,6 +27,11 @@ final class Node: NSObject {
     // Summary rows.
     var moreCount = 0
     var moreBytes: Int64 = 0
+    /// Synthetic children, kept so the outline sees the same objects.
+    var moreNode: Node?
+    var unseenNode: Node?
+    /// Largest-files groups: same name and size in several places.
+    var groupKey: String?
 
     private var cachedName: String?
     private var cachedIcon: NSImage?
@@ -38,6 +43,18 @@ final class Node: NSObject {
         nameOffset = e.name
         nameLength = e.name_len
         entryKind = e.kind
+        self.parent = parent
+    }
+
+    /// A row standing for several copies of one file; `first` supplies the name.
+    init(groupOf first: Node, key: String, parent: Node?) {
+        kind = .group
+        entry = first.entry
+        dir = NONE
+        nameOffset = first.nameOffset
+        nameLength = first.nameLength
+        entryKind = first.entryKind
+        groupKey = key
         self.parent = parent
     }
 
@@ -61,10 +78,11 @@ final class Node: NSObject {
     /// Names are immutable once written and the arena never moves, so this
     /// needs no lock.
     func name(in tree: Tree) -> String {
+        if kind == .more { return "\(Fmt.count(moreCount)) smaller items" }
         if let cachedName { return cachedName }
         let s: String
         switch kind {
-        case .more: s = "\(Fmt.count(moreCount)) smaller items"
+        case .more: s = ""
         case .unseen: s = "System & hidden space"
         case .list: s = ""
         default:
@@ -83,7 +101,7 @@ final class Node: NSObject {
         case .unseen: image = Icons.symbol("lock.circle")
         case .list: image = NSImage()
         case .dir: image = Icons.folder(name: name(in: tree), path: path)
-        case .file: image = Icons.file(name: name(in: tree), symlink: entryKind == UInt8(SILT_KIND_SYMLINK))
+        case .file, .group: image = Icons.file(name: name(in: tree), symlink: entryKind == UInt8(SILT_KIND_SYMLINK))
         }
         cachedIcon = image
         return image

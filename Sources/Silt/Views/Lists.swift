@@ -1,44 +1,37 @@
 import SwiftUI
 
-/// A header over a flat list view.
-private struct ListHeader: View {
-    let title: String
-    let subtitle: String
-    var busy = false
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(title).font(.system(size: 13, weight: .semibold))
-            Text(subtitle).font(.system(size: 12)).foregroundStyle(.secondary)
-            if busy { ProgressView().controlSize(.mini) }
-            Spacer()
-        }
-        .padding(.horizontal, 14)
-        .frame(height: 34)
-    }
+/// Recompute keys for list panes: every so often while scanning, then on
+/// each change once live (the task debounces those).
+@MainActor private func refreshKey(_ session: Session) -> String {
+    session.phase == .live ? "live-\(session.version)" : "scan-\(session.version / 10)"
 }
 
 struct LargestFiles: View {
     let session: Session
     @State private var entries: [UInt32] = []
-    @State private var computedFor: String = ""
+    @State private var stamp = 0
 
     var body: some View {
-        let key = "\(session.focus):\(session.phase == .live ? "live" : "scan-\(session.version / 25)")"
         VStack(spacing: 0) {
-            ListHeader(title: "Largest Files", subtitle: "The 1,000 biggest files in \(focusName)",
+            PaneHeader(title: "Largest Files",
+                       subtitle: "The 1,000 biggest files in \(focusName). Copies with the same name and size are grouped.",
                        busy: session.phase == .scanning)
             Divider()
-            TreeView(session: session, source: .list(id: "largest-\(computedFor)", entries: entries))
+            TreeView(session: session, source: .list(id: "largest-\(stamp)", entries: entries, groupCopies: true))
         }
-        .task(id: key) {
+        .task(id: "\(session.focus)|\(refreshKey(session))") {
+            if stamp > 0 { try? await Task.sleep(for: .milliseconds(session.phase == .live ? 900 : 0)) }
+            guard !Task.isCancelled else { return }
             let tree = session.tree
             let focus = session.focus
             let result = await Task.detached(priority: .userInitiated) {
                 tree.topFiles(under: focus, limit: 1000)
             }.value
-            entries = result
-            computedFor = key
+            guard !Task.isCancelled else { return }
+            if result != entries || stamp == 0 {
+                entries = result
+                stamp += 1
+            }
         }
     }
 
@@ -59,7 +52,7 @@ struct SearchResults: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ListHeader(
+            PaneHeader(
                 title: "Search",
                 subtitle: entries.isEmpty && !searching
                     ? "No names contain “\(query)”"
@@ -69,10 +62,10 @@ struct SearchResults: View {
             Divider()
             TreeView(session: session, source: .list(id: "search-\(stamp)", entries: entries))
         }
-        // Re-run as a scan fills in, then once more when it finishes.
-        .task(id: "\(query)|\(session.focus)|\(session.phase == .live ? "live" : String(session.version / 10))") {
-            searching = true
-            try? await Task.sleep(for: .milliseconds(120))
+        .task(id: "\(query)|\(session.focus)|\(refreshKey(session))") {
+            let newQuery = query != resultQuery
+            if newQuery { searching = true }
+            try? await Task.sleep(for: .milliseconds(newQuery ? 120 : 900))
             guard !Task.isCancelled else { return }
             let tree = session.tree
             let focus = session.focus
@@ -81,9 +74,11 @@ struct SearchResults: View {
                 tree.search(q, under: focus, limit: 2000)
             }.value
             guard !Task.isCancelled else { return }
-            entries = result
-            resultQuery = q
-            stamp += 1
+            if result != entries || newQuery {
+                entries = result
+                resultQuery = q
+                stamp += 1
+            }
             searching = false
         }
     }

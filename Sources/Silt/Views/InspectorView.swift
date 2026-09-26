@@ -48,30 +48,30 @@ struct InspectorView: View {
                     .font(.system(size: 15, weight: .semibold))
                     .lineLimit(3)
                     .textSelection(.enabled)
-                Text(kind(s))
-                    .font(.system(size: 11.5))
+                Text(isFocus ? "\(kind(s)) · \(Fmt.count(s.items)) items" : kind(s))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             }
         }
 
-        VStack(alignment: .leading, spacing: 4) {
-            let parts = Fmt.bytesParts(s.size)
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(parts.number)
-                    .font(.system(size: 30, weight: .semibold, design: .rounded).monospacedDigit())
-                    .contentTransition(.numericText())
-                Text(parts.unit)
-                    .font(.system(size: 15, weight: .medium, design: .rounded))
-                    .foregroundStyle(.secondary)
-            }
-            if s.parentSize > 0 && !isFocus {
-                Text("\(Fmt.percent(Double(s.size) / Double(s.parentSize))) of \(s.parentName)")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-            } else {
-                Text("on disk")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
+        // The folder being explored already shows its total in the path bar,
+        // so the hero number is for selections only.
+        if !isFocus {
+            VStack(alignment: .leading, spacing: 4) {
+                let parts = Fmt.bytesParts(s.size)
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    Text(parts.number)
+                        .font(.system(size: 28, weight: .semibold, design: .rounded).monospacedDigit())
+                        .contentTransition(.numericText())
+                    Text(parts.unit)
+                        .font(.system(size: 15, weight: .medium, design: .rounded))
+                        .foregroundStyle(.secondary)
+                }
+                if s.parentSize > 0 {
+                    Text("\(Fmt.percent(Double(s.size) / Double(s.parentSize))) of \(s.parentName)")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
             }
         }
 
@@ -79,9 +79,7 @@ struct InspectorView: View {
 
         if !isFocus {
             HStack(spacing: 8) {
-                Button { session.reveal([s.ref]) } label: {
-                    Label("Show in Finder", systemImage: "magnifyingglass")
-                }
+                Button("Show in Finder") { session.reveal([s.ref]) }
                 Button { session.quickLook?() } label: {
                     Image(systemName: "eye")
                 }
@@ -92,9 +90,8 @@ struct InspectorView: View {
                 .help("Move to Trash")
             }
             .controlSize(.regular)
+            details(s)
         }
-
-        details(s)
 
         if s.isDir {
             Composition(session: session, dir: s.ref.dir)
@@ -113,7 +110,7 @@ struct InspectorView: View {
                                 .truncationMode(.middle)
                             Spacer(minLength: 6)
                             Text(Fmt.bytes(t.size))
-                                .font(.system(size: 11.5).monospacedDigit())
+                                .font(.system(size: 12).monospacedDigit())
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -158,7 +155,7 @@ struct InspectorView: View {
                     }
                 }
                 GridRow {
-                    label(s.isDir ? "Newest" : "Modified")
+                    label(s.isDir ? "Last changed" : "Modified")
                     Text(s.modified == 0 ? "—" : Date(timeIntervalSince1970: TimeInterval(s.modified))
                         .formatted(date: .abbreviated, time: .shortened))
                 }
@@ -192,14 +189,14 @@ struct InspectorView: View {
             let parts = Fmt.bytesParts(total)
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 Text(parts.number)
-                    .font(.system(size: 30, weight: .semibold, design: .rounded).monospacedDigit())
+                    .font(.system(size: 28, weight: .semibold, design: .rounded).monospacedDigit())
                 Text(parts.unit)
                     .font(.system(size: 15, weight: .medium, design: .rounded))
                     .foregroundStyle(.secondary)
             }
         }
         HStack(spacing: 8) {
-            Button { session.reveal(refs) } label: { Label("Show in Finder", systemImage: "magnifyingglass") }
+            Button("Show in Finder") { session.reveal(refs) }
             Button(role: .destructive) { session.moveToTrash(refs) } label: {
                 Label("Move to Trash", systemImage: "trash")
             }
@@ -210,6 +207,12 @@ struct InspectorView: View {
 
     private func summary(for ref: ItemRef) -> Summary? {
         let tree = session.tree
+        let dirForTop: UInt32? = tree.withLock {
+            let i = session.entryIndex(ref)
+            let e = tree.entry(i)
+            return tree.isLive(i) && e.isDir ? e.aux : nil
+        }
+        let topEntries = dirForTop.map { tree.topChildren(of: $0, limit: 6) } ?? []
         return tree.withLock {
             let i = session.entryIndex(ref)
             guard tree.isLive(i) else { return nil }
@@ -221,7 +224,7 @@ struct InspectorView: View {
                 let d = tree.dir(e.aux)
                 s.items = Int(d.items)
                 s.modified = d.newest
-                s.top = tree.children(of: e.aux, key: .size).prefix(6).map { c in
+                s.top = topEntries.filter { tree.isLive($0) }.map { c in
                     let ce = tree.entry(c)
                     return (tree.name(of: ce), ce.size, ce.isDir)
                 }
@@ -244,7 +247,9 @@ struct InspectorView: View {
             }
             return "Folder"
         }
-        let ext = (s.name as NSString).pathExtension
+        let ext = (s.name as NSString).pathExtension.lowercased()
+        // A few extensions map to misleading legacy types ("MacBinary archive").
+        if ["bin", "dat", "raw"].contains(ext) { return "Binary data" }
         return UTType(filenameExtension: ext)?.localizedDescription?.capitalizedFirst ?? "File"
     }
 
@@ -271,7 +276,7 @@ struct SectionTitle: View {
 
     var body: some View {
         Text(text.uppercased())
-            .font(.system(size: 10.5, weight: .semibold))
+            .font(.system(size: 11, weight: .semibold))
             .tracking(0.6)
             .foregroundStyle(.secondary)
     }
@@ -322,7 +327,7 @@ struct Composition: View {
                             Text(cat.shortTitle).font(.system(size: 12))
                             Spacer()
                             Text(Fmt.bytes(bytes))
-                                .font(.system(size: 11.5).monospacedDigit())
+                                .font(.system(size: 12).monospacedDigit())
                                 .foregroundStyle(.secondary)
                         }
                     }

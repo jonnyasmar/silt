@@ -17,6 +17,19 @@ enum Fmt {
         return String(format: "%.1f %@", v, units[unit])
     }
 
+    /// Three significant digits: "107 GB", "88.3 GB", "4.52 GB". For tight spots.
+    static func bytesShort(_ value: Int64) -> String {
+        if value < 1000 { return "\(max(value, 0)) B" }
+        var v = Double(value)
+        var unit = 0
+        while v >= 999.5 && unit < units.count - 1 {
+            v /= 1000
+            unit += 1
+        }
+        let digits = v >= 100 ? 0 : v >= 10 ? 1 : 2
+        return String(format: "%.\(digits)f %@", v, units[unit])
+    }
+
     /// "84.0" and "GB" separately, for layouts that style the unit.
     static func bytesParts(_ value: Int64) -> (number: String, unit: String) {
         let s = bytes(value)
@@ -47,17 +60,17 @@ enum Fmt {
         let d = now - TimeInterval(unix)
         switch d {
         case ..<60: return "just now"
-        case ..<3600: return "\(Int(d / 60)) min ago"
-        case ..<86400: return "\(Int(d / 3600)) hr ago"
-        case ..<(86400 * 14): return plural(Int(d / 86400), "day")
-        case ..<(86400 * 60): return plural(Int(d / (86400 * 7)), "wk")
-        case ..<(86400 * 365): return plural(Int(d / (86400 * 30.44)), "mo")
-        default: return plural(Int(d / (86400 * 365.25)), "yr")
+        case ..<3600: return ago(Int(d / 60), "minute")
+        case ..<86400: return ago(Int(d / 3600), "hour")
+        case ..<(86400 * 14): return ago(Int(d / 86400), "day")
+        case ..<(86400 * 60): return ago(Int(d / (86400 * 7)), "week")
+        case ..<(86400 * 365): return ago(Int(d / (86400 * 30.44)), "month")
+        default: return ago(Int(d / (86400 * 365.25)), "year")
         }
     }
 
-    private static func plural(_ n: Int, _ unit: String) -> String {
-        unit == "day" && n != 1 ? "\(n) days ago" : "\(n) \(unit) ago"
+    private static func ago(_ n: Int, _ unit: String) -> String {
+        "\(n) \(unit)\(n == 1 ? "" : "s") ago"
     }
 
     static func duration(_ seconds: Double) -> String {

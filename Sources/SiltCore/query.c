@@ -122,6 +122,21 @@ uint32_t silt_top_files(silt_tree *t, uint32_t dir, uint32_t *out,
   return n;
 }
 
+uint32_t silt_top_children(silt_tree *t, uint32_t dir, uint32_t *out,
+                           uint32_t cap) {
+  heap h = {.t = t, .idx = out, .tag = NULL, .n = 0, .cap = cap};
+  silt_tree_lock(t);
+  if (dir < t->dir_count) {
+    const silt_dir *d = silt_dir_at(t, dir);
+    for (uint32_t i = d->first, end = d->first + d->count; i < end; i++) {
+      if (!(silt_entry_at(t, i)->flags & SILT_FLAG_REMOVED)) heap_offer(&h, i, 0);
+    }
+  }
+  uint32_t n = heap_finish(&h);
+  silt_tree_unlock(t);
+  return n;
+}
+
 static bool contains_ci(const uint8_t *hay, uint32_t hlen, const uint8_t *nee,
                         uint32_t nlen) {
   if (nlen == 0) return true;

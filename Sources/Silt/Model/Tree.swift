@@ -18,16 +18,28 @@ final class Tree: @unchecked Sendable {
         raw = silt_tree_create(path)
     }
 
+    /// Adopts a tree loaded from a snapshot.
+    init(restored: UnsafeMutablePointer<silt_tree>, path: String) {
+        rootPath = path
+        raw = restored
+    }
+
     deinit {
         if let scanner { silt_scanner_destroy(scanner) }
         silt_tree_destroy(raw)
     }
 
+    /// Directory listing is syscall-bound, so more threads than cores helps
+    /// keep the storage queue full.
+    private static var threads: Int32 { Int32(max(8, ProcessInfo.processInfo.activeProcessorCount * 2)) }
+
     func startScan() {
-        // Directory listing is syscall-bound, so more threads than cores helps
-        // keep the storage queue full.
-        let threads = max(8, ProcessInfo.processInfo.activeProcessorCount * 2)
-        scanner = silt_scanner_start(raw, Int32(threads))
+        scanner = silt_scanner_start(raw, Self.threads)
+    }
+
+    /// For a restored tree: workers only, waiting for refreshes.
+    func startIdle() {
+        scanner = silt_scanner_start_idle(raw, Self.threads)
     }
 
     func stop() {
@@ -90,6 +102,12 @@ final class Tree: @unchecked Sendable {
     func topFiles(under dir: UInt32, limit: Int) -> [UInt32] {
         [UInt32](unsafeUninitializedCapacity: limit) { buf, n in
             n = Int(silt_top_files(raw, dir, buf.baseAddress!, UInt32(limit)))
+        }
+    }
+
+    func topChildren(of dir: UInt32, limit: Int) -> [UInt32] {
+        [UInt32](unsafeUninitializedCapacity: limit) { buf, n in
+            n = Int(silt_top_children(raw, dir, buf.baseAddress!, UInt32(limit)))
         }
     }
 

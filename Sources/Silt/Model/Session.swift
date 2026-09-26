@@ -70,24 +70,47 @@ final class Session: Identifiable {
     /// Set by the tree view that currently owns the selection.
     @ObservationIgnored var quickLook: (() -> Void)?
 
+    /// When the scan being shown was saved, if it came from a snapshot.
+    private(set) var restoredFrom: Date?
+    /// Replaying file-system history since that snapshot.
+    private(set) var catchingUp = false
+    @ObservationIgnored private let fullDiskAccess: Bool
+    @ObservationIgnored private var lastEventId: FSEventStreamEventId = 0
+    @ObservationIgnored private var lastSave: TimeInterval = 0
+    @ObservationIgnored private var savedGeneration: UInt64 = 0
+    @ObservationIgnored private var saving = false
+
     /// Without Full Disk Access, opening another app's container pops a
     /// privacy prompt and blocks the scanning thread until it's answered, so
     /// those folders are recorded but not opened.
-    init(url: URL, guardPrivateFolders: Bool) {
+    init(url: URL, guardPrivateFolders: Bool, fresh: Bool = false) {
         let resolved = url.resolvingSymlinksInPath()
         self.url = resolved
         title = Locations.displayName(for: resolved)
         let values = try? resolved.resourceValues(forKeys: [.isVolumeKey])
         isVolume = values?.isVolume == true || resolved.path == "/"
-        tree = Tree(path: resolved.path)
+        fullDiskAccess = !guardPrivateFolders
+        let restored = fresh ? nil : Snapshots.load(for: resolved, fullDiskAccess: fullDiskAccess)
+        tree = restored.map { Tree(restored: $0.tree, path: resolved.path) } ?? Tree(path: resolved.path)
         if guardPrivateFolders {
             let home = FileManager.default.homeDirectoryForCurrentUser.path
             for sub in ["Library/Containers", "Library/Group Containers", "Library/Daemon Containers"] {
                 silt_tree_guard(tree.raw, home + "/" + sub)
             }
         }
-        tree.startScan()
-        startWatching()
+        if let restored {
+            // Show the saved scan now; FSEvents replays everything since.
+            tree.startIdle()
+            phase = .live
+            restoredFrom = restored.savedAt
+            catchingUp = true
+            lastEventId = restored.eventId
+            startWatching(since: restored.eventId)
+        } else {
+            tree.startScan()
+            startWatching(since: nil)
+        }
+        savedGeneration = tree.generation
         capacity = Locations.volumeCapacity(for: resolved)
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 12, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
@@ -137,10 +160,12 @@ final class Session: Identifiable {
             releaseHeldEvents()
             capacity = Locations.volumeCapacity(for: url)
             version += 1
+            lastSave = 0 // save the fresh scan as soon as it settles
         }
 
         if gen != lastGeneration {
             lastGeneration = gen
+            repairFocus()
             for body in listeners.values { body() }
             if now - lastVersionBump > 0.2 || phase == .live {
                 lastVersionBump = now
@@ -152,14 +177,63 @@ final class Session: Identifiable {
             lastCapacityCheck = now
             capacity = Locations.volumeCapacity(for: url)
         }
+
+        // Keep the snapshot reasonably fresh without rewriting it constantly.
+        if phase == .live, !catchingUp, !saving, p.idle, gen != savedGeneration,
+           now - lastSave > (lastSave == 0 ? 1 : 300) {
+            saveSnapshot(now: now, generation: gen)
+        }
     }
 
-    private func startWatching() {
-        watcher = FSWatcher(path: url.path) { [weak self] events in
+    private func saveSnapshot(now: TimeInterval, generation: UInt64) {
+        saving = true
+        lastSave = now
+        let tree = tree, url = url, eventId = lastEventId, fda = fullDiskAccess
+        Task { [weak self] in
+            let ok = await Task.detached(priority: .utility) {
+                Snapshots.save(tree, url: url, eventId: eventId, fullDiskAccess: fda)
+            }.value
+            self?.saving = false
+            if ok { self?.savedGeneration = generation }
+        }
+    }
+
+    /// At quit: save synchronously if anything changed since the last save.
+    func saveSnapshotNow() {
+        guard phase == .live, !catchingUp, tree.generation != savedGeneration else { return }
+        if Snapshots.save(tree, url: url, eventId: lastEventId, fullDiskAccess: fullDiskAccess) {
+            savedGeneration = tree.generation
+        }
+    }
+
+    /// If the focused folder was deleted or replaced, fall back to its nearest
+    /// surviving ancestor.
+    private func repairFocus() {
+        guard focus != 0 else { return }
+        let fixed: UInt32? = tree.withLock {
+            var d = focus
+            while d != 0 {
+                let i = tree.dirEntry(d)
+                if tree.isLive(i) { return d == focus ? nil : d }
+                let parent = tree.entry(i).parent
+                d = parent == NONE ? 0 : parent
+            }
+            return 0
+        }
+        if let fixed {
+            focus = fixed
+            selection = []
+        }
+    }
+
+    private func startWatching(since: FSEventStreamEventId?) {
+        let w = FSWatcher(path: url.path, since: since) { [weak self] events in
             DispatchQueue.main.async {
                 MainActor.assumeIsolated { self?.handle(events) }
             }
         }
+        watcher = w
+        if since == nil { lastEventId = w.startId }
     }
 
     private func handle(_ events: [FSWatcher.Event]) {
@@ -182,9 +256,13 @@ final class Session: Identifiable {
         guard !events.isEmpty else { return }
         var targets: [UInt32: Bool] = [:]
         let root = url.path
+        for event in events {
+            if event.id > lastEventId && event.id != UInt64(kFSEventStreamEventIdSinceNow) { lastEventId = event.id }
+            if event.historyDone { catchingUp = false }
+        }
         tree.withLock {
             for event in events {
-                if event.rootChanged { continue }
+                if event.rootChanged || event.historyDone { continue }
                 guard let dir = nearestListedDir(for: event.path, root: root) else { continue }
                 targets[dir] = (targets[dir] ?? false) || event.mustScanSubdirs
             }
@@ -279,37 +357,66 @@ final class Session: Identifiable {
         selection = [ItemRef(entry: tree.withLock { tree.dirEntry(previous) }, dir: previous)]
     }
 
+    /// Which object on disk a path named when we resolved it.
+    private struct Identity: Hashable {
+        let dev: Int32
+        let ino: UInt64
+
+        init?(path: String) {
+            var st = stat()
+            guard lstat(path, &st) == 0 else { return nil }
+            dev = st.st_dev
+            ino = st.st_ino
+        }
+    }
+
     private struct Target {
         let entry: UInt32
         let url: URL
         let size: Int64
+        let identity: Identity
+
+        /// Still the same object we showed the user?
+        var unchanged: Bool { Identity(path: url.path) == identity }
     }
 
-    private static let protected: Set<String> = {
+    private static let protectedPaths: [String] = {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        var s: Set<String> = ["/", "/System", "/Library", "/Applications", "/Users", "/private", "/usr",
-                              "/bin", "/sbin", "/etc", "/var", "/opt", "/cores", "/Volumes", "/tmp",
-                              "/System/Volumes/Data", home]
-        for sub in ["Library", "Desktop", "Documents", "Downloads", "Applications", "Movies", "Music", "Pictures", "Public"] {
-            s.insert(home + "/" + sub)
+        var s = ["/", "/System", "/Library", "/Applications", "/Users", "/private", "/usr", "/bin", "/sbin",
+                 "/etc", "/var", "/opt", "/cores", "/Volumes", "/tmp", "/System/Volumes/Data", home]
+        for sub in ["Library", "Desktop", "Documents", "Downloads", "Applications", "Movies", "Music", "Pictures",
+                    "Public", ".Trash"] {
+            s.append(home + "/" + sub)
         }
         return s
     }()
 
+    /// Compared by inode as well as by path, so firmlink spellings
+    /// (/System/Volumes/Data/Users/…) can't slip past.
+    private static let protectedIdentities: Set<Identity> = Set(protectedPaths.compactMap { Identity(path: $0) })
+
+    private static func isProtected(_ path: String, _ identity: Identity) -> Bool {
+        protectedIdentities.contains(identity) || protectedPaths.contains(path)
+    }
+
     private func targets(_ refs: [ItemRef]) -> (ok: [Target], refused: [String]) {
         var ok: [Target] = []
         var refused: [String] = []
+        var resolved: [(UInt32, String, Int64)] = []
         tree.withLock {
             for ref in refs {
                 let i = entryIndex(ref)
                 guard i != 0, tree.isLive(i) else { continue }
-                let path = tree.path(of: i)
-                if Self.protected.contains(path) {
-                    refused.append((path as NSString).lastPathComponent)
-                    continue
-                }
-                ok.append(Target(entry: i, url: URL(fileURLWithPath: path), size: tree.entry(i).size))
+                resolved.append((i, tree.path(of: i), tree.entry(i).size))
             }
+        }
+        for (i, path, size) in resolved {
+            guard let identity = Identity(path: path) else { continue }
+            if Self.isProtected(path, identity) {
+                refused.append((path as NSString).lastPathComponent)
+                continue
+            }
+            ok.append(Target(entry: i, url: URL(fileURLWithPath: path), size: size, identity: identity))
         }
         // Drop anything nested inside another target.
         let paths = Set(ok.map(\.url.path))
@@ -325,8 +432,9 @@ final class Session: Identifiable {
     }
 
     func moveToTrash(_ refs: [ItemRef]) {
-        let (items, refused) = targets(refs)
+        let (all, refused) = targets(refs)
         if !refused.isEmpty { refuse(refused) }
+        let items = all.filter(\.unchanged)
         guard !items.isEmpty else { return }
         NSWorkspace.shared.recycle(items.map(\.url)) { [weak self] trashed, error in
             DispatchQueue.main.async {
@@ -374,7 +482,16 @@ final class Session: Identifiable {
         if let window { alert.beginSheetModal(for: window, completionHandler: run) } else { run(alert.runModal()) }
     }
 
-    private func performDelete(_ items: [Target]) {
+    private func performDelete(_ confirmed: [Target]) {
+        // The sheet may have been open a while: only delete what is still the
+        // very object the user confirmed.
+        let items = confirmed.filter(\.unchanged)
+        if items.count < confirmed.count {
+            refreshParents(of: confirmed)
+            show(Toast(symbol: "exclamationmark.triangle", title: "Some items changed on disk",
+                       detail: "They were left alone. Look again and retry."))
+        }
+        guard !items.isEmpty else { return }
         // Optimistic: the rows disappear now; failures come back on refresh.
         for t in items { tree.remove(entry: t.entry) }
         selection = []

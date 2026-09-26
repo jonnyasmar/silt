@@ -176,11 +176,38 @@ void silt_scanner_refresh(silt_scanner *s, uint32_t dir, bool deep);
 // refresh of its parent drops it for good.
 void silt_tree_remove(silt_tree *t, uint32_t entry);
 
+// Like silt_scanner_start, but queues nothing: for a tree restored from a
+// snapshot, which only needs refreshes.
+silt_scanner *silt_scanner_start_idle(silt_tree *t, int threads);
+
+// MARK: Snapshots
+
+typedef struct silt_snapshot_meta {
+  uint64_t event_id;       // FSEvents id the snapshot is current as of
+  uint8_t volume_uuid[16]; // FSEvents database the id belongs to
+  double saved_at;         // unix seconds
+  uint32_t flags;          // caller-defined (e.g. whether FDA was granted)
+} silt_snapshot_meta;
+
+// Writes a compacted copy of the tree (live entries only) to `path`
+// atomically. Takes the lock. Returns false on I/O error, or if a scan is
+// still pending anywhere in the tree.
+bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *meta);
+
+// Loads a snapshot. Returns NULL if the file is missing, damaged, or from
+// another format version. The tree's root path is stored in the file.
+silt_tree *silt_tree_load(const char *path, silt_snapshot_meta *meta);
+
 // MARK: Queries (each takes the lock itself; safe during a scan)
 
 // The `cap` largest files under `dir`, largest first. Returns the count.
 uint32_t silt_top_files(silt_tree *t, uint32_t dir, uint32_t *out,
                         uint32_t cap);
+
+// The `cap` largest live direct children of `dir`, largest first. Unlike
+// silt_children_sorted this never sorts the whole folder.
+uint32_t silt_top_children(silt_tree *t, uint32_t dir, uint32_t *out,
+                           uint32_t cap);
 
 // Entries under `dir` whose name contains `needle` (ASCII case-insensitive),
 // largest first. Returns the count.

@@ -7,12 +7,18 @@ enum TreeSource: Equatable {
     /// A folder's contents, drillable.
     case folder(UInt32)
     /// A flat, precomputed list of entries (largest files, search results…).
-    case list(id: String, entries: [UInt32])
+    /// With `groupCopies`, files sharing a name and size fold into one row.
+    case list(id: String, entries: [UInt32], groupCopies: Bool = false)
+
+    var isList: Bool {
+        if case .list = self { return true }
+        return false
+    }
 
     static func == (a: TreeSource, b: TreeSource) -> Bool {
         switch (a, b) {
         case let (.folder(x), .folder(y)): x == y
-        case let (.list(x, _), .list(y, _)): x == y
+        case let (.list(x, _, _), .list(y, _, _)): x == y
         default: false
         }
     }
@@ -62,6 +68,10 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     let scroll = NSScrollView()
     private(set) var source: TreeSource
     private var root: Node
+    /// Folder mode only: a folder appears at most once in a hierarchy, so
+    /// one node per dir id keeps expansion state across refreshes. Lists
+    /// can show a folder both as a hit and inside another hit, so they build
+    /// nodes per parent instead.
     private var dirNodes: [UInt32: Node] = [:]
     private var sortKey: SortKey = .size
     private var ascending = false
@@ -70,7 +80,11 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     /// Folders that became expandable while being rebuilt; the outline must
     /// be told or it keeps showing them without a disclosure triangle.
     private var expandFlips: [Node] = []
+    /// Largest top-level size in a list, which list bars are scaled to.
+    private var listMax: Int64 = 1
+    private var locationCache: [UInt32: String] = [:]
     private var tree: Tree { session.tree }
+    private var sharesDirNodes: Bool { !source.isList }
     private static let maxChildren = 20_000
 
     private static let nameColumn = NSUserInterfaceItemIdentifier("name")
@@ -83,7 +97,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     init(session: Session, source: TreeSource) {
         self.session = session
         self.source = source
-        root = Node(summary: .more, parent: nil)
+        root = Node(summary: .list, parent: nil)
         super.init()
         root = makeRoot(for: source)
         configureOutline()
@@ -110,7 +124,6 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         outline.gridStyleMask = []
         outline.autosaveExpandedItems = false
         outline.floatsGroupRows = false
-        outline.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
         outline.allowsColumnReordering = false
         outline.dataSource = self
         outline.delegate = self
@@ -123,9 +136,6 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             return m
         }()
 
-        let isList: Bool
-        if case .list = source { isList = true } else { isList = false }
-
         @discardableResult
         func column(_ id: NSUserInterfaceItemIdentifier, _ title: String, width: CGFloat, min: CGFloat,
                     sortKey: String?, ascending: Bool = false, align: NSTextAlignment = .left) -> NSTableColumn {
@@ -133,25 +143,41 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             c.title = title
             c.width = width
             c.minWidth = min
+            c.resizingMask = .userResizingMask
             c.headerCell.alignment = align
             if let sortKey { c.sortDescriptorPrototype = NSSortDescriptor(key: sortKey, ascending: ascending) }
             outline.addTableColumn(c)
             return c
         }
-        // Starts narrow; as the first column it absorbs whatever width is left.
-        let name = column(Self.nameColumn, "Name", width: 200, min: 180, sortKey: "name", ascending: true)
-        name.resizingMask = .autoresizingMask
-        outline.outlineTableColumn = name
-        column(Self.shareColumn, "Share", width: 130, min: 80, sortKey: "size")
-        column(Self.sizeColumn, "Size", width: 84, min: 70, sortKey: "size", align: .right)
-        if isList {
-            column(Self.locationColumn, "Location", width: 280, min: 120, sortKey: nil)
+
+        if source.isList {
+            // The location is the long, flexible part of a list row.
+            let name = column(Self.nameColumn, "Name", width: 230, min: 180, sortKey: "name", ascending: true)
+            outline.outlineTableColumn = name
+            column(Self.shareColumn, shareTitle, width: 100, min: 70, sortKey: "share")
+            column(Self.sizeColumn, "Size", width: 84, min: 70, sortKey: "size", align: .right)
+            column(Self.modifiedColumn, "Modified", width: 108, min: 80, sortKey: "modified", align: .right)
+            // Starts at its minimum so the table never begins wider than the
+            // view; growth then flows into it.
+            let location = column(Self.locationColumn, "Location", width: 80, min: 80, sortKey: nil)
+            location.resizingMask = [.autoresizingMask, .userResizingMask]
+            outline.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         } else {
+            // Starts narrow; as the first column it absorbs whatever width is left.
+            let name = column(Self.nameColumn, "Name", width: 200, min: 180, sortKey: "name", ascending: true)
+            name.resizingMask = [.autoresizingMask, .userResizingMask]
+            outline.outlineTableColumn = name
+            column(Self.shareColumn, "Share", width: 116, min: 70, sortKey: "share")
+            column(Self.sizeColumn, "Size", width: 84, min: 70, sortKey: "size", align: .right)
             column(Self.itemsColumn, "Items", width: 76, min: 56, sortKey: "items", align: .right)
+            column(Self.modifiedColumn, "Modified", width: 108, min: 80, sortKey: "modified", align: .right)
+            outline.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
         }
-        column(Self.modifiedColumn, "Modified", width: 96, min: 70, sortKey: "modified", align: .right)
         outline.sortDescriptors = [NSSortDescriptor(key: "size", ascending: false)]
 
+        // No horizontal scrolling: the table stays exactly as wide as the
+        // view, and the flexible column (name, or location in lists) absorbs
+        // every resize.
         scroll.documentView = outline
         scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = false
@@ -160,10 +186,22 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         scroll.borderType = .noBorder
     }
 
+    /// Lists show each hit's share of the folder being explored.
+    private var shareTitle: String {
+        let name = session.focus == 0 ? session.title : tree.withLock {
+            tree.name(of: tree.entry(tree.dirEntry(session.focus)))
+        }
+        return "% of \(name)"
+    }
+
     private func makeRoot(for source: TreeSource) -> Node {
         switch source {
         case .folder(let dir):
-            return tree.withLock { dirNode(dir, entry: tree.dirEntry(dir), parent: nil) }
+            return tree.withLock {
+                let n = dirNode(dir, entry: tree.dirEntry(dir), parent: nil)
+                n.children = nil // it may have been collapsed, and unwatched, for a while
+                return n
+            }
         case .list:
             return Node(summary: .list, parent: nil)
         }
@@ -171,10 +209,17 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
 
     func setSource(_ newSource: TreeSource) {
         guard newSource != source else { return }
+        let previous = source.isList ? root.children ?? [] : []
         source = newSource
         root = makeRoot(for: newSource)
+        if newSource.isList {
+            root.children = previous // lets buildList reuse row objects
+            tree.withLock { root.children = buildList(root) }
+            outline.tableColumns.first { $0.identifier == Self.shareColumn }?.title = shareTitle
+        }
+        let selected = selectedNodes()
         outline.reloadData()
-        outline.scrollRowToVisible(0)
+        if newSource.isList { restoreSelection(selected) } else { outline.scrollRowToVisible(0) }
     }
 
     // MARK: Nodes
@@ -207,21 +252,29 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         var more: Node?
         if order.count > Self.maxChildren {
             let rest = order[Self.maxChildren...]
-            let m = Node(summary: .more, parent: node)
+            let m = node.moreNode ?? Node(summary: .more, parent: node)
             m.moreCount = rest.count
             m.moreBytes = rest.reduce(0) { $0 + tree.entry($1).size }
+            node.moreNode = m
             more = m
             order = order.prefix(Self.maxChildren)
         }
         var oldFiles: [UInt32: Node] = [:]
-        for c in node.children ?? [] where c.kind == .file { oldFiles[c.entry] = c }
+        var oldDirs: [UInt32: Node] = [:]
+        for c in node.children ?? [] {
+            if c.kind == .file { oldFiles[c.entry] = c } else if c.kind == .dir { oldDirs[c.dir] = c }
+        }
         var result: [Node] = []
         result.reserveCapacity(order.count + 2)
         for i in order {
             let e = tree.entry(i)
             let child: Node
             if e.isDir {
-                child = dirNode(e.aux, entry: i, parent: node)
+                if sharesDirNodes {
+                    child = dirNode(e.aux, entry: i, parent: node)
+                } else {
+                    child = oldDirs[e.aux] ?? Node(entry: i, value: e, parent: node)
+                }
                 let expandable = tree.dir(e.aux).count > 0
                 if expandable != child.expandable {
                     child.expandable = expandable
@@ -232,8 +285,9 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             }
             result.append(child)
         }
-        if node.dir == 0, session.isVolume, session.unseenBytes > 0 {
-            let u = Node(summary: .unseen, parent: node)
+        if node.dir == 0, !source.isList, session.isVolume, session.unseenBytes > 0 {
+            let u = node.unseenNode ?? Node(summary: .unseen, parent: node)
+            node.unseenNode = u
             let bytes = session.unseenBytes
             let at = sortKey == .size && !ascending
                 ? (result.firstIndex { valueSize($0) < bytes } ?? result.count)
@@ -246,30 +300,71 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
 
     /// Lock held.
     private func buildList(_ node: Node) -> [Node] {
-        guard case .list(_, let entries) = source else { return [] }
-        var result: [Node] = []
+        guard case .list(_, let entries, let groupCopies) = source else { return [] }
+        var oldFiles: [UInt32: Node] = [:]
+        var oldDirs: [UInt32: Node] = [:]
+        var oldGroups: [String: Node] = [:]
+        for c in node.children ?? [] {
+            switch c.kind {
+            case .file: oldFiles[c.entry] = c
+            case .dir: oldDirs[c.dir] = c
+            case .group: if let k = c.groupKey { oldGroups[k] = c }
+            default: break
+            }
+        }
+        var rows: [Node] = []
+        var groups: [String: Node] = [:]
         for i in entries where tree.isLive(i) {
             let e = tree.entry(i)
             if e.isDir {
-                let n = dirNode(e.aux, entry: i, parent: node)
+                let n = oldDirs[e.aux] ?? Node(entry: i, value: e, parent: node)
+                n.parent = node
                 n.expandable = tree.dir(e.aux).count > 0
-                result.append(n)
+                rows.append(n)
+                continue
+            }
+            let file = oldFiles[i] ?? Node(entry: i, value: e, parent: node)
+            guard groupCopies else {
+                file.parent = node
+                rows.append(file)
+                continue
+            }
+            let key = "\(tree.name(of: e))\u{0}\(e.size)"
+            if let g = groups[key] {
+                file.parent = g
+                g.children?.append(file)
             } else {
-                result.append(Node(entry: i, value: e, parent: node))
+                let g = oldGroups[key] ?? Node(groupOf: file, key: key, parent: node)
+                g.parent = node
+                g.children = [file]
+                file.parent = g
+                groups[key] = g
+                rows.append(g)
             }
         }
-        node.order = result.map(\.entry)
-        return result
+        // A "group" of one is just the file.
+        rows = rows.map { r in
+            guard r.kind == .group, let only = r.children?.first, r.children?.count == 1 else { return r }
+            only.parent = node
+            return only
+        }
+        for r in rows where r.kind == .group {
+            r.expandable = true
+            r.moreCount = r.children?.count ?? 0
+        }
+        listMax = max(1, rows.map { valueSize($0) }.max() ?? 1)
+        node.order = rows.map(\.entry)
+        if groupCopies { rows.sort { valueSize($0) > valueSize($1) } }
+        return rows
     }
 
     /// Lock held.
     private func loadChildren(_ node: Node) {
-        if node.kind == .list {
-            node.children = buildList(node)
-        } else if node.isDir {
-            node.children = buildChildren(node, order: sortedOrder(node))
-        } else {
-            node.children = []
+        switch node.kind {
+        case .list: node.children = buildList(node)
+        case .dir: node.children = buildChildren(node, order: sortedOrder(node))
+        case .group: break // members were assigned by buildList
+        default: node.children = []
         }
     }
 
@@ -284,6 +379,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         case .dir: tree.entry(tree.dirEntry(n.dir)).size
         case .more: n.moreBytes
         case .unseen: session.unseenBytes
+        case .group: (n.children ?? []).reduce(0) { $0 + tree.entry($1.entry).size }
         case .list: 0
         }
     }
@@ -313,16 +409,24 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             v.hasItems = true
         case .unseen:
             v.size = session.unseenBytes
+        case .group:
+            v.size = valueSize(n)
+            v.modified = (n.children ?? []).map { tree.entry($0.entry).aux }.max() ?? 0
+            v.copies = n.children?.count ?? 0
         case .list:
             break
         }
-        if case .list = source {
+        if source.isList && n.parent === root {
+            // Bars compare hits with each other; the percentage says how much
+            // of the explored folder each one is.
             v.parentSize = tree.entry(tree.dirEntry(session.focus)).size
+            v.barBase = listMax
         } else if let p = n.parent {
             v.parentSize = valueSize(p)
             if p.kind == .dir && p.dir == 0 && session.isVolume, let cap = session.capacity {
                 v.parentSize = max(v.parentSize, cap.total - cap.free)
             }
+            v.barBase = v.parentSize
         }
         return v
     }
@@ -341,14 +445,14 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
 
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
         let n = node(item)
-        n.shownExpandable = n.isDir && n.expandable
+        n.shownExpandable = (n.isDir || n.kind == .group) && n.expandable
         return n.shownExpandable
     }
 
     func outlineView(_ outlineView: NSOutlineView, shouldExpandItem item: Any) -> Bool {
         // Always open onto fresh contents.
         let n = node(item)
-        tree.withLock { loadChildren(n) }
+        if n.isDir { tree.withLock { loadChildren(n) } }
         return true
     }
 
@@ -373,12 +477,9 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     private func resortAll() {
         let selected = selectedNodes()
         tree.withLock {
-            for n in activeNodes() where n.kind != .list { n.children = buildChildren(n, order: sortedOrder(n)) }
+            for n in activeNodes() where n.isDir { n.children = buildChildren(n, order: sortedOrder(n)) }
         }
-        if case .list = source {
-            // Lists are sorted by size at the source; re-sort locally.
-            sortListRoot()
-        }
+        if source.isList { sortListRoot() }
         outline.reloadData()
         restoreSelection(selected)
     }
@@ -386,9 +487,8 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     private func sortListRoot() {
         guard var kids = root.children else { return }
         let key = sortKey, asc = ascending
-        let names = tree.withLock { kids.map { $0.name(in: tree) } }
-        let sizes = tree.withLock { kids.map { valueSize($0) } }
-        let mtimes = tree.withLock { kids.map { values(for: $0).modified } }
+        let names = kids.map { $0.name(in: tree) }
+        let (sizes, mtimes) = tree.withLock { (kids.map { valueSize($0) }, kids.map { values(for: $0).modified }) }
         var idx = Array(kids.indices)
         idx.sort { a, b in
             switch key {
@@ -439,10 +539,11 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         }
     }
 
-    private var locationCache: [UInt32: String] = [:]
-
+    /// Where a list hit lives. Rows nested under a hit (or a group) don't
+    /// repeat it, except group members, whose locations are the point.
     private func location(of n: Node) -> String {
-        guard n.isReal else { return "" }
+        if n.kind == .group { return "\(n.children?.count ?? 0) places" }
+        guard n.isReal, n.parent === root || n.parent?.kind == .group else { return "" }
         let parentDir: UInt32 = tree.withLock { tree.entry(session.entryIndex(n.ref)).parent }
         if let hit = locationCache[parentDir] { return hit }
         let base = session.url.path
@@ -468,13 +569,13 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
 
     // MARK: Live refresh
 
-    /// Root plus every expanded node that is actually on screen.
+    /// Root plus every expanded folder that is actually on screen.
     private func activeNodes() -> [Node] {
         var result = [root]
         var stack = root.children ?? []
         while let n = stack.popLast() {
-            guard n.isDir, outline.isItemExpanded(n) else { continue }
-            result.append(n)
+            guard n.isDir || n.kind == .group, outline.isItemExpanded(n) else { continue }
+            if n.isDir { result.append(n) }
             stack.append(contentsOf: n.children ?? [])
         }
         return result
@@ -496,14 +597,19 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         tree.withLock {
             for n in active {
                 if n.kind == .list {
-                    let live = n.children?.filter { !$0.isReal || tree.isLive(session.entryIndex($0.ref)) }
-                    if let live, live.count != n.children?.count { structural.append((n, live)) }
+                    // Rebuild if any hit (or copy) is gone.
+                    let dead = (n.children ?? []).contains { c in
+                        c.kind == .group
+                            ? (c.children ?? []).contains { !tree.isLive($0.entry) }
+                            : c.isReal && !tree.isLive(session.entryIndex(c.ref))
+                    }
+                    if dead { structural.append((n, buildList(n))) }
                     continue
                 }
                 guard n.isDir, tree.isLive(tree.dirEntry(n.dir)) else { continue }
                 let d = tree.dir(n.dir)
                 let hasUnseen = n.children?.contains { $0.kind == .unseen } ?? false
-                let wantsUnseen = n.dir == 0 && session.isVolume && session.unseenBytes > 0
+                let wantsUnseen = n.dir == 0 && !source.isList && session.isVolume && session.unseenBytes > 0
                 if d.first != n.stamp.first || d.count != n.stamp.count || hasUnseen != wantsUnseen {
                     structural.append((n, buildChildren(n, order: sortedOrder(n))))
                 } else if reorderDue {
@@ -541,30 +647,31 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             outline.reloadItem(n, reloadChildren: true)
         }
         updateVisibleValues()
-        debugExpandIfRequested()
-    }
-
-    // TEMP(debug): remove before shipping.
-    private var debugDone = false
-    private func debugExpandIfRequested() {
-        guard !debugDone, session.phase == .live, ProcessInfo.processInfo.environment["SILT_DEBUG_EXPAND"] != nil,
-              let first = outline.item(atRow: 0) as? Node else { return }
-        debugDone = true
-        outline.expandItem(first)
-        if let inner = first.children?.first(where: { $0.isDir }) { outline.expandItem(inner) }
-        outline.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
     }
 
     /// Moves rows into their new order with animation when the change is
     /// small enough to read; otherwise just reloads.
     private func applyReorder(_ n: Node, to kids: [Node]) {
         let item: Any? = n === root ? nil : n
-        guard var current = n.children, current.count == kids.count, kids.count <= 400 else {
+        guard var current = n.children, current.count == kids.count, kids.count <= 400,
+              Set(current.map(ObjectIdentifier.init)) == Set(kids.map(ObjectIdentifier.init))
+        else {
             n.children = kids
             outline.reloadItem(item, reloadChildren: true)
             return
         }
+        var moves = 0
+        var probe = current
+        for i in kids.indices where probe[i] !== kids[i] {
+            guard let j = probe[(i + 1)...].firstIndex(where: { $0 === kids[i] }) else { continue }
+            probe.insert(probe.remove(at: j), at: i)
+            moves += 1
+        }
         n.children = kids
+        if moves > 12 {
+            outline.reloadItem(item, reloadChildren: true)
+            return
+        }
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.25
             ctx.allowsImplicitAnimation = true
@@ -605,20 +712,23 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         outline.selectedRowIndexes.compactMap { outline.item(atRow: $0) as? Node }
     }
 
+    /// Reselects `nodes`. A file whose folder was relisted has a new node, so
+    /// it is found again by name among its folder's new children.
     private func restoreSelection(_ nodes: [Node]) {
-        let rows = IndexSet(nodes.map { outline.row(forItem: $0) }.filter { $0 >= 0 })
+        var rows = IndexSet()
+        for n in nodes {
+            var row = outline.row(forItem: n)
+            if row < 0, n.kind == .file, let kids = n.parent?.children {
+                let name = n.name(in: tree)
+                if let match = kids.first(where: { $0.kind == .file && $0.name(in: tree) == name }) {
+                    row = outline.row(forItem: match)
+                }
+            }
+            if row >= 0 { rows.insert(row) }
+        }
         if rows != outline.selectedRowIndexes {
             outline.selectRowIndexes(rows, byExtendingSelection: false)
         }
-    }
-
-    func select(_ ref: ItemRef) {
-        let n: Node? = ref.isDir ? dirNodes[ref.dir] : root.children?.first { $0.entry == ref.entry }
-        guard let n else { return }
-        let row = outline.row(forItem: n)
-        guard row >= 0 else { return }
-        outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-        outline.scrollRowToVisible(row)
     }
 
     private func targetNodes() -> [Node] {
@@ -633,10 +743,10 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
 
     @objc private func doubleClicked() {
         let row = outline.clickedRow
-        guard row >= 0, let n = outline.item(atRow: row) as? Node, n.isReal else { return }
-        if n.isDir {
+        guard row >= 0, let n = outline.item(atRow: row) as? Node else { return }
+        if n.isDir || n.kind == .group {
             if outline.isItemExpanded(n) { outline.collapseItem(n) } else { outline.expandItem(n) }
-        } else {
+        } else if n.isReal {
             session.reveal([n.ref])
         }
     }
@@ -687,13 +797,13 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             menu.addItem(i)
         }
 
-        item("Show in Finder", "magnifyingglass", key: "r") { [session] in session.reveal(refs) }
-        if let one, one.isDir {
+        item("Show in Finder", "arrow.up.right.square", key: "r") { [session] in session.reveal(refs) }
+        if let one, one.isDir, !source.isList {
             item("Focus on “\(one.name(in: tree))”", "arrow.down.right.circle",
                  key: String(Character(UnicodeScalar(NSDownArrowFunctionKey)!))) { [session] in
                 session.focus(on: one.ref)
             }
-        } else {
+        } else if !(one?.isDir ?? false) {
             item("Open", "arrow.up.forward.app") { [session] in session.open(refs) }
         }
         item("Quick Look", "eye", key: " ", mods: []) { [weak self] in self?.toggleQuickLook() }

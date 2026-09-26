@@ -15,26 +15,37 @@ struct TypesView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("File Types")
-                        .font(.system(size: 24, weight: .bold, design: .rounded))
-                    Text("Where the bytes are, by kind of file. Click an extension to find those files.")
-                        .font(.system(size: 13.5))
-                        .foregroundStyle(.secondary)
-                }
+        VStack(spacing: 0) {
+            PaneHeader(title: "File Types",
+                       subtitle: "Space by kind of file. Click an extension to find those files.",
+                       busy: loading)
+            Divider()
+            ScrollView { content }
+        }
+        .task(id: "\(session.focus)-\(session.phase == .live ? session.version / 4 : session.version / 40)") {
+            let tree = session.tree
+            let focus = session.focus
+            let result = await Task.detached(priority: .userInitiated) {
+                tree.extensionStats(under: focus, limit: 400)
+            }.value
+            stats = result
+            loading = false
+        }
+    }
+
+    private var content: some View {
+            VStack(alignment: .leading, spacing: 20) {
                 if loading && stats.isEmpty {
                     ProgressView().controlSize(.small)
                 } else {
                     let cats = categories
                     CategoryBar(parts: cats, total: total)
                         .frame(height: 16)
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 10)], alignment: .leading, spacing: 10) {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 16)], alignment: .leading, spacing: 10) {
                         ForEach(cats, id: \.0) { cat, bytes in
                             HStack(spacing: 8) {
                                 RoundedRectangle(cornerRadius: 3).fill(cat.color).frame(width: 10, height: 10)
-                                Text(cat.title).font(.system(size: 12.5)).lineLimit(1)
+                                Text(cat.shortTitle).font(.system(size: 13)).lineLimit(1)
                                 Spacer(minLength: 4)
                                 Text(Fmt.bytes(bytes))
                                     .font(.system(size: 12, weight: .medium).monospacedDigit())
@@ -48,20 +59,10 @@ struct TypesView: View {
                     extensions
                 }
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 20)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 18)
             .frame(maxWidth: 860, alignment: .leading)
             .frame(maxWidth: .infinity)
-        }
-        .task(id: "\(session.focus)-\(session.phase == .live ? session.version / 4 : session.version / 40)") {
-            let tree = session.tree
-            let focus = session.focus
-            let result = await Task.detached(priority: .userInitiated) {
-                tree.extensionStats(under: focus, limit: 400)
-            }.value
-            stats = result
-            loading = false
-        }
     }
 
     private var extensions: some View {
@@ -69,7 +70,7 @@ struct TypesView: View {
         let biggest = top.first?.bytes ?? 1
         return VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Extension").frame(width: 120, alignment: .leading)
+                Text("Extension").padding(.leading, 14).frame(width: 120, alignment: .leading)
                 Text("Kind").frame(width: 110, alignment: .leading)
                 Spacer()
                 Text("Files").frame(width: 80, alignment: .trailing)
@@ -104,7 +105,7 @@ private struct ExtRow: View {
                 HStack(spacing: 7) {
                     Circle().fill(cat.color).frame(width: 7, height: 7)
                     Text(stat.ext.isEmpty ? "No extension" : stat.ext == "*" ? "Everything else" : "." + stat.ext)
-                        .font(.system(size: 12.5, design: stat.ext.isEmpty || stat.ext == "*" ? .default : .monospaced))
+                        .font(.system(size: 13, design: stat.ext.isEmpty || stat.ext == "*" ? .default : .monospaced))
                         .lineLimit(1)
                 }
                 .frame(width: 120, alignment: .leading)
@@ -123,7 +124,7 @@ private struct ExtRow: View {
                     .foregroundStyle(.secondary)
                     .frame(width: 80, alignment: .trailing)
                 Text(Fmt.bytes(stat.bytes))
-                    .font(.system(size: 12.5, weight: .medium).monospacedDigit())
+                    .font(.system(size: 13, weight: .medium).monospacedDigit())
                     .frame(width: 84, alignment: .trailing)
             }
             .padding(.horizontal, 10)

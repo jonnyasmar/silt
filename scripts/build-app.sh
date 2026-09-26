@@ -30,7 +30,7 @@ fi
 echo "built $APP"
 
 if [[ "${1:-}" == "--install" ]]; then
-  osascript -e 'tell application id "com.jonnyasmar.silt" to quit' >/dev/null 2>&1 || true
+  pkill -x Silt >/dev/null 2>&1 || true
   rm -rf /Applications/Silt.app
   cp -R "$APP" /Applications/Silt.app
   open /Applications/Silt.app
