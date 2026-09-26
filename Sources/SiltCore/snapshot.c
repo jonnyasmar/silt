@@ -9,6 +9,7 @@
 #include "internal.h"
 
 #include <compression.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,8 +99,9 @@ bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *me
     queue[qtail++] = (b);                                                      \
   } while (0)
 
+  bool incomplete = (silt_dir_at(t, root->aux)->state & SILT_DIR_INCOMPLETE) != 0;
   PUSH(root->aux, 0);
-  while (qhead < qtail) {
+  while (qhead < qtail && !incomplete) {
     uint32_t old_id = queue[qhead++], new_id = queue[qhead++];
     const silt_dir *od = silt_dir_at(t, old_id);
     uint32_t first = (uint32_t)(entries.n / sizeof(silt_entry));
@@ -112,6 +114,9 @@ bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *me
       ne->parent = new_id;
       ne->name = put_name(&names, silt_name_ptr(t, e->name), e->name_len);
       if (e->kind == SILT_KIND_DIR) {
+        // A listing that failed partway may be missing changes whose events
+        // were already consumed: never persist it.
+        if (silt_dir_at(t, e->aux)->state & SILT_DIR_INCOMPLETE) incomplete = true;
         uint32_t child_new = (uint32_t)(dirs.n / sizeof(silt_dir));
         silt_dir *nd = grow(&dirs, sizeof *nd);
         *nd = *silt_dir_at(t, e->aux);
@@ -131,6 +136,12 @@ bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *me
 #undef PUSH
   silt_tree_unlock(t);
   free(queue);
+  if (incomplete) {
+    free(entries.p);
+    free(dirs.p);
+    free(names.p);
+    return false;
+  }
 
   // One payload: entries, then dirs, then names.
   size_t raw = entries.n + dirs.n + names.n;
@@ -167,12 +178,14 @@ bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *me
   h.compressed_bytes = packed_n;
 
   // Write beside the target, then rename over it.
+  // A unique temporary per save, so concurrent savers never share a file.
   size_t plen = strlen(path);
-  char *tmp = malloc(plen + 8);
+  char *tmp = malloc(plen + 16);
   if (!tmp) abort();
-  memcpy(tmp, path, plen);
-  memcpy(tmp + plen, ".tmp", 5);
-  FILE *f = fopen(tmp, "wb");
+  snprintf(tmp, plen + 16, "%s.XXXXXX", path);
+  int fd = mkstemp(tmp);
+  FILE *f = fd >= 0 ? fdopen(fd, "wb") : NULL;
+  if (!f && fd >= 0) close(fd);
   bool ok = f && fwrite(&h, sizeof h, 1, f) == 1 && fwrite(packed, 1, packed_n, f) == packed_n;
   if (f) ok = (fclose(f) == 0) && ok;
   free(packed);
@@ -182,13 +195,53 @@ bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *me
   return ok;
 }
 
+// Every invariant the rest of the engine relies on, checked before anyone
+// walks the tree. Cheap next to decompression (one pass over each array).
+static bool validate(const silt_tree *t) {
+  const uint32_t ne = t->entry_count, nd = t->dir_count;
+  const silt_entry *root = silt_entry_at(t, 0);
+  if (root->kind != SILT_KIND_DIR || root->aux != 0 || root->parent != SILT_NONE) return false;
+  for (uint32_t i = 0; i < ne; i++) {
+    const silt_entry *e = silt_entry_at(t, i);
+    uint64_t end = (uint64_t)e->name + e->name_len;
+    if (e->name_len == 0 || end > t->name_used ||
+        (e->name >> SILT_NAME_SHIFT) != ((end - 1) >> SILT_NAME_SHIFT))
+      return false; // out of range, or straddling an arena chunk
+    if (e->kind > SILT_KIND_OTHER) return false;
+    if (i > 0 && e->parent >= nd) return false;
+    if (e->kind == SILT_KIND_DIR && (e->aux >= nd || silt_dir_at(t, e->aux)->entry != i)) return false;
+  }
+  uint64_t covered = 1; // the root has no parent run
+  for (uint32_t d = 0; d < nd; d++) {
+    const silt_dir *x = silt_dir_at(t, d);
+    if (x->entry >= ne || silt_entry_at(t, x->entry)->kind != SILT_KIND_DIR ||
+        silt_entry_at(t, x->entry)->aux != d)
+      return false;
+    if ((uint64_t)x->first + x->count > ne || x->pending != 0) return false;
+    for (uint32_t i = x->first, end = x->first + x->count; i < end; i++) {
+      if (i == 0 || silt_entry_at(t, i)->parent != d) return false;
+    }
+    covered += x->count;
+  }
+  // Compacted: every entry belongs to exactly one run (so no cycles either).
+  return covered == ne;
+}
+
+#define MAX_ENTRIES (SILT_ENTRY_CHUNKS / 2 * (uint64_t)ENTRY_CHUNK)
+#define MAX_DIRS (SILT_DIR_CHUNKS / 2 * (uint64_t)DIR_CHUNK)
+#define MAX_NAMES (SILT_NAME_CHUNKS / 2 * (uint64_t)NAME_CHUNK)
+
 silt_tree *silt_tree_load(const char *path, silt_snapshot_meta *meta) {
   FILE *f = fopen(path, "rb");
   if (!f) return NULL;
+  struct stat st;
   snap_header h;
-  if (fread(&h, sizeof h, 1, f) != 1 || memcmp(h.magic, SNAP_MAGIC, 8) != 0 ||
-      h.version != SNAP_VERSION || h.entry_size != sizeof(silt_entry) ||
-      h.dir_size != sizeof(silt_dir) || h.entry_count == 0 || h.dir_count == 0 ||
+  if (fstat(fileno(f), &st) != 0 || fread(&h, sizeof h, 1, f) != 1 ||
+      memcmp(h.magic, SNAP_MAGIC, 8) != 0 || h.version != SNAP_VERSION ||
+      h.entry_size != sizeof(silt_entry) || h.dir_size != sizeof(silt_dir) ||
+      h.entry_count == 0 || h.dir_count == 0 || h.entry_count > MAX_ENTRIES ||
+      h.dir_count > MAX_DIRS || h.name_bytes > MAX_NAMES ||
+      h.compressed_bytes != (uint64_t)st.st_size - sizeof h ||
       h.raw_bytes != (uint64_t)h.entry_count * sizeof(silt_entry) +
                          (uint64_t)h.dir_count * sizeof(silt_dir) + h.name_bytes) {
     fclose(f);
@@ -196,8 +249,7 @@ silt_tree *silt_tree_load(const char *path, silt_snapshot_meta *meta) {
   }
   uint8_t *packed = malloc(h.compressed_bytes ? h.compressed_bytes : 1);
   uint8_t *raw = malloc(h.raw_bytes);
-  if (!packed || !raw) abort();
-  bool ok = fread(packed, 1, h.compressed_bytes, f) == h.compressed_bytes;
+  bool ok = packed && raw && fread(packed, 1, h.compressed_bytes, f) == h.compressed_bytes;
   fclose(f);
   if (ok) {
     size_t n = compression_decode_buffer(raw, h.raw_bytes, packed, h.compressed_bytes, NULL, COMPRESSION_LZ4);
@@ -211,33 +263,45 @@ silt_tree *silt_tree_load(const char *path, silt_snapshot_meta *meta) {
 
   silt_tree *t = calloc(1, sizeof *t);
   silt_internal *in = calloc(1, sizeof *in);
-  if (!t || !in) abort();
-  t->entries = calloc(SILT_ENTRY_CHUNKS, sizeof *t->entries);
-  t->dirs = calloc(SILT_DIR_CHUNKS, sizeof *t->dirs);
-  t->names = calloc(SILT_NAME_CHUNKS, sizeof *t->names);
-  if (!t->entries || !t->dirs || !t->names) abort();
+  if (t) {
+    t->entries = calloc(SILT_ENTRY_CHUNKS, sizeof *t->entries);
+    t->dirs = calloc(SILT_DIR_CHUNKS, sizeof *t->dirs);
+    t->names = calloc(SILT_NAME_CHUNKS, sizeof *t->names);
+  }
+  if (!t || !in || !t->entries || !t->dirs || !t->names) {
+    if (t) {
+      free(t->entries);
+      free(t->dirs);
+      free(t->names);
+    }
+    free(t);
+    free(in);
+    free(raw);
+    return NULL;
+  }
   in->lock = OS_UNFAIR_LOCK_INIT;
   t->internal = in;
 
+  bool alloc_ok = true;
   const uint8_t *p = raw;
-  for (uint32_t i = 0, c = 0; i < h.entry_count; i += ENTRY_CHUNK, c++) {
-    uint32_t n = h.entry_count - i < ENTRY_CHUNK ? h.entry_count - i : ENTRY_CHUNK;
+  for (uint64_t i = 0, c = 0; alloc_ok && i < h.entry_count; i += ENTRY_CHUNK, c++) {
+    uint64_t n = h.entry_count - i < ENTRY_CHUNK ? h.entry_count - i : ENTRY_CHUNK;
     t->entries[c] = malloc(ENTRY_CHUNK * sizeof(silt_entry));
-    if (!t->entries[c]) abort();
+    if (!(alloc_ok = t->entries[c] != NULL)) break;
     memcpy(t->entries[c], p, n * sizeof(silt_entry));
     p += n * sizeof(silt_entry);
   }
-  for (uint32_t i = 0, c = 0; i < h.dir_count; i += DIR_CHUNK, c++) {
-    uint32_t n = h.dir_count - i < DIR_CHUNK ? h.dir_count - i : DIR_CHUNK;
+  for (uint64_t i = 0, c = 0; alloc_ok && i < h.dir_count; i += DIR_CHUNK, c++) {
+    uint64_t n = h.dir_count - i < DIR_CHUNK ? h.dir_count - i : DIR_CHUNK;
     t->dirs[c] = malloc(DIR_CHUNK * sizeof(silt_dir));
-    if (!t->dirs[c]) abort();
+    if (!(alloc_ok = t->dirs[c] != NULL)) break;
     memcpy(t->dirs[c], p, n * sizeof(silt_dir));
     p += n * sizeof(silt_dir);
   }
-  for (uint32_t off = 0, c = 0; off < h.name_bytes; off += NAME_CHUNK, c++) {
-    uint32_t n = h.name_bytes - off < NAME_CHUNK ? h.name_bytes - off : NAME_CHUNK;
+  for (uint64_t off = 0, c = 0; alloc_ok && off < h.name_bytes; off += NAME_CHUNK, c++) {
+    uint64_t n = h.name_bytes - off < NAME_CHUNK ? h.name_bytes - off : NAME_CHUNK;
     t->names[c] = malloc(NAME_CHUNK);
-    if (!t->names[c]) abort();
+    if (!(alloc_ok = t->names[c] != NULL)) break;
     memcpy(t->names[c], p, n);
     p += n;
   }
@@ -247,14 +311,7 @@ silt_tree *silt_tree_load(const char *path, silt_snapshot_meta *meta) {
   t->dir_count = h.dir_count;
   t->name_used = h.name_bytes;
   t->generation = 1;
-  // Cheap sanity checks before anyone walks it.
-  const silt_entry *root = silt_entry_at(t, 0);
-  bool sane = root->kind == SILT_KIND_DIR && root->aux == 0 && root->parent == SILT_NONE;
-  for (uint32_t d = 0; sane && d < t->dir_count; d++) {
-    const silt_dir *x = silt_dir_at(t, d);
-    sane = x->entry < t->entry_count && (uint64_t)x->first + x->count <= t->entry_count;
-  }
-  if (!sane) {
+  if (!alloc_ok || !validate(t)) {
     silt_tree_destroy(t);
     return NULL;
   }

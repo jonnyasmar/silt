@@ -491,11 +491,14 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         let (sizes, mtimes) = tree.withLock { (kids.map { valueSize($0) }, kids.map { values(for: $0).modified }) }
         var idx = Array(kids.indices)
         idx.sort { a, b in
+            let order: ComparisonResult
             switch key {
-            case .name: return (names[a].localizedStandardCompare(names[b]) == .orderedAscending) == asc
-            case .modified: return (mtimes[a] < mtimes[b]) == asc
-            default: return (sizes[a] < sizes[b]) == asc
+            case .name: order = names[a].localizedStandardCompare(names[b])
+            case .modified: order = mtimes[a] == mtimes[b] ? .orderedSame : (mtimes[a] < mtimes[b] ? .orderedAscending : .orderedDescending)
+            default: order = sizes[a] == sizes[b] ? .orderedSame : (sizes[a] < sizes[b] ? .orderedAscending : .orderedDescending)
             }
+            if order == .orderedSame { return a < b } // stable
+            return (order == .orderedAscending) == asc
         }
         kids = idx.map { kids[$0] }
         root.children = kids

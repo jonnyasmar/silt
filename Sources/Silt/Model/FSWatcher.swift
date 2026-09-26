@@ -13,13 +13,19 @@ final class FSWatcher {
         var rootChanged: Bool { flags & UInt32(kFSEventStreamEventFlagRootChanged) != 0 }
         /// Marks the end of replayed history when started from a past id.
         var historyDone: Bool { flags & UInt32(kFSEventStreamEventFlagHistoryDone) != 0 }
+        /// Ids wrapped: continuity with any saved id is lost.
+        var idsWrapped: Bool { flags & UInt32(kFSEventStreamEventFlagEventIdsWrapped) != 0 }
     }
 
     private var stream: FSEventStreamRef?
     private let queue = DispatchQueue(label: "silt.fsevents", qos: .utility)
     private let handler: ([Event]) -> Void
-    /// The newest event id at creation: changes after it will be delivered.
+    /// Changes after this id are delivered. Without `since`, it's the newest
+    /// id at creation, and the stream starts from it, so nothing that happens
+    /// between reading it and starting the stream can slip through.
     let startId: FSEventStreamEventId
+    /// False if the stream couldn't be created or started.
+    private(set) var running = false
 
     init(path: String, since: FSEventStreamEventId? = nil, latency: TimeInterval = 0.4,
          handler: @escaping ([Event]) -> Void) {
@@ -43,13 +49,10 @@ final class FSWatcher {
             watcher.handler(events)
         }
         let flags = UInt32(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagWatchRoot)
-        stream = FSEventStreamCreate(
-            nil, callback, &context, [path] as CFArray,
-            since ?? FSEventStreamEventId(kFSEventStreamEventIdSinceNow), latency, flags
-        )
+        stream = FSEventStreamCreate(nil, callback, &context, [path] as CFArray, startId, latency, flags)
         if let stream {
             FSEventStreamSetDispatchQueue(stream, queue)
-            FSEventStreamStart(stream)
+            running = FSEventStreamStart(stream)
         }
     }
 

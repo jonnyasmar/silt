@@ -305,7 +305,7 @@ static void commit(silt_scanner *s, const work *w, batch *b, listing r) {
   if (w->dir >= t->dir_count) return;
   silt_dir *d = silt_dir_at(t, w->dir);
   const bool deep = w->deep || (d->state & SILT_DIR_DEEP);
-  d->state &= ~(SILT_DIR_QUEUED | SILT_DIR_DEEP);
+  d->state &= ~SILT_DIR_DEEP;
   if (!tree_dir_live(t, w->dir)) return; // its pending was already dropped
 
   const bool relisted = (d->state & SILT_DIR_LISTED) != 0;
@@ -476,6 +476,11 @@ static void process(silt_scanner *s, const work *w, batch *b) {
   b->n = 0;
   b->nlen = 0;
   b->nout = 0;
+  // From here on, a change to this folder must queue a fresh listing rather
+  // than fold into this one, which may already have read past it.
+  silt_tree_lock(s->tree);
+  if (w->dir < s->tree->dir_count) silt_dir_at(s->tree, w->dir)->state &= ~SILT_DIR_QUEUED;
+  silt_tree_unlock(s->tree);
   listing r = list_dir(b, w->path, w->dir == 0);
 
   silt_tree_lock(s->tree);

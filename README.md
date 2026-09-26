@@ -31,7 +31,7 @@ than trigger a privacy prompt for each one, and marks them as locked.
 | Copy path | ⌥⌘C |
 | Move to Trash | ⌘⌫ |
 | Delete immediately | ⌥⌘⌫ (asks first) |
-| Files · Largest · Reclaim · Types | ⌘1 – ⌘4 |
+| Files · Largest · Reclaim · Types | ⌘1 – ⌘4 (or the toolbar) |
 | Rescan | ⇧⌘R |
 
 Other features:
@@ -40,6 +40,8 @@ Other features:
   SwiftPM `.build`, DerivedData…), installers, model weights, and large files
   untouched for a year. It works from the scan, with no extra disk reads.
 - **File Types** breaks space down by kind and extension.
+- **Largest Files** folds copies (same name and size in several places) into
+  one row, so duplicates stand out.
 - **Search** matches names anywhere in the scan, largest first.
 
 ## How it's fast
@@ -53,6 +55,12 @@ Other features:
   folder, and names in a shared arena. About 1.2M entries fit in ~55 MB.
 - After the scan, an FSEvents stream re-lists only the folders that changed.
   Unchanged listings are updated in place.
+- **Instant relaunch.** A settled scan is saved as a compacted, LZ4-compressed
+  snapshot (about 26 MB for 1.2M items) in
+  `~/Library/Caches/com.jonnyasmar.silt/Snapshots`. Reopening the same
+  location shows it immediately, then FSEvents replays everything that changed
+  since, so only those folders are re-listed. Removable and network volumes
+  always rescan, and ⇧⌘R forces a fresh scan.
 - The UI is an `NSOutlineView` whose rows are created lazily. A 12 Hz tick
   refreshes only the visible cells and re-sorts expanded folders, animating
   the moves.

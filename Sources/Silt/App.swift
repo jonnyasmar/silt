@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 @main
 struct SiltApp: App {
@@ -17,6 +18,15 @@ struct SiltApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // Icon Services is slow to wake the first time; do it while the
+        // window is still being built.
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = NSWorkspace.shared.icon(for: .folder)
+            _ = NSWorkspace.shared.icon(for: .data)
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = false
     }
@@ -87,7 +97,13 @@ final class WindowModel {
         Self.active.append(WeakModel(model: self))
         let pending = Self.pendingOpen
         Self.pendingOpen = []
-        if let first = pending.first ?? Self.launchArgument() { scan(first) }
+        if let first = pending.first ?? Self.launchArgument() {
+            scan(first)
+        } else if let last = Self.lastScanToRestore(),
+                  hasFullDiskAccess || UserDefaults.standard.bool(forKey: "scanWithoutFDA")
+                  || !touchesPrivateFolders(last.path) {
+            scan(last)
+        }
         if let i = CommandLine.arguments.firstIndex(of: "--pane"), i + 1 < CommandLine.arguments.count,
            let p = Pane(rawValue: CommandLine.arguments[i + 1]) {
             pane = p
@@ -115,6 +131,18 @@ final class WindowModel {
         active.removeAll { $0.model == nil }
         let key = active.first { $0.model?.window?.isKeyWindow == true }?.model ?? active.last?.model
         if let key { key.scan(url) } else { pendingOpen.append(url) }
+    }
+
+    /// The first window reopens the last location, but only when a saved
+    /// snapshot makes that instant.
+    private static var restoredLast = false
+
+    private static func lastScanToRestore() -> URL? {
+        guard !restoredLast else { return nil }
+        restoredLast = true
+        guard let path = UserDefaults.standard.string(forKey: "lastScan"),
+              FileManager.default.fileExists(atPath: Snapshots.file(for: path).path) else { return nil }
+        return URL(fileURLWithPath: path)
     }
 
     /// `Silt <folder>` scans that folder on launch (first window only).
@@ -148,6 +176,7 @@ final class WindowModel {
         search = ""
         if let existing = sessions.first(where: { $0.url.path == path }) {
             current = existing
+            UserDefaults.standard.set(path, forKey: "lastScan")
             return
         }
         refreshLocations()
@@ -186,6 +215,7 @@ final class WindowModel {
     }
 
     private func start(_ url: URL) {
+        UserDefaults.standard.set(url.resolvingSymlinksInPath().path, forKey: "lastScan")
         let session = Session(url: url, guardPrivateFolders: !hasFullDiskAccess)
         sessions.append(session)
         current = session

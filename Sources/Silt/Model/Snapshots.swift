@@ -31,12 +31,16 @@ enum Snapshots {
         let savedAt: Date
     }
 
+    /// Older than this and the FSEvents journal may no longer reach back.
+    private static let maxAge: TimeInterval = 7 * 86400
+
     static func load(for url: URL, fullDiskAccess: Bool) -> Restored? {
         guard eligible(url) else { return nil }
         let path = file(for: url.path).path
         var meta = silt_snapshot_meta()
         guard let tree = silt_tree_load(path, &meta) else { return nil }
         var ok = (meta.flags & flagFullDiskAccess != 0) == fullDiskAccess
+            && Date().timeIntervalSince1970 - meta.saved_at < maxAge
         if ok, let uuid = FSWatcher.databaseUUID(for: url.path) {
             ok = withUnsafeBytes(of: uuid) { a in withUnsafeBytes(of: meta.volume_uuid) { b in a.elementsEqual(b) } }
         } else {

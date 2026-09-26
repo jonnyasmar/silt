@@ -77,6 +77,7 @@ final class Session: Identifiable {
     @ObservationIgnored private let fullDiskAccess: Bool
     @ObservationIgnored private var lastEventId: FSEventStreamEventId = 0
     @ObservationIgnored private var lastSave: TimeInterval = 0
+    @ObservationIgnored private var lastSaveAttempt: TimeInterval = 0
     @ObservationIgnored private var savedGeneration: UInt64 = 0
     @ObservationIgnored private var saving = false
 
@@ -90,7 +91,17 @@ final class Session: Identifiable {
         let values = try? resolved.resourceValues(forKeys: [.isVolumeKey])
         isVolume = values?.isVolume == true || resolved.path == "/"
         fullDiskAccess = !guardPrivateFolders
-        let restored = fresh ? nil : Snapshots.load(for: resolved, fullDiskAccess: fullDiskAccess)
+        var restored = fresh ? nil : Snapshots.load(for: resolved, fullDiskAccess: fullDiskAccess)
+        // A restore is only as good as the replay behind it.
+        var replay: FSWatcher?
+        if let r = restored {
+            replay = Session.makeWatcher(path: resolved.path, since: r.eventId, session: nil)
+            if replay?.running != true {
+                silt_tree_destroy(r.tree)
+                restored = nil
+                replay = nil
+            }
+        }
         tree = restored.map { Tree(restored: $0.tree, path: resolved.path) } ?? Tree(path: resolved.path)
         if guardPrivateFolders {
             let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -105,6 +116,7 @@ final class Session: Identifiable {
             restoredFrom = restored.savedAt
             catchingUp = true
             lastEventId = restored.eventId
+            replay?.stop()
             startWatching(since: restored.eventId)
         } else {
             tree.startScan()
@@ -180,21 +192,24 @@ final class Session: Identifiable {
 
         // Keep the snapshot reasonably fresh without rewriting it constantly.
         if phase == .live, !catchingUp, !saving, p.idle, gen != savedGeneration,
-           now - lastSave > (lastSave == 0 ? 1 : 300) {
+           now - lastSave > (lastSave == 0 ? 1 : 300), now - lastSaveAttempt > 5 {
             saveSnapshot(now: now, generation: gen)
         }
     }
 
     private func saveSnapshot(now: TimeInterval, generation: UInt64) {
         saving = true
-        lastSave = now
+        lastSaveAttempt = now
         let tree = tree, url = url, eventId = lastEventId, fda = fullDiskAccess
         Task { [weak self] in
             let ok = await Task.detached(priority: .utility) {
                 Snapshots.save(tree, url: url, eventId: eventId, fullDiskAccess: fda)
             }.value
             self?.saving = false
-            if ok { self?.savedGeneration = generation }
+            if ok {
+                self?.savedGeneration = generation
+                self?.lastSave = ProcessInfo.processInfo.systemUptime
+            }
         }
     }
 
@@ -227,13 +242,17 @@ final class Session: Identifiable {
     }
 
     private func startWatching(since: FSEventStreamEventId?) {
-        let w = FSWatcher(path: url.path, since: since) { [weak self] events in
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.handle(events) }
-            }
-        }
+        let w = Session.makeWatcher(path: url.path, since: since, session: self)
         watcher = w
         if since == nil { lastEventId = w.startId }
+    }
+
+    private static func makeWatcher(path: String, since: FSEventStreamEventId?, session: Session?) -> FSWatcher {
+        FSWatcher(path: path, since: since) { [weak session] events in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { session?.handle(events) }
+            }
+        }
     }
 
     private func handle(_ events: [FSWatcher.Event]) {
@@ -256,9 +275,17 @@ final class Session: Identifiable {
         guard !events.isEmpty else { return }
         var targets: [UInt32: Bool] = [:]
         let root = url.path
+        var rescanAll = false
         for event in events {
             if event.id > lastEventId && event.id != UInt64(kFSEventStreamEventIdSinceNow) { lastEventId = event.id }
             if event.historyDone { catchingUp = false }
+            // The root moved or was replaced, or ids wrapped: nothing about
+            // the current tree can be trusted to be incremental any more.
+            if event.rootChanged || event.idsWrapped { rescanAll = true }
+        }
+        if rescanAll {
+            tree.refresh(dir: 0, deep: true)
+            return
         }
         tree.withLock {
             for event in events {
@@ -358,7 +385,7 @@ final class Session: Identifiable {
     }
 
     /// Which object on disk a path named when we resolved it.
-    private struct Identity: Hashable {
+    fileprivate struct Identity: Hashable, Sendable {
         let dev: Int32
         let ino: UInt64
 
@@ -370,7 +397,7 @@ final class Session: Identifiable {
         }
     }
 
-    private struct Target {
+    fileprivate struct Target: Sendable {
         let entry: UInt32
         let url: URL
         let size: Int64
@@ -496,11 +523,10 @@ final class Session: Identifiable {
         for t in items { tree.remove(entry: t.entry) }
         selection = []
         show(Toast(symbol: "hourglass", title: "Deleting…", detail: nil))
-        let urls = items.map(\.url)
         Task.detached(priority: .userInitiated) {
             var failures: [URL: String] = [:]
-            for url in urls {
-                do { try FileManager.default.removeItem(at: url) } catch { failures[url] = error.localizedDescription }
+            for t in items {
+                if let problem = Self.quarantineAndDelete(t) { failures[t.url] = problem }
             }
             let failed = failures
             await MainActor.run { [weak self] in
@@ -517,6 +543,29 @@ final class Session: Identifiable {
                     self.show(Toast(symbol: "checkmark.circle", title: "Freed \(Fmt.bytes(bytes))", detail: nil))
                 }
             }
+        }
+    }
+
+    /// Renames the target to a private name first (atomic, same folder), then
+    /// checks that what moved is the object the user confirmed, and only then
+    /// deletes it. A lookalike that appeared at the path is moved back
+    /// untouched. Returns a problem description, or nil on success.
+    nonisolated private static func quarantineAndDelete(_ t: Target) -> String? {
+        let path = t.url.path
+        let parked = t.url.deletingLastPathComponent()
+            .appendingPathComponent(".silt-deleting-\(UUID().uuidString)").path
+        guard rename(path, parked) == 0 else { return String(cString: strerror(errno)) }
+        guard Identity(path: parked) == t.identity else {
+            _ = renamex_np(parked, path, UInt32(RENAME_EXCL))
+            return "It changed on disk after you confirmed, so it was left alone."
+        }
+        do {
+            try FileManager.default.removeItem(atPath: parked)
+            return nil
+        } catch {
+            // Partly deleted: put what's left back where the user expects it.
+            _ = renamex_np(parked, path, UInt32(RENAME_EXCL))
+            return error.localizedDescription
         }
     }
 
