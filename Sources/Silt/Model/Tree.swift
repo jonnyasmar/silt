@@ -64,7 +64,8 @@ final class Tree: @unchecked Sendable {
         return try body()
     }
 
-    var generation: UInt64 { withLock { raw.pointee.generation } }
+    /// An atomic read, so it needs no lock.
+    var generation: UInt64 { silt_tree_generation(raw) }
 
     // MARK: Lock-held accessors
 
@@ -132,6 +133,15 @@ final class Tree: @unchecked Sendable {
             var which = [UInt32](repeating: 0, count: limit)
             let n = Int(silt_find_files(raw, dir, ptrs, UInt32(extensions.count), &out, &which, UInt32(limit)))
             return (0..<n).map { (out[$0], Int(which[$0])) }
+        }
+    }
+
+    func filesAtLeast(_ minSize: Int64, skip: [String], skipPackages: Bool, limit: Int) -> [UInt32] {
+        withCStrings(skip) { ptrs in
+            [UInt32](unsafeUninitializedCapacity: limit) { buf, n in
+                n = Int(silt_files_at_least(raw, 0, minSize, ptrs, UInt32(skip.count), skipPackages,
+                                            buf.baseAddress!, UInt32(limit)))
+            }
         }
     }
 

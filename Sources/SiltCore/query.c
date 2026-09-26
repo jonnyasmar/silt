@@ -4,8 +4,10 @@
 #include "internal.h"
 
 #include <ctype.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 // MARK: Top-N heap
 
@@ -90,16 +92,36 @@ static void wpush(walker *w, uint32_t dir) {
   w->stack[w->n++] = dir;
 }
 
+// Lets anyone waiting on the lock (the UI, scanner commits) in every few
+// thousand entries. A relist leaves the old run allocated, but it is no
+// longer live and must not be returned by the query.
+static inline bool walk_breathe(silt_tree *t, uint32_t *budget, uint32_t dir,
+                                uint32_t first, uint32_t count) {
+  if (++*budget < 8192) return true;
+  *budget = 0;
+  silt_tree_unlock(t);
+  sched_yield();
+  silt_tree_lock(t);
+  if (!tree_dir_live(t, dir)) return false;
+  const silt_dir *d = silt_dir_at(t, dir);
+  return d->first == first && d->count == count;
+}
+
 // Calls `visit` for every live entry under `root_dir`. `visit` returns true to
-// descend into a folder.
+// descend into a folder. The lock is held, but released now and then.
 #define WALK(t, root_dir, e, index, body)                                      \
   do {                                                                         \
     walker w_ = {0};                                                           \
+    uint32_t budget_ = 0;                                                      \
     wpush(&w_, (root_dir));                                                    \
     while (w_.n) {                                                             \
-      const silt_dir *d_ = silt_dir_at((t), w_.stack[--w_.n]);                 \
-      for (uint32_t index = d_->first, end_ = d_->first + d_->count;           \
-           index < end_; index++) {                                            \
+      uint32_t dir_ = w_.stack[--w_.n];                                        \
+      if (dir_ >= (t)->dir_count || !tree_dir_live((t), dir_)) continue;        \
+      const silt_dir *d_ = silt_dir_at((t), dir_);                             \
+      uint32_t first_ = d_->first, count_ = d_->count;                         \
+      for (uint32_t index = first_, end_ = first_ + count_; index < end_;      \
+           index++) {                                                          \
+        if (!walk_breathe((t), &budget_, dir_, first_, count_)) break;          \
         const silt_entry *e = silt_entry_at((t), index);                       \
         if (e->flags & SILT_FLAG_REMOVED) continue;                            \
         bool descend_ = e->kind == SILT_KIND_DIR;                              \
@@ -192,6 +214,44 @@ uint32_t silt_find_dirs(silt_tree *t, uint32_t dir, const char *const *names,
     }
   });
   uint32_t n = heap_finish(&h);
+  silt_tree_unlock(t);
+  return n;
+}
+
+static bool is_package_name(const uint8_t *nm, uint32_t len) {
+  static const char *const exts[] = {".app", ".framework", ".bundle", ".photoslibrary", ".musiclibrary",
+                                     ".xcarchive", ".appex", ".plugin", ".kext", ".tvlibrary",
+                                     ".fcpbundle", ".imovielibrary", ".logicx", ".band", ".sparsebundle",
+                                     ".xcframework", ".docc", ".doccarchive", ".dSYM"};
+  for (size_t k = 0; k < sizeof exts / sizeof *exts; k++) {
+    size_t el = strlen(exts[k]);
+    if (len > el && strncasecmp((const char *)nm + len - el, exts[k], el) == 0) return true;
+  }
+  return false;
+}
+
+uint32_t silt_files_at_least(silt_tree *t, uint32_t dir, int64_t min_size,
+                             const char *const *skip, uint32_t skip_count,
+                             bool skip_packages, uint32_t *out, uint32_t cap) {
+  uint32_t lens[64];
+  if (skip_count > 64) skip_count = 64;
+  for (uint32_t k = 0; k < skip_count; k++) lens[k] = (uint32_t)strlen(skip[k]);
+  uint32_t n = 0;
+  silt_tree_lock(t);
+  WALK(t, dir, e, i, {
+    if (e->kind == SILT_KIND_DIR) {
+      const uint8_t *nm = silt_name_ptr(t, e->name);
+      if (skip_packages && is_package_name(nm, e->name_len)) descend_ = false;
+      for (uint32_t k = 0; descend_ && k < skip_count; k++) {
+        if (lens[k] == e->name_len && memcmp(nm, skip[k], lens[k]) == 0) descend_ = false;
+      }
+    } else if (e->kind == SILT_KIND_FILE &&
+               (e->size >= min_size ||
+                (e->flags & (SILT_FLAG_CLONE | SILT_FLAG_HARDLINK))) &&
+               n < cap) {
+      out[n++] = i;
+    }
+  });
   silt_tree_unlock(t);
   return n;
 }

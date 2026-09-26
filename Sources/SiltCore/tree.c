@@ -84,6 +84,10 @@ void silt_tree_unlock(silt_tree *t) {
   os_unfair_lock_unlock(&silt_int(t)->lock);
 }
 
+uint64_t silt_tree_generation(const silt_tree *t) {
+  return __atomic_load_n(&t->generation, __ATOMIC_ACQUIRE);
+}
+
 // MARK: Internal mutation
 
 void tree_reserve_entries(silt_tree *t, uint32_t n) {
@@ -363,6 +367,6 @@ void silt_tree_remove(silt_tree *t, uint32_t entry) {
   }
   e->flags |= SILT_FLAG_REMOVED;
   tree_propagate(t, e->parent, -e->size, -items, 0, -pending);
-  t->generation++;
+  TREE_BUMP(t);
   silt_tree_unlock(t);
 }

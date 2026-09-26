@@ -4,9 +4,10 @@ import SwiftUI
 struct ReclaimView: View {
     let session: Session
     let model: WindowModel
-    @State private var findings: [Finding] = []
-    @State private var analyzing = true
     @State private var expanded: Set<String> = []
+
+    private var findings: [Finding] { session.findings }
+    private var analyzing: Bool { session.analyzing || (session.phase == .live && session.findings.isEmpty && session.version == 0) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -16,25 +17,12 @@ struct ReclaimView: View {
                 list
             }
         }
-        .task(id: analysisKey) {
-            guard session.phase == .live else { return }
-            analyzing = true
-            if !findings.isEmpty { try? await Task.sleep(for: .milliseconds(600)) }
-            guard !Task.isCancelled else { return }
-            let tree = session.tree
-            let focus = session.focus
-            let result = await Task.detached(priority: .userInitiated) {
-                Reclaim.analyze(tree: tree, under: focus)
-            }.value
-            guard !Task.isCancelled else { return }
-            withAnimation(.easeOut(duration: 0.2)) { findings = result }
-            analyzing = false
-        }
+        .animation(.easeOut(duration: 0.2), value: findings.map(\.id))
     }
 
     private var list: some View {
             VStack(alignment: .leading, spacing: 22) {
-                if analyzing && findings.isEmpty {
+                if findings.isEmpty && (session.phase == .scanning || session.analyzing) {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
                         Text(session.phase == .scanning ? "Waiting for the scan to finish…" : "Looking for space to reclaim…")
@@ -55,14 +43,11 @@ struct ReclaimView: View {
             .frame(maxWidth: .infinity)
     }
 
-    private var analysisKey: String {
-        "\(session.focus)-\(session.phase == .live)-\(session.version / 3)"
-    }
-
     private var header: some View {
         let safe = findings.filter { $0.safety == .safe }.reduce(Int64(0)) { $0 + $1.bytes }
         let review = findings.filter { $0.safety == .review }.reduce(Int64(0)) { $0 + $1.bytes }
-        let place = session.focus == 0 ? session.title : "this folder"
+        let place = session.title
+        let safeFindings = findings.filter { $0.safety == .safe && !$0.isTrash }
         return PaneHeader(
             title: "Reclaim",
             subtitle: safe + review > 0
@@ -74,6 +59,13 @@ struct ReclaimView: View {
                 HStack(spacing: 8) {
                     Chip(color: .green, title: "Safe", value: Fmt.bytes(safe))
                     Chip(color: .orange, title: "Review", value: Fmt.bytes(review))
+                    if !safeFindings.isEmpty {
+                        Button("Mark All Safe") {
+                            for f in safeFindings { session.mark(entries: f.entries, reason: f.title) }
+                        }
+                        .controlSize(.small)
+                        .help("Marks every Safe to clear item for review in Cleanup")
+                    }
                 }
             }
         }
@@ -167,7 +159,7 @@ private struct FindingCard: View {
 
             if expanded {
                 Divider().padding(.horizontal, 12)
-                Members(session: session, entries: finding.isTrash ? finding.entries : finding.entries)
+                Members(session: session, entries: finding.entries, reason: finding.title)
                     .padding(.vertical, 6)
             }
         }
@@ -195,62 +187,42 @@ private struct FindingCard: View {
                 }
                 .help("Show in Finder")
                 .controlSize(.small)
-                if finding.safety == .safe {
+                let marked = allMarked
+                if finding.safety == .safe || marked {
                     Button {
-                        confirmTrash()
+                        if marked {
+                            let keys = session.tree.withLock { refs.compactMap { session.markKey(for: $0) } }
+                            session.unmark(keys)
+                        } else {
+                            session.mark(entries: finding.entries, reason: finding.title)
+                        }
                     } label: {
-                        Image(systemName: "trash")
+                        Label(marked ? "Marked" : "Mark", systemImage: marked ? "checkmark.circle.fill" : "checklist")
                     }
-                    .help("Move all to Trash")
+                    .help(marked ? "Remove from Cleanup" : "Mark for Cleanup")
                     .controlSize(.small)
+                    .tint(marked ? Brand.color : nil)
+                } else {
+                    // "Only you can say": look at each one rather than marking all.
+                    Button("Review") { withAnimation(.easeOut(duration: 0.18)) { expanded = true } }
+                        .controlSize(.small)
                 }
             }
         }
         .buttonStyle(.bordered)
     }
 
+    private var allMarked: Bool {
+        let r = refs
+        return !r.isEmpty && r.allSatisfy { session.isMarked($0) }
+    }
+
     private var refs: [ItemRef] {
         session.tree.withLock { finding.entries.filter { session.tree.isLive($0) }.map { session.ref(forEntry: $0) } }
     }
 
-    private func confirmTrash() {
-        let alert = NSAlert()
-        alert.messageText = "Move \(finding.title) to the Trash?"
-        alert.informativeText = finding.entries.count == 1
-            ? "\(Fmt.bytes(finding.bytes)) will move to the Trash."
-            : "\(finding.entries.count) folders, \(Fmt.bytes(finding.bytes)) in all, will move to the Trash."
-        alert.addButton(withTitle: "Move to Trash")
-        alert.addButton(withTitle: "Cancel")
-        let refs = refs
-        let run: (NSApplication.ModalResponse) -> Void = { r in
-            if r == .alertFirstButtonReturn { session.moveToTrash(refs) }
-        }
-        if let w = NSApp.keyWindow { alert.beginSheetModal(for: w, completionHandler: run) } else { run(alert.runModal()) }
-    }
-
     private func emptyTrash() {
-        let alert = NSAlert()
-        alert.messageText = "Empty the Trash?"
-        alert.informativeText = "This permanently frees \(Fmt.bytes(finding.bytes)). Finder will ask for permission the first time."
-        let b = alert.addButton(withTitle: "Empty Trash")
-        b.hasDestructiveAction = true
-        alert.addButton(withTitle: "Cancel")
-        let run: (NSApplication.ModalResponse) -> Void = { r in
-            guard r == .alertFirstButtonReturn else { return }
-            DispatchQueue.global(qos: .userInitiated).async {
-                var error: NSDictionary?
-                NSAppleScript(source: "tell application \"Finder\" to empty trash")?.executeAndReturnError(&error)
-                DispatchQueue.main.async {
-                    if let error {
-                        session.show(Toast(symbol: "exclamationmark.triangle", title: "Couldn’t empty the Trash",
-                                           detail: error[NSAppleScript.errorMessage] as? String))
-                    } else {
-                        session.show(Toast(symbol: "checkmark.circle", title: "Emptied the Trash", detail: nil))
-                    }
-                }
-            }
-        }
-        if let w = NSApp.keyWindow { alert.beginSheetModal(for: w, completionHandler: run) } else { run(alert.runModal()) }
+        session.emptyTrash(window: NSApp.keyWindow)
     }
 }
 
@@ -258,6 +230,7 @@ private struct FindingCard: View {
 private struct Members: View {
     let session: Session
     let entries: [UInt32]
+    var reason = ""
 
     private struct Row: Identifiable {
         let id: UInt32
@@ -272,7 +245,8 @@ private struct Members: View {
         let rows = load()
         VStack(spacing: 0) {
             ForEach(rows) { r in
-                MemberRow(session: session, ref: r.ref, name: r.name, location: r.location, size: r.size, isDir: r.isDir)
+                MemberRow(session: session, ref: r.ref, name: r.name, location: r.location, size: r.size, isDir: r.isDir,
+                          reason: reason)
             }
             if entries.count > rows.count {
                 Text("and \(Fmt.count(entries.count - rows.count)) more")
@@ -307,6 +281,7 @@ private struct MemberRow: View {
     let location: String
     let size: Int64
     let isDir: Bool
+    let reason: String
     @State private var hovering = false
 
     var body: some View {
@@ -324,13 +299,21 @@ private struct MemberRow: View {
                 .lineLimit(1)
                 .truncationMode(.head)
             Spacer(minLength: 8)
-            if hovering {
+            let marked = session.isMarked(ref)
+            HStack(spacing: 6) {
                 Button { session.reveal([ref]) } label: { Image(systemName: "arrow.up.right.square") }
-                    .buttonStyle(.borderless)
                     .help("Show in Finder")
-                Button { session.moveToTrash([ref]) } label: { Image(systemName: "trash") }
-                    .buttonStyle(.borderless)
-                    .help("Move to Trash")
+                Button { session.toggleMarks([ref], reason: reason) } label: {
+                    Image(systemName: marked ? "minus.circle" : "checklist")
+                }
+                .help(marked ? "Remove from Cleanup" : "Mark for Cleanup")
+            }
+            .buttonStyle(.borderless)
+            .opacity(hovering ? 1 : 0)
+            if marked {
+                Text("Cleanup")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Brand.color)
             }
             Text(Fmt.bytes(size))
                 .font(.system(size: 12).monospacedDigit())

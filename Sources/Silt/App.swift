@@ -43,7 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 enum Pane: String, CaseIterable, Identifiable {
-    case files, largest, reclaim, types
+    case files, largest, duplicates, reclaim, types
 
     var id: String { rawValue }
 
@@ -51,6 +51,7 @@ enum Pane: String, CaseIterable, Identifiable {
         switch self {
         case .files: "Files"
         case .largest: "Largest Files"
+        case .duplicates: "Duplicates"
         case .reclaim: "Reclaim"
         case .types: "File Types"
         }
@@ -60,6 +61,7 @@ enum Pane: String, CaseIterable, Identifiable {
         switch self {
         case .files: "Files"
         case .largest: "Largest"
+        case .duplicates: "Duplicates"
         case .reclaim: "Reclaim"
         case .types: "Types"
         }
@@ -69,13 +71,14 @@ enum Pane: String, CaseIterable, Identifiable {
         switch self {
         case .files: "list.bullet.indent"
         case .largest: "arrow.down.right.and.arrow.up.left.square"
+        case .duplicates: "square.on.square"
         case .reclaim: "sparkles"
         case .types: "chart.bar.xaxis"
         }
     }
 }
 
-enum ItemAction { case reveal, open, up, quickLook, copyPath, trash, delete }
+enum ItemAction { case reveal, open, up, quickLook, copyPath, trash, delete, mark }
 
 /// Per-window state: which locations have been scanned and what is showing.
 @MainActor
@@ -86,6 +89,7 @@ final class WindowModel {
     var pane: Pane = .files
     var search = ""
     var showInspector = true
+    var reviewingCleanup = false
     private(set) var locations: [Location] = Locations.all()
     private(set) var hasFullDiskAccess = FullDiskAccess.isGranted
     @ObservationIgnored weak var window: NSWindow?
@@ -222,7 +226,13 @@ final class WindowModel {
         pane = .files
     }
 
+    /// Rescans in place: everything stays visible while it's re-checked.
     func rescan() {
+        current?.rescan()
+    }
+
+    /// Throws the scan away and starts over (rarely needed).
+    func rescanFromScratch() {
         guard let old = current, let i = sessions.firstIndex(where: { $0 === old }) else { return }
         old.close()
         refreshLocations()
@@ -272,6 +282,7 @@ final class WindowModel {
         case .copyPath: s.copyPaths(sel)
         case .trash: s.moveToTrash(sel)
         case .delete: s.deleteImmediately(sel, window: window)
+        case .mark: s.toggleMarks(sel)
         }
     }
 }
@@ -301,6 +312,9 @@ struct SiltCommands: Commands {
             Button("Rescan") { model?.rescan() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
                 .disabled(model?.current == nil)
+            Button("Rescan from Scratch") { model?.rescanFromScratch() }
+                .keyboardShortcut("r", modifiers: [.command, .shift, .option])
+                .disabled(model?.current == nil)
         }
         CommandMenu("Item") {
             let none = model?.current?.selection.isEmpty ?? true
@@ -319,6 +333,13 @@ struct SiltCommands: Commands {
             Button("Copy Path") { model?.perform(.copyPath) }
                 .keyboardShortcut("c", modifiers: [.command, .option])
                 .disabled(none)
+            // Plain M is handled by the file list itself: as a menu key
+            // equivalent it would swallow typing in the search field.
+            Button("Mark for Cleanup   M") { model?.perform(.mark) }
+                .disabled(none)
+            Button("Review Cleanup…") { model?.reviewingCleanup = true }
+                .keyboardShortcut(.return, modifiers: [.command])
+                .disabled((model?.current?.markedCount ?? 0) == 0)
             Divider()
             Button("Move to Trash") { model?.perform(.trash) }
                 .keyboardShortcut(.delete)

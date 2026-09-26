@@ -16,8 +16,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SNAP_MAGIC "SILTSNP1"
-#define SNAP_VERSION 1u
+#define SNAP_MAGIC "SILTSNP2"
+#define SNAP_VERSION 2u // 2: clone-aware sizes
 #define NAME_CHUNK (1u << SILT_NAME_SHIFT)
 #define ENTRY_CHUNK (1u << SILT_ENTRY_SHIFT)
 #define DIR_CHUNK (1u << SILT_DIR_SHIFT)
@@ -310,7 +310,7 @@ silt_tree *silt_tree_load(const char *path, silt_snapshot_meta *meta) {
   t->entry_count = h.entry_count;
   t->dir_count = h.dir_count;
   t->name_used = h.name_bytes;
-  t->generation = 1;
+  TREE_BUMP(t);
   if (!alloc_ok || !validate(t)) {
     silt_tree_destroy(t);
     return NULL;

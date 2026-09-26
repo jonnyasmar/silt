@@ -17,6 +17,8 @@ struct InspectorView: View {
         var parentName: String
         var parentSize: Int64
         var top: [(name: String, size: Int64, isDir: Bool)]
+        var guidance: Guidance?
+        var rawAlloc: Int64 = 0
     }
 
     var body: some View {
@@ -78,18 +80,27 @@ struct InspectorView: View {
         notes(s)
 
         if !isFocus {
+            let marked = session.isMarked(s.ref)
             HStack(spacing: 8) {
                 Button("Show in Finder") { session.reveal([s.ref]) }
                 Button { session.quickLook?() } label: {
                     Image(systemName: "eye")
                 }
                 .help("Quick Look")
+                Button { session.toggleMarks([s.ref], reason: s.guidance?.title) } label: {
+                    Image(systemName: marked ? "minus.circle" : "checklist")
+                }
+                .help(marked ? "Remove from Cleanup (M)" : "Mark for Cleanup (M)")
+                .tint(marked ? Brand.color : nil)
                 Button(role: .destructive) { session.moveToTrash([s.ref]) } label: {
                     Image(systemName: "trash")
                 }
                 .help("Move to Trash")
             }
             .controlSize(.regular)
+            if let g = s.guidance {
+                GuidanceCard(guidance: g, marked: marked)
+            }
             details(s)
         }
 
@@ -132,6 +143,10 @@ struct InspectorView: View {
         if f & UInt8(SILT_FLAG_MOUNT) != 0 {
             Note(symbol: "externaldrive", color: .secondary,
                  text: "Another volume is mounted here. Scan it from the sidebar.") { EmptyView() }
+        }
+        if f & UInt8(SILT_FLAG_CLONE) != 0 {
+            Note(symbol: "square.on.square.dashed", color: .secondary,
+                 text: "An APFS clone: it shares \(Fmt.bytes(s.rawAlloc)) of blocks with other copies, so Silt counts only its share (\(Fmt.bytes(s.size))). Deleting it frees little unless every copy goes.") { EmptyView() }
         }
         if f & UInt8(SILT_FLAG_HARDLINK) != 0 {
             Note(symbol: "link", color: .secondary,
@@ -233,6 +248,11 @@ struct InspectorView: View {
                 let pe = tree.entry(tree.dirEntry(e.parent))
                 s.parentName = e.parent == 0 ? session.title : tree.name(of: pe)
                 s.parentSize = pe.size
+            }
+            s.guidance = Guide.classify(tree: tree, entry: i, name: s.name) { tree.path(of: i) }
+            if e.flags & UInt8(SILT_FLAG_CLONE) != 0 {
+                var st = stat()
+                if lstat(s.path, &st) == 0 { s.rawAlloc = Int64(st.st_blocks) * 512 }
             }
             return s
         }
@@ -365,5 +385,45 @@ struct CategoryBar: View {
             }
             .clipShape(Capsule())
         }
+    }
+}
+
+/// "What is this, and can it go?"
+private struct GuidanceCard: View {
+    let guidance: Guidance
+    let marked: Bool
+
+    private var tint: Color {
+        switch guidance.safety {
+        case .safe: .green
+        case .review: .orange
+        case .keep: .secondary
+        }
+    }
+
+    private var verdict: String {
+        switch guidance.safety {
+        case .safe: "Safe to clear"
+        case .review: "Worth a look"
+        case .keep: "Keep"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text(guidance.title).font(.system(size: 13, weight: .semibold))
+                Spacer(minLength: 4)
+                VerdictPill(safety: guidance.safety, marked: marked)
+            }
+            Text(LocalizedStringKey(guidance.detail))
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tint.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(tint.opacity(0.2)))
     }
 }

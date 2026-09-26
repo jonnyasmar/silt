@@ -57,7 +57,7 @@ struct RootView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .help("Files ⌘1 · Largest ⌘2 · Reclaim ⌘3 · Types ⌘4")
+                .help(Pane.allCases.enumerated().map { "\($1.shortTitle) ⌘\($0 + 1)" }.joined(separator: " · "))
             }
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
@@ -91,6 +91,10 @@ private struct SearchWhenScanned: ViewModifier {
     func body(content: Content) -> some View {
         if model.current != nil {
             content.searchable(text: $model.search, placement: .toolbar, prompt: "Search names")
+                .onSubmit(of: .search) {
+                    // Return in the field moves the keyboard to the results.
+                    NotificationCenter.default.post(name: .siltFocusResults, object: nil)
+                }
         } else {
             content
         }
@@ -189,16 +193,46 @@ private struct FolderSessionRow: View {
 
 struct CapacityBar: View {
     let fraction: Double
+    /// Share of the volume marked for cleanup: drawn hatched at the end of
+    /// the used part, the bit that would come back.
+    var marked: Double = 0
 
     var body: some View {
         GeometryReader { geo in
+            let used = geo.size.width * min(1, fraction)
+            let staged = min(used, geo.size.width * max(0, marked))
             ZStack(alignment: .leading) {
                 Capsule().fill(.quaternary)
                 Capsule()
                     .fill(fraction > 0.9 ? Color.orange : Brand.color)
-                    .frame(width: max(4, geo.size.width * min(1, fraction)))
+                    .frame(width: max(4, used))
+                if staged >= 1 {
+                    Stripes()
+                        .fill(Color.white.opacity(0.55))
+                        .frame(width: staged)
+                        .offset(x: used - staged)
+                        .clipShape(Capsule())
+                }
             }
         }
+    }
+}
+
+/// Diagonal hatching, the app's shorthand for "not settled yet".
+struct Stripes: Shape {
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        let step: CGFloat = 4
+        var x = rect.minX - rect.height
+        while x < rect.maxX {
+            p.move(to: CGPoint(x: x, y: rect.maxY))
+            p.addLine(to: CGPoint(x: x + 1.5, y: rect.maxY))
+            p.addLine(to: CGPoint(x: x + 1.5 + rect.height, y: rect.minY))
+            p.addLine(to: CGPoint(x: x + rect.height, y: rect.minY))
+            p.closeSubpath()
+            x += step
+        }
+        return p
     }
 }
 
@@ -242,17 +276,25 @@ struct Detail: View {
             VStack(spacing: 0) {
                 content(session)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if session.markedCount > 0 {
+                    CleanupBar(session: session, reviewing: $model.reviewingCleanup)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
                 StatusBar(session: session, model: model)
             }
             .overlay(alignment: .bottom) {
                 if let toast = session.toast {
                     ToastView(toast: toast)
-                        .padding(.bottom, 40)
+                        .padding(.bottom, session.markedCount > 0 ? 76 : 40)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                         .id(toast.id)
                 }
             }
             .animation(.spring(duration: 0.35), value: session.toast)
+            .animation(.spring(duration: 0.35), value: session.markedCount > 0)
+            .sheet(isPresented: $model.reviewingCleanup) {
+                CleanupSheet(session: session)
+            }
             .id(session.id)
         } else {
             StartView(model: model)
@@ -273,6 +315,7 @@ struct Detail: View {
                     TreeView(session: s, source: .folder(s.focus))
                 }
             case .largest: LargestFiles(session: s)
+            case .duplicates: DuplicatesView(session: s, finder: s.duplicates)
             case .reclaim: ReclaimView(session: s, model: model)
             case .types: TypesView(session: s, model: model)
             }
@@ -347,32 +390,25 @@ struct PathBar: View {
 struct StatusBar: View {
     let session: Session
     let model: WindowModel
+    @State private var showingChanges = false
 
     var body: some View {
         let s = session.stats
-        HStack(spacing: 10) {
+        HStack(spacing: 12) {
             leading(s)
             Spacer(minLength: 8)
-            if s.denied > 0 && !model.hasFullDiskAccess {
-                Button {
-                    FullDiskAccess.openSettings()
-                } label: {
-                    Label("\(Fmt.count(s.denied)) folders need Full Disk Access", systemImage: "lock")
-                        .foregroundStyle(.orange)
-                }
-                .buttonStyle(.plain)
-            }
-            if session.freedBytes > 0 {
-                Label("Freed \(Fmt.bytes(session.freedBytes))", systemImage: "checkmark.circle")
-                    .foregroundStyle(.green)
-            }
+            chips(s)
             if let cap = session.capacity {
                 HStack(spacing: 6) {
-                    CapacityBar(fraction: Double(cap.total - cap.available) / Double(max(cap.total, 1)))
+                    CapacityBar(fraction: Double(cap.total - cap.available) / Double(max(cap.total, 1)),
+                                marked: Double(session.markedBytes) / Double(max(cap.total, 1)))
                         .frame(width: 54, height: 5)
                     Text("\(Fmt.bytes(cap.available)) available")
                         .monospacedDigit()
                 }
+                .help(session.markedBytes > 0
+                      ? "\(Fmt.bytes(session.markedBytes)) marked for cleanup (hatched)"
+                      : "\(Fmt.bytes(cap.available)) available of \(Fmt.bytes(cap.total))")
             }
         }
         .font(.system(size: 11))
@@ -381,6 +417,56 @@ struct StatusBar: View {
         .frame(height: 28)
         .background(.bar)
         .overlay(alignment: .top) { Divider() }
+    }
+
+    /// Small, quiet pointers to the next useful thing.
+    @ViewBuilder
+    private func chips(_ s: ScanStats) -> some View {
+        if s.denied > 0 && !model.hasFullDiskAccess {
+            Chip(symbol: "lock", text: "\(Fmt.count(s.denied)) folders need Full Disk Access", tint: .orange) {
+                FullDiskAccess.openSettings()
+            }
+        }
+        if session.waitingInTrash > 0 {
+            Chip(symbol: "trash", text: "\(Fmt.bytes(session.waitingInTrash)) waiting in the Trash · Empty…", tint: Brand.color) {
+                session.emptyTrash(window: model.window)
+            }
+        } else if session.freedBytes > 0 {
+            Label("Freed \(Fmt.bytes(session.freedBytes))", systemImage: "checkmark.circle")
+                .foregroundStyle(.green)
+        }
+        if let delta = netChange, !session.changes.isEmpty {
+            Chip(symbol: delta >= 0 ? "arrow.up.right" : "arrow.down.right",
+                 text: "\(delta >= 0 ? "+" : "−")\(Fmt.bytesShort(abs(delta))) \(sinceText)",
+                 tint: delta >= 0 ? .orange : .green) {
+                showingChanges.toggle()
+            }
+            .popover(isPresented: $showingChanges, arrowEdge: .top) {
+                ChangesPopover(session: session, title: sinceText.capitalizedFirstLetter) { showingChanges = false }
+            }
+        }
+        let easy = session.findings.filter { $0.safety == .safe && !$0.isTrash }.reduce(Int64(0)) { $0 + $1.bytes }
+        if easy > 500_000_000, session.markedCount == 0, model.pane != .reclaim {
+            Chip(symbol: "sparkles", text: "\(Fmt.bytesShort(easy)) easy to reclaim", tint: Brand.color) {
+                model.pane = .reclaim
+                model.search = ""
+            }
+        }
+    }
+
+    /// The location's own net change (children would double-count).
+    private var netChange: Int64? {
+        session.changes.isEmpty || abs(session.netChange) < 100_000_000 ? nil : session.netChange
+    }
+
+    private var sinceText: String {
+        guard let d = session.baselineDate else { return "since the scan" }
+        if session.restoredFrom == nil { return "since the scan finished" }
+        let age = Date().timeIntervalSince(d)
+        if age < 3600 { return "in the last hour" }
+        if Calendar.current.isDateInToday(d) { return "since earlier today" }
+        if Calendar.current.isDateInYesterday(d) { return "since yesterday" }
+        return "since " + d.formatted(.relative(presentation: .named))
     }
 
     private var restoredAge: String {
@@ -397,30 +483,111 @@ struct StatusBar: View {
                 if session.stalled {
                     Text("Waiting on macOS — look for a permission prompt")
                         .foregroundStyle(.orange)
+                } else if let est = session.scanEstimate, est > 0 {
+                    Text("Scanning · \(min(99, s.items * 100 / est))% · \(Fmt.compactCount(s.items)) items")
+                        .monospacedDigit()
                 } else {
-                    Text("Scanning · \(Fmt.count(s.items)) items · \(Fmt.bytes(s.bytes)) · \(Fmt.duration(s.elapsed))")
+                    Text("Scanning · \(Fmt.compactCount(s.items)) items · \(Fmt.duration(s.elapsed))")
                         .monospacedDigit()
                 }
             }
         case .live:
             HStack(spacing: 6) {
-                if session.catchingUp {
+                if let r = session.rescanState {
+                    // Everything stays usable; this just says how far along it is.
+                    ProgressView(value: r.fraction)
+                        .progressViewStyle(.linear)
+                        .frame(width: 70)
+                        .controlSize(.small)
+                    Text(r.explicit ? "Rescanning in place · \(Int(r.fraction * 100))%"
+                                    : "Checking for changes · \(Int(r.fraction * 100))%")
+                        .monospacedDigit()
+                } else if session.catchingUp {
                     ProgressView().controlSize(.mini)
-                    Text("Restored the scan from \(restoredAge) · catching up on changes")
+                    Text("Catching up on changes since \(restoredAge)")
                 } else {
                     Circle().fill(.green).frame(width: 6, height: 6)
-                        .help("Watching for changes")
-                    if session.restoredFrom != nil {
-                        Text("Live · \(Fmt.count(s.items)) items · restored from \(restoredAge) and caught up")
-                            .monospacedDigit()
-                    } else {
-                        Text("Live · \(Fmt.count(s.items)) items scanned in \(Fmt.duration(s.finished))")
-                            .monospacedDigit()
-                    }
+                    Text("Live · \(Fmt.compactCount(s.items)) items")
+                        .monospacedDigit()
                 }
             }
+            .help(session.restoredFrom != nil
+                  ? "Restored from the scan saved \(restoredAge), then caught up with every change since. Watching for more."
+                  : "Scanned in \(Fmt.duration(s.finished)). Watching for changes.")
         }
     }
+}
+
+private struct Chip: View {
+    let symbol: String
+    let text: String
+    let tint: Color
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: symbol).foregroundStyle(tint)
+                Text(text).foregroundStyle(hovering ? .primary : .secondary)
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(tint.opacity(hovering ? 0.16 : 0.09), in: Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+}
+
+/// What grew or shrank since the baseline; each row jumps to the folder.
+private struct ChangesPopover: View {
+    let session: Session
+    let title: String
+    let dismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.system(size: 13, weight: .semibold))
+            ForEach(session.changes) { c in
+                Button {
+                    session.focus = session.tree.withLock {
+                        let p = session.tree.entry(session.tree.dirEntry(c.dir)).parent
+                        return p == NONE ? 0 : p
+                    }
+                    session.reveal(inTree: ItemRef(entry: session.tree.withLock { session.tree.dirEntry(c.dir) }, dir: c.dir))
+                    dismiss()
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "folder.fill")
+                            .foregroundStyle(Brand.color)
+                            .font(.system(size: 11))
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(c.name).font(.system(size: 12, weight: .medium))
+                            Text(c.path.replacingOccurrences(of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~"))
+                                .font(.system(size: 11))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                                .truncationMode(.head)
+                        }
+                        Spacer(minLength: 12)
+                        Text((c.delta > 0 ? "+" : "−") + Fmt.bytes(abs(c.delta)))
+                            .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                            .foregroundStyle(c.delta > 0 ? Color.orange : Color.green)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(14)
+        .frame(width: 340)
+    }
+}
+
+private extension String {
+    var capitalizedFirstLetter: String { prefix(1).uppercased() + dropFirst() }
 }
 
 struct ToastView: View {
@@ -436,6 +603,11 @@ struct ToastView: View {
                 if let d = toast.detail {
                     Text(d).font(.system(size: 12)).foregroundStyle(.secondary)
                 }
+            }
+            if let action = toast.action {
+                Button(action.title) { action.run() }
+                    .controlSize(.small)
+                    .padding(.leading, 4)
             }
         }
         .padding(.horizontal, 16)
@@ -459,4 +631,8 @@ struct WindowAccessor: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {
         DispatchQueue.main.async { onWindow(nsView.window) }
     }
+}
+
+extension Notification.Name {
+    static let siltFocusResults = Notification.Name("SiltFocusResults")
 }

@@ -35,18 +35,24 @@ enum {
   SILT_FLAG_DATALESS = 1 << 3, // cloud placeholder, no local data
   SILT_FLAG_HIDDEN = 1 << 4,   // dot-file or UF_HIDDEN
   SILT_FLAG_REMOVED = 1 << 5,  // deleted by the user; awaiting refresh
+  SILT_FLAG_CLONE = 1 << 6,    // APFS clone: shares blocks with other files
 };
 
 enum {
   SILT_DIR_QUEUED = 1 << 0,     // a listing of this directory is pending
   SILT_DIR_DETACHED = 1 << 1,   // no longer reachable from the root
   SILT_DIR_LISTED = 1 << 2,     // listed at least once
-  SILT_DIR_DEEP = 1 << 3,       // the pending listing must not reuse subfolders
+  SILT_DIR_DEEP = 1 << 3,       // the pending listing must revalidate the subtree
   SILT_DIR_INCOMPLETE = 1 << 4, // the last listing stopped early on an error
+  SILT_DIR_ACTIVE = 1 << 5,     // this directory is being listed now
+  SILT_DIR_DIRTY = 1 << 6,      // list it once more after the active listing
 };
 
 typedef struct silt_entry {
-  int64_t size;      // bytes on disk; directories: whole subtree
+  // Bytes on disk this entry accounts for; directories: whole subtree.
+  // Blocks shared by hard links or APFS clones are split between the files
+  // sharing them, so totals match what the volume actually stores.
+  int64_t size;
   uint32_t parent;   // dir id of the containing directory
   uint32_t name;     // offset into the name arena
   uint32_t aux;      // files: mtime (unix seconds); directories: dir id
@@ -115,6 +121,9 @@ void silt_tree_guard(silt_tree *t, const char *parent_path);
 void silt_tree_lock(silt_tree *t);
 void silt_tree_unlock(silt_tree *t);
 
+// Mutation counter, safe to read without the tree lock.
+uint64_t silt_tree_generation(const silt_tree *t);
+
 // MARK: Reading (hold the lock while a scan or refresh may be running)
 
 // Writes the absolute path of `entry` into `buf` (NUL-terminated). Returns the
@@ -143,6 +152,7 @@ typedef struct silt_progress {
   uint64_t dirs;
   uint64_t bytes;
   uint64_t denied;
+  uint64_t listed;  // entries listed so far, across scans and refreshes
   uint32_t queued;  // listings waiting or running
   uint32_t active;  // listings running right now
   bool idle;        // nothing queued or running
@@ -166,8 +176,10 @@ void silt_scanner_wait_idle(silt_scanner *s);
 void silt_scanner_destroy(silt_scanner *s);
 
 // Re-lists `dir`. Subfolders that still exist (same name and inode) keep
-// their scanned contents; new ones are scanned. With `deep`, the whole subtree
-// is rescanned instead. Duplicate requests coalesce; a deep request upgrades a
+// their scanned contents; new ones are scanned. With `deep`, every surviving
+// subfolder is re-listed too, recursively, but in place: sizes and identities
+// stay put until each folder's fresh listing replaces them, so a rescan never
+// empties the tree. Duplicate requests coalesce; a deep request upgrades a
 // pending shallow one.
 void silt_scanner_refresh(silt_scanner *s, uint32_t dir, bool deep);
 
@@ -220,6 +232,14 @@ uint32_t silt_search(silt_tree *t, uint32_t dir, const char *needle,
 uint32_t silt_find_dirs(silt_tree *t, uint32_t dir, const char *const *names,
                         uint32_t name_count, uint32_t *out, uint32_t *which,
                         uint32_t cap);
+
+// Every file under `dir` of at least `min_size` accounted bytes, plus all
+// clone/hard-link candidates whose divided accounting may be below the
+// threshold. Skips folders named in `skip` (dependency and build folders,
+// bundles). Unordered. Returns the count, at most `cap`.
+uint32_t silt_files_at_least(silt_tree *t, uint32_t dir, int64_t min_size,
+                             const char *const *skip, uint32_t skip_count,
+                             bool skip_packages, uint32_t *out, uint32_t cap);
 
 // Files under `dir` at least `min_size` bytes whose mtime is older than
 // `before` (unix seconds). Largest first. Returns the count.

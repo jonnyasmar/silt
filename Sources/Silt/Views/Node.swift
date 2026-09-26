@@ -32,6 +32,8 @@ final class Node: NSObject {
     var unseenNode: Node?
     /// Largest-files groups: same name and size in several places.
     var groupKey: String?
+    /// Guide.classify, computed once (nil inside means "nothing to say").
+    var guidance: Guidance??
 
     private var cachedName: String?
     private var cachedIcon: NSImage?

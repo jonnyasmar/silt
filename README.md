@@ -29,16 +29,47 @@ than trigger a privacy prompt for each one, and marks them as locked.
 | Enclosing folder | ⌘↑ |
 | Quick Look | Space |
 | Copy path | ⌥⌘C |
+| Mark for Cleanup | M (or the hover button) |
+| Review & clean up | ⌘↩ |
 | Move to Trash | ⌘⌫ |
 | Delete immediately | ⌥⌘⌫ (asks first) |
-| Files · Largest · Reclaim · Types | ⌘1 – ⌘4 (or the toolbar) |
-| Rescan | ⇧⌘R |
+| Files · Largest · Duplicates · Reclaim · Types | ⌘1 – ⌘5 (or the toolbar) |
+| Rescan in place | ⇧⌘R |
+| Rescan from scratch | ⌥⇧⌘R |
 
 Other features:
 
-- **Reclaim** finds known caches, build output (node_modules, Rust `target`,
-  SwiftPM `.build`, DerivedData…), installers, model weights, and large files
-  untouched for a year. It works from the scan, with no extra disk reads.
+- **Cleanup basket.** Mark anything with M, from Reclaim ("Mark All Safe"), or
+  from Duplicates ("Mark All Extras"). A bar above the status line keeps a
+  running, deduplicated total, and the capacity meter shows the marked share
+  hatched. The review sheet gives every item a safety verdict (and warns
+  about anything Silt would keep), can pull in everything Safe to clear, and
+  lets you choose between Trash and deleting now. Only Trash is on the Return
+  key. A mark remembers the exact file it was made on: if that file is
+  replaced by another with the same name, the mark is dropped, not carried
+  over. Marks survive a relaunch.
+- **Undo and follow-through.** "Moved to the Trash" toasts have Undo, which
+  puts everything back. The status bar remembers what's still waiting in the
+  Trash and offers to empty it.
+- **What changed.** Silt compares against the last scan (or the moment this
+  one finished) and shows the folders that grew or shrank most: a status-bar
+  chip ("+2.8 GB since yesterday") opens the list, and changed folders carry a
+  "+1.2 GB" tag in the tree.
+- **Guidance.** Rows for known things get a tag (Dependencies, Build output,
+  Cache, Installer…). The inspector explains what the selection is, whether
+  it's safe to remove, the exact reinstall command its lockfile implies, and
+  how long its project has sat untouched.
+- **Duplicates** finds files with identical contents. It compares size, then a
+  sampled hash, then a full SHA-256, and skips dependency and build folders
+  unless you ask. Results stream in, largest first. APFS clones already share
+  their blocks, so they aren't counted as waste. Before anything is marked,
+  every copy is re-checked against the exact file that was compared.
+- **Reclaim** finds known caches, build output (node_modules, Rust target
+  folders wherever they live, SwiftPM `.build`, DerivedData…), orphaned build
+  output whose project is gone, installers, model weights, and large files
+  untouched for a year. Build output in projects you haven't touched for
+  three months gets its own group at the top. It works from the scan, with no
+  extra disk reads.
 - **File Types** breaks space down by kind and extension.
 - **Largest Files** folds copies (same name and size in several places) into
   one row, so duplicates stand out.
@@ -61,6 +92,9 @@ Other features:
   location shows it immediately, then FSEvents replays everything that changed
   since, so only those folders are re-listed. Removable and network volumes
   always rescan, and ⇧⌘R forces a fresh scan.
+- **Rescans happen in place.** Every folder keeps its size and identity while
+  its fresh listing replaces it, so the tree stays usable. The status bar
+  shows a percentage, and folders still being re-checked show a hatched bar.
 - The UI is an `NSOutlineView` whose rows are created lazily. A 12 Hz tick
   refreshes only the visible cells and re-sorts expanded folders, animating
   the moves.
@@ -70,6 +104,9 @@ scans in 5–9 s; `du -sk` took 71 s.
 
 ## Sizes, precisely
 
-Sizes are **allocated bytes on disk**. A file with several hard links is split
-evenly across its links. APFS clones share blocks but each copy reports its
-full allocation, so totals can overstate what deleting a clone would free.
+Sizes are **bytes on disk, counted once**. Blocks shared by several hard links
+or APFS clones are split between the files sharing them. Full clones count
+`size ÷ clone count`; a partial clone counts its own blocks plus half of what
+it shares. On a volume full of cloned cargo target folders, Silt reports
+1,143 GB against 1,157 GB used according to `df` (the rest is APFS metadata and
+snapshots). The inspector shows a clone's full size alongside its share.

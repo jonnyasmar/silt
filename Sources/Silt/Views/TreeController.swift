@@ -28,8 +28,13 @@ final class SiltOutlineView: NSOutlineView {
     weak var controller: TreeController?
 
     override func keyDown(with event: NSEvent) {
-        if event.charactersIgnoringModifiers == " " && event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty {
+        let plain = event.modifierFlags.intersection([.command, .option, .control]).isEmpty
+        if event.charactersIgnoringModifiers == " " && plain {
             controller?.toggleQuickLook()
+            return
+        }
+        if event.charactersIgnoringModifiers?.lowercased() == "m" && plain {
+            controller?.toggleMarkOnSelection()
             return
         }
         super.keyDown(with: event)
@@ -102,6 +107,17 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         root = makeRoot(for: source)
         configureOutline()
         session.addListener(self) { [weak self] in self?.treeChanged() }
+        if source.isList {
+            NotificationCenter.default.addObserver(forName: .siltFocusResults, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let window = self.outline.window else { return }
+                    window.makeFirstResponder(self.outline)
+                    if self.outline.selectedRow < 0, self.outline.numberOfRows > 0 {
+                        self.outline.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+                    }
+                }
+            }
+        }
     }
 
     func teardown() {
@@ -246,6 +262,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     /// Lock held.
     private func buildChildren(_ node: Node, order fullOrder: [UInt32]) -> [Node] {
         let d = tree.dir(node.dir)
+        let relisted = node.stamp.first != d.first || node.stamp.count != d.count
         node.stamp = (d.first, d.count)
         node.order = fullOrder
         var order = fullOrder[...]
@@ -263,6 +280,8 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         var oldDirs: [UInt32: Node] = [:]
         for c in node.children ?? [] {
             if c.kind == .file { oldFiles[c.entry] = c } else if c.kind == .dir { oldDirs[c.dir] = c }
+            // Siblings changed, so what Guide says about them may have too.
+            if relisted { c.guidance = nil }
         }
         var result: [Node] = []
         result.reserveCapacity(order.count + 2)
@@ -403,6 +422,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             v.growing = d.pending > 0
             v.isDir = true
             v.hasItems = true
+            v.growth = session.growth(of: n.dir, now: e.size)
         case .more:
             v.size = n.moreBytes
             v.items = n.moreCount
@@ -415,6 +435,18 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             v.copies = n.children?.count ?? 0
         case .list:
             break
+        }
+        if n.isReal {
+            if !session.marks.isEmpty {
+                let key = session.markKey(for: n.ref)
+                v.marked = key.map { session.marks[$0] != nil } ?? false
+                v.covered = v.marked || session.isCovered(session.entryIndex(n.ref), key: nil)
+            }
+            if n.guidance == nil {
+                let i = session.entryIndex(n.ref)
+                n.guidance = .some(Guide.classify(tree: tree, entry: i, name: n.name(in: tree)) { tree.path(of: i) })
+            }
+            v.guidance = n.guidance ?? nil
         }
         if source.isList && n.parent === root {
             // Bars compare hits with each other; the percentage says how much
@@ -522,6 +554,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             cell.configure(node: n, name: name, image: icon, values: v)
             cell.onReveal = { [weak self] n in self?.session.reveal([n.ref]) }
             cell.onTrash = { [weak self] n in self?.session.moveToTrash([n.ref]) }
+            cell.onMark = { [weak self] n in self?.session.toggleMarks([n.ref]) }
             return cell
         case Self.shareColumn:
             _ = n.name(in: tree) // decode once so the bar can color by type
@@ -650,6 +683,10 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             outline.reloadItem(n, reloadChildren: true)
         }
         updateVisibleValues()
+        if !source.isList, let want = session.pendingSelect, want.isDir {
+            session.pendingSelect = nil
+            DispatchQueue.main.async { [weak self] in self?.select(want) }
+        }
     }
 
     /// Moves rows into their new order with animation when the change is
@@ -734,6 +771,31 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         }
     }
 
+    /// Selects a folder and scrolls to it, opening its ancestors so the row
+    /// exists.
+    func select(_ ref: ItemRef) {
+        guard ref.isDir else { return }
+        var chain: [UInt32] = tree.withLock {
+            var out: [UInt32] = []
+            var d = ref.dir
+            while d != NONE && d != root.dir {
+                out.append(d)
+                d = tree.entry(tree.dirEntry(d)).parent
+            }
+            return out
+        }
+        chain.reverse() // outermost first
+        for d in chain.dropLast() {
+            if let n = dirNodes[d], !outline.isItemExpanded(n) { outline.expandItem(n) }
+        }
+        guard let n = dirNodes[ref.dir] else { return }
+        let row = outline.row(forItem: n)
+        guard row >= 0 else { return }
+        outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        outline.scrollRowToVisible(row)
+        outline.window?.makeFirstResponder(outline)
+    }
+
     private func targetNodes() -> [Node] {
         let clicked = outline.clickedRow
         if clicked >= 0, !outline.selectedRowIndexes.contains(clicked), let n = outline.item(atRow: clicked) as? Node {
@@ -752,6 +814,12 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         } else if n.isReal {
             session.reveal([n.ref])
         }
+    }
+
+    func toggleMarkOnSelection() {
+        let refs = selectedNodes().filter(\.isReal).map(\.ref)
+        guard !refs.isEmpty else { return }
+        session.toggleMarks(refs)
     }
 
     func toggleQuickLook() {
@@ -816,6 +884,9 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             item("Rescan Folder", "arrow.clockwise") { [session] in session.rescan(one.ref) }
         }
         menu.addItem(.separator())
+        let allMarked = refs.allSatisfy { session.isMarked($0) }
+        item(allMarked ? "Remove from Cleanup" : "Mark for Cleanup", allMarked ? "minus.circle" : "checklist",
+             key: "m", mods: []) { [session] in session.toggleMarks(refs) }
         item("Move to Trash", "trash", key: "\u{8}") { [session] in session.moveToTrash(refs) }
         item("Delete Immediately…", "xmark.bin", key: "\u{8}", mods: [.command, .option]) { [weak self, session] in
             session.deleteImmediately(refs, window: self?.outline.window)
@@ -850,7 +921,13 @@ struct TreeView: NSViewRepresentable {
     func makeNSView(context: Context) -> NSScrollView {
         let c = context.coordinator
         DispatchQueue.main.async {
-            c.outline.window?.makeFirstResponder(c.outline)
+            // Take the keyboard only if nobody else has it: never out of the
+            // search field while someone is typing.
+            guard let window = c.outline.window else { return }
+            let current = window.firstResponder
+            if current == nil || current === window || current is NSOutlineView {
+                window.makeFirstResponder(c.outline)
+            }
         }
         return c.scroll
     }

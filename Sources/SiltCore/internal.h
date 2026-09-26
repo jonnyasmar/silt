@@ -5,10 +5,12 @@
 #include <os/lock.h>
 
 #define SILT_MAX_GUARDS 16
+#define TREE_BUMP(t) ((void)__atomic_add_fetch(&(t)->generation, 1, __ATOMIC_RELEASE))
 
 typedef struct silt_internal {
   os_unfair_lock lock;
   uint64_t dirs_listed;
+  uint64_t entries_listed;
   uint64_t denied;
   char *guards[SILT_MAX_GUARDS];
   uint32_t guard_count;

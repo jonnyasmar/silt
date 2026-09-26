@@ -10,6 +10,12 @@ struct RowValues {
     var barBase: Int64 = 0
     /// Rows standing for several identical files.
     var copies = 0
+    /// Marked for cleanup itself, or inside a marked folder.
+    var marked = false
+    var covered = false
+    var guidance: Guidance?
+    /// Change since the last scan, when it's worth pointing out.
+    var growth: Int64?
     var items: Int = 0
     var modified: UInt32 = 0
     var flags: UInt8 = 0
@@ -63,11 +69,14 @@ final class NameCell: NSTableCellView, ValueCell {
     private let label = NSTextField(labelWithString: "")
     private let badge = NSTextField(labelWithString: "")
     private let revealButton = NameCell.makeButton("arrow.up.right.square", tip: "Show in Finder")
+    private let markButton = NameCell.makeButton("checklist", tip: "Mark for Cleanup (M)")
     private let trashButton = NameCell.makeButton("trash", tip: "Move to Trash")
+    private var name = ""
     private var hovered = false
     private weak var node: Node?
     var onReveal: ((Node) -> Void)?
     var onTrash: ((Node) -> Void)?
+    var onMark: ((Node) -> Void)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -79,14 +88,17 @@ final class NameCell: NSTableCellView, ValueCell {
         badge.font = .systemFont(ofSize: 11)
         badge.textColor = .secondaryLabelColor
         badge.isHidden = true
-        for v in [icon, label, badge, revealButton, trashButton] as [NSView] { addSubview(v) }
+        for v in [icon, label, badge, revealButton, markButton, trashButton] as [NSView] { addSubview(v) }
         imageView = icon
         textField = label
         revealButton.target = self
         revealButton.action = #selector(reveal)
         trashButton.target = self
         trashButton.action = #selector(trash)
+        markButton.target = self
+        markButton.action = #selector(mark)
         revealButton.isHidden = true
+        markButton.isHidden = true
         trashButton.isHidden = true
     }
 
@@ -106,39 +118,80 @@ final class NameCell: NSTableCellView, ValueCell {
     func configure(node: Node, name: String, image: NSImage, values: RowValues) {
         self.node = node
         icon.image = image
-        label.stringValue = name
+        self.name = name
+        lastStyle = nil
         let actionable = node.isReal
         if !actionable { setHovered(false) }
         apply(values, node: node)
         needsLayout = true
     }
 
+    private var lastStyle: (NSColor, Bool)?
+
     func apply(_ values: RowValues, node: Node) {
         let f = values.flags
         let hidden = f & UInt8(SILT_FLAG_HIDDEN) != 0
         let primary = node.isReal || node.kind == .group
-        label.textColor = primary ? (hidden ? .secondaryLabelColor : .labelColor) : .secondaryLabelColor
+        var color: NSColor = primary ? (hidden ? .secondaryLabelColor : .labelColor) : .secondaryLabelColor
+        if values.covered { color = values.marked ? .secondaryLabelColor : .tertiaryLabelColor }
+        // Marked rows read as "going away": struck through, dimmed.
+        if lastStyle == nil || lastStyle!.0 != color || lastStyle!.1 != values.covered {
+            lastStyle = (color, values.covered)
+            // No explicit color in the string: the label's text color lets
+            // selected rows turn white like any other table text.
+            var attrs: [NSAttributedString.Key: Any] = [.font: label.font!]
+            if values.covered { attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
+            let para = NSMutableParagraphStyle()
+            para.lineBreakMode = .byTruncatingMiddle
+            attrs[.paragraphStyle] = para
+            label.attributedStringValue = NSAttributedString(string: name, attributes: attrs)
+            label.textColor = color
+        }
         let text: String?
-        var color = NSColor.secondaryLabelColor
+        var badgeColor = NSColor.secondaryLabelColor
         if f & UInt8(SILT_FLAG_DENIED) != 0 {
             text = "No access"
-            color = .systemOrange
+            badgeColor = .systemOrange
         } else if f & UInt8(SILT_FLAG_MOUNT) != 0 {
             text = "Other volume"
         } else if f & UInt8(SILT_FLAG_DATALESS) != 0 {
             text = "In iCloud"
-        } else if f & UInt8(SILT_FLAG_HARDLINK) != 0 {
-            text = "Hard link"
+        } else if values.marked {
+            text = "Cleanup"
+            badgeColor = Brand.ochre
+        } else if values.covered {
+            text = nil
+        } else if let g = values.growth {
+            text = (g > 0 ? "+" : "−") + Fmt.bytesShort(abs(g))
+            badgeColor = g > 0 ? .systemOrange : .systemGreen
         } else if values.copies > 1 {
             text = "\(values.copies) copies"
+        } else if f & UInt8(SILT_FLAG_CLONE) != 0 {
+            text = "Clone"
+        } else if f & UInt8(SILT_FLAG_HARDLINK) != 0 {
+            text = "Hard link"
+        } else if let g = values.guidance, !g.tag.isEmpty {
+            text = g.tag
+            switch g.safety {
+            case .safe: badgeColor = .systemGreen
+            case .review: badgeColor = .systemOrange
+            case .keep: badgeColor = .secondaryLabelColor
+            }
         } else {
             text = nil
         }
-        if badge.stringValue != (text ?? "") || badge.isHidden != (text == nil) {
+        let color_ = badgeColor
+        if badge.stringValue != (text ?? "") || badge.isHidden != (text == nil) || badge.textColor != color_ {
             badge.stringValue = text ?? ""
-            badge.textColor = color
+            badge.textColor = color_
             badge.isHidden = text == nil
             needsLayout = true
+        }
+        let symbol = values.marked ? "minus.circle" : "checklist"
+        if markButton.toolTip != (values.marked ? "Remove from Cleanup (M)" : "Mark for Cleanup (M)") {
+            markButton.toolTip = values.marked ? "Remove from Cleanup (M)" : "Mark for Cleanup (M)"
+            markButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: markButton.toolTip)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .medium))
         }
     }
 
@@ -147,6 +200,7 @@ final class NameCell: NSTableCellView, ValueCell {
         guard show != hovered else { return }
         hovered = show
         revealButton.isHidden = !show
+        markButton.isHidden = !show
         trashButton.isHidden = !show
         needsLayout = true
     }
@@ -159,10 +213,14 @@ final class NameCell: NSTableCellView, ValueCell {
         if hovered {
             trashButton.frame = NSRect(x: right - 20, y: (h - 20) / 2, width: 20, height: 20)
             right -= 22
+            markButton.frame = NSRect(x: right - 20, y: (h - 20) / 2, width: 20, height: 20)
+            right -= 22
             revealButton.frame = NSRect(x: right - 20, y: (h - 20) / 2, width: 20, height: 20)
             right -= 24
         }
-        if !badge.isHidden {
+        // While hovered the buttons take the badge's place, so nothing jumps.
+        badge.alphaValue = hovered ? 0 : 1
+        if !badge.isHidden && !hovered {
             let w = ceil(badge.intrinsicContentSize.width)
             badge.frame = NSRect(x: right - w, y: (h - 15) / 2, width: w, height: 15)
             right -= w + 8
@@ -173,6 +231,7 @@ final class NameCell: NSTableCellView, ValueCell {
 
     @objc private func reveal() { if let node { onReveal?(node) } }
     @objc private func trash() { if let node { onTrash?(node) } }
+    @objc private func mark() { if let node { onMark?(node) } }
 }
 
 // MARK: Share bar

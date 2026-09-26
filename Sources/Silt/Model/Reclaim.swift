@@ -83,8 +83,6 @@ enum Reclaim {
     private static let patterns: [Pattern] = [
         Pattern(name: "node_modules", sibling: "package.json", id: "node_modules", title: "node_modules",
                 detail: "JavaScript dependencies. Reinstall with your package manager."),
-        Pattern(name: "target", sibling: "Cargo.toml", id: "rust-target", title: "Rust build output",
-                detail: "`target` folders next to Cargo.toml. `cargo build` recreates them."),
         Pattern(name: ".build", sibling: "Package.swift", id: "swiftpm", title: "SwiftPM build output",
                 detail: "`.build` folders next to Package.swift."),
         Pattern(name: "DerivedData", sibling: nil, id: "project-deriveddata", title: "Project DerivedData",
@@ -157,13 +155,20 @@ enum Reclaim {
         let names = patterns.map(\.name)
         let matches = tree.findDirs(named: names, under: dir, limit: 20_000)
         var grouped: [Int: [UInt32]] = [:]
+        var orphanedModules: [UInt32] = []
         tree.withLock {
             for m in matches {
                 let p = patterns[m.which]
                 if let sibling = p.sibling {
                     let path = tree.path(of: m.entry)
                     let parent = (path as NSString).deletingLastPathComponent
-                    guard tree.lookup(parent + "/" + sibling) != NONE else { continue }
+                    guard tree.lookup(parent + "/" + sibling) != NONE else {
+                        // Dependencies whose project is gone.
+                        if p.name == "node_modules" && !isInside(tree, m.entry, claimed: claimed) {
+                            orphanedModules.append(m.entry)
+                        }
+                        continue
+                    }
                 }
                 // Skip anything inside a known location we already listed.
                 if isInside(tree, m.entry, claimed: claimed) { continue }
@@ -176,6 +181,62 @@ enum Reclaim {
             guard bytes > 50_000_000 else { continue }
             findings.append(Finding(id: p.id, title: p.title, detail: p.detail, symbol: "hammer",
                                     safety: .safe, entries: entries, bytes: bytes))
+        }
+
+        // node_modules with no package.json beside them: nothing installs them.
+        let orphanedModuleBytes = sizes(orphanedModules)
+        if orphanedModuleBytes > 20_000_000 {
+            findings.append(Finding(id: "node-orphaned", title: "Orphaned node_modules",
+                                    detail: "Dependency folders whose `package.json` is gone. Nothing will reinstall them.",
+                                    symbol: "shippingbox", safety: .safe, entries: orphanedModules,
+                                    bytes: orphanedModuleBytes))
+        }
+
+        // Rust build output wherever it lives: `.rustc_info.json` marks the root
+        // of a cargo target dir, even one kept on another volume and reached
+        // through a `target` symlink. If no project contains it or links to
+        // it, it's orphaned (often left behind by a deleted worktree).
+        var links = targetLinks()
+        // Plus any `target` symlink inside the scan itself.
+        let named = tree.search("target", under: dir, limit: 20_000)
+        let linkPaths: [String] = tree.withLock {
+            named.compactMap { i in
+                let e = tree.entry(i)
+                return e.isSymlink && tree.name(of: e) == "target" ? tree.path(of: i) : nil
+            }
+        }
+        for p in linkPaths {
+            if let dest = try? FileManager.default.destinationOfSymbolicLink(atPath: p) {
+                let base = (p as NSString).deletingLastPathComponent
+                let absolute = dest.hasPrefix("/") ? dest : (base as NSString).appendingPathComponent(dest)
+                links.insert(URL(fileURLWithPath: absolute).standardizedFileURL.resolvingSymlinksInPath().path)
+            }
+        }
+        var linkedRust: [UInt32] = [], orphanedRust: [UInt32] = []
+        let infos = tree.search(".rustc_info.json", under: dir, limit: 5000)
+        tree.withLock {
+            for f in infos {
+                let e = tree.entry(f)
+                guard !e.isDir, tree.name(of: e) == ".rustc_info.json", e.parent != NONE else { continue }
+                let root = tree.dirEntry(e.parent)
+                guard tree.isLive(root), !claimed.contains(root), !isInside(tree, root, claimed: claimed) else { continue }
+                let path = tree.path(of: root)
+                let parent = (path as NSString).deletingLastPathComponent
+                let inProject = tree.lookup(parent + "/Cargo.toml") != NONE
+                if inProject || links.contains(path) { linkedRust.append(root) } else { orphanedRust.append(root) }
+            }
+        }
+        let orphanedRustBytes = sizes(orphanedRust)
+        if orphanedRustBytes > 20_000_000 {
+            findings.append(Finding(id: "rust-orphaned", title: "Rust build output with no project",
+                                    detail: "Cargo target folders no project Silt could find links to, often left by deleted worktrees. At worst, deleting one costs a rebuild.",
+                                    symbol: "hammer", safety: .safe, entries: orphanedRust, bytes: orphanedRustBytes))
+        }
+        let linkedRustBytes = sizes(linkedRust)
+        if linkedRustBytes > 50_000_000 {
+            findings.append(Finding(id: "rust-target", title: "Rust build output",
+                                    detail: "Cargo target folders. The next `cargo build` recreates them, which can take a while.",
+                                    symbol: "hammer", safety: .safe, entries: linkedRust, bytes: linkedRustBytes))
         }
 
         let installers = tree.findFiles(extensions: installerExts, under: dir, limit: 2_000)
@@ -208,10 +269,95 @@ enum Reclaim {
                                     bytes: staleBytes))
         }
 
+        findings = splitDormant(tree: tree, findings)
         return findings.sorted { a, b in
             if a.isTrash != b.isTrash { return a.isTrash }
+            if (a.id == "dormant") != (b.id == "dormant") { return a.id == "dormant" }
             return a.bytes > b.bytes
         }
+    }
+
+    private static let buildFindings: Set<String> = [
+        "node_modules", "rust-target", "swiftpm", "project-deriveddata", "pods", "next", "turbo", "parcel",
+        "sveltekit", "project-gradle",
+    ]
+
+    /// Build output whose project hasn't been touched in three months is the
+    /// space you'll miss least: it moves out of its own group into one that
+    /// leads the list.
+    private static func splitDormant(tree: Tree, _ findings: [Finding]) -> [Finding] {
+        let cutoff = UInt32(Date().addingTimeInterval(-90 * 86400).timeIntervalSince1970)
+        var dormant: [UInt32] = []
+        var projects = Set<UInt32>()
+        var out: [Finding] = []
+        tree.withLock {
+            for f in findings {
+                guard buildFindings.contains(f.id) else {
+                    out.append(f)
+                    continue
+                }
+                var keep: [UInt32] = []
+                for i in f.entries where tree.isLive(i) {
+                    let e = tree.entry(i)
+                    guard e.parent != NONE else { continue }
+                    // The project's own last change, ignoring the build folder.
+                    let p = tree.dir(e.parent)
+                    var newest: UInt32 = 0
+                    for k in p.first..<(p.first + p.count) where k != i {
+                        let c = tree.entry(k)
+                        if c.isRemoved { continue }
+                        let m = c.isDir ? tree.dir(c.aux).newest : c.aux
+                        newest = max(newest, m)
+                    }
+                    if newest > 0 && newest < cutoff {
+                        dormant.append(i)
+                        projects.insert(e.parent)
+                    } else {
+                        keep.append(i)
+                    }
+                }
+                let bytes = keep.reduce(Int64(0)) { $0 + tree.entry($1).size }
+                if bytes > 20_000_000 {
+                    out.append(Finding(id: f.id, title: f.title, detail: f.detail, symbol: f.symbol, safety: f.safety,
+                                       entries: keep, bytes: bytes))
+                }
+            }
+        }
+        let bytes = tree.withLock { dormant.reduce(Int64(0)) { $0 + tree.entry($1).size } }
+        if bytes > 20_000_000 {
+            out.append(Finding(id: "dormant", title: "Build output in dormant projects",
+                               detail: "\(projects.count) \(projects.count == 1 ? "project" : "projects") untouched for 3+ months. Their dependencies and build folders come back with one install or build if you return.",
+                               symbol: "moon.zzz", safety: .safe, entries: dormant, bytes: bytes))
+        }
+        return out
+    }
+
+    /// Where projects' `target` symlinks point, for the usual places people
+    /// keep code. Lets a target folder on another volume be recognized as
+    /// still in use.
+    static func targetLinks() -> Set<String> {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser.path
+        var out = Set<String>()
+        func check(_ project: String) {
+            let link = project + "/target"
+            guard let dest = try? fm.destinationOfSymbolicLink(atPath: link) else { return }
+            let absolute = dest.hasPrefix("/") ? dest : (project as NSString).appendingPathComponent(dest)
+            out.insert(URL(fileURLWithPath: absolute).standardizedFileURL.resolvingSymlinksInPath().path)
+        }
+        for root in ["dev", "Developer", "Projects", "projects", "code", "Code", "src", "work", "repos", "git", "GitHub"] {
+            let base = home + "/" + root
+            guard let kids = try? fm.contentsOfDirectory(atPath: base) else { continue }
+            for k in kids {
+                let project = base + "/" + k
+                check(project)
+                // One level deeper for org/repo layouts.
+                if let inner = try? fm.contentsOfDirectory(atPath: project), inner.count < 200 {
+                    for i in inner { check(project + "/" + i) }
+                }
+            }
+        }
+        return out
     }
 
     /// Lock held. True if any ancestor of `entry` is in `claimed`.

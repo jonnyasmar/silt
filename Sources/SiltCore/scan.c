@@ -36,11 +36,17 @@ typedef struct batch {
   uint32_t n, cap;
   uint8_t *names;
   uint32_t nlen, ncap;
-  uint32_t *new_dirs; // batch index of each new folder to descend into
-  uint32_t *new_ids;  // ...and the dir id it was given
+  uint32_t *new_dirs; // batch index of each folder to list next
+  uint32_t *new_ids;  // ...its dir id
+  uint8_t *new_deep;  // ...and whether to revalidate beneath it
   uint32_t nnew, newcap;
+  // Partial APFS clones: their private size is fetched after the listing.
+  struct partial { uint32_t index; uint32_t links; int64_t alloc; } *partials;
+  uint32_t npartial, partialcap;
   work *out;
   uint32_t nout, outcap;
+  bool followup;
+  bool followup_deep;
   char *buf;
 } batch;
 
@@ -81,6 +87,18 @@ static void *xrealloc(void *p, size_t size) {
 // MARK: Listing
 
 static struct attrlist bulk_attrs = {
+    .bitmapcount = ATTR_BIT_MAP_COUNT,
+    .commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_ERROR |
+                  ATTR_CMN_OBJTYPE | ATTR_CMN_MODTIME | ATTR_CMN_FLAGS |
+                  ATTR_CMN_FILEID,
+    .dirattr = ATTR_DIR_MOUNTSTATUS,
+    .fileattr = ATTR_FILE_LINKCOUNT | ATTR_FILE_ALLOCSIZE,
+    // Clone tracking (APFS). Packed after the file attributes.
+    .forkattr = ATTR_CMNEXT_EXT_FLAGS | ATTR_CMNEXT_CLONE_REFCNT,
+};
+
+// The same, for file systems that reject extended attributes.
+static struct attrlist plain_attrs = {
     .bitmapcount = ATTR_BIT_MAP_COUNT,
     .commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_ERROR |
                   ATTR_CMN_OBJTYPE | ATTR_CMN_MODTIME | ATTR_CMN_FLAGS |
@@ -189,6 +207,28 @@ static uint32_t parse(batch *b, const char *buf, int count) {
         memcpy(&alloc, f, 8);
         f += 8;
       }
+      uint64_t ext = 0;
+      uint32_t clones = 0;
+      if (ret.forkattr & ATTR_CMNEXT_EXT_FLAGS) {
+        memcpy(&ext, f, 8);
+        f += 8;
+      }
+      if (ret.forkattr & ATTR_CMNEXT_CLONE_REFCNT) {
+        memcpy(&clones, f, 4);
+        f += 4;
+      }
+      // APFS clones share blocks, yet each reports its full allocation.
+      // Split shared blocks between the files sharing them, like hard links,
+      // so a folder of clones counts what the disk actually stores.
+      if (ext & EF_MAY_SHARE_BLOCKS && e.kind == SILT_KIND_FILE) {
+        e.flags |= SILT_FLAG_CLONE;
+        if (ext & EF_SHARES_ALL_BLOCKS) {
+          if (clones > 1) alloc /= clones;
+        } else {
+          GROW(b->partials, b->npartial, b->partialcap, 1);
+          b->partials[b->npartial++] = (struct partial){b->n, links, alloc};
+        }
+      }
       // Hard links split their blocks evenly, so totals are exact when every
       // link is inside the scan and the answer never depends on scan order.
       if (links > 1 && e.kind == SILT_KIND_FILE) {
@@ -224,15 +264,52 @@ static listing list_dir(batch *b, const char *path, bool root) {
     r.open_error = errno;
     return r;
   }
+  b->npartial = 0;
+  bool extended = true;
   for (;;) {
-    int n = getattrlistbulk(fd, &bulk_attrs, b->buf, BULK_BUFFER, 0);
+    int n = extended ? getattrlistbulk(fd, &bulk_attrs, b->buf, BULK_BUFFER, FSOPT_ATTR_CMN_EXTENDED)
+                     : getattrlistbulk(fd, &plain_attrs, b->buf, BULK_BUFFER, 0);
     if (n < 0) {
       if (errno == EINTR) continue;
+      if (errno == EINVAL && extended && b->n == 0) {
+        extended = false; // this file system doesn't do clone attributes
+        continue;
+      }
       r.read_error = errno;
       break;
     }
     if (n == 0) break;
     parse(b, b->buf, n);
+  }
+  // A partial clone shares only some blocks: count what's its own, plus half
+  // of what it shares. APFS doesn't say how many files share those blocks, so
+  // "half" is exact for the common case (a clone and its source) and an
+  // overcount when several partial clones share the same extents.
+  for (uint32_t k = 0; k < b->npartial; k++) {
+    struct partial pc = b->partials[k];
+    silt_entry *e = &b->ents[pc.index];
+    char name[1024];
+    if (e->name_len >= sizeof name) continue;
+    memcpy(name, b->names + e->name, e->name_len);
+    name[e->name_len] = 0;
+    struct attrlist al = {.bitmapcount = ATTR_BIT_MAP_COUNT,
+                          .commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_FILEID,
+                          .forkattr = ATTR_CMNEXT_PRIVATESIZE};
+    struct __attribute__((packed)) {
+      uint32_t len;
+      attribute_set_t ret;
+      uint64_t file_id;
+      int64_t priv;
+    } out;
+    memset(&out, 0, sizeof out);
+    if (getattrlistat(fd, name, &al, &out, sizeof out, FSOPT_ATTR_CMN_EXTENDED | FSOPT_NOFOLLOW) != 0 ||
+        !(out.ret.commonattr & ATTR_CMN_FILEID) ||
+        !(out.ret.forkattr & ATTR_CMNEXT_PRIVATESIZE) ||
+        out.file_id != b->ids[pc.index])
+      continue;
+    int64_t priv = out.priv < pc.alloc ? out.priv : pc.alloc;
+    int64_t size = priv + (pc.alloc - priv) / 2;
+    e->size = pc.links > 1 ? size / pc.links : size;
   }
   close(fd);
   return r;
@@ -297,16 +374,69 @@ static bool commit_in_place(silt_tree *t, uint32_t dir_id, batch *b,
   return true;
 }
 
+static void n_alloc_new_dirs(batch *b, uint32_t n) {
+  if (n <= b->newcap) return;
+  b->newcap = n;
+  b->new_dirs = xrealloc(b->new_dirs, n * sizeof *b->new_dirs);
+  b->new_ids = xrealloc(b->new_ids, n * sizeof *b->new_ids);
+  b->new_deep = xrealloc(b->new_deep, n);
+}
+
+// Queues an in-place re-listing of subfolder `dir` (batch index `i`) as part
+// of a deep refresh. Returns the pending units added to the parent's chain.
+// Lock held.
+static int64_t revalidate(silt_tree *t, batch *b, uint32_t dir, uint32_t i) {
+  silt_dir *od = silt_dir_at(t, dir);
+  if (od->state & SILT_DIR_QUEUED) {
+    od->state |= SILT_DIR_DEEP; // already waiting: just make it thorough
+    return 0;
+  }
+  if (od->state & SILT_DIR_ACTIVE) {
+    od->state |= SILT_DIR_DIRTY | SILT_DIR_DEEP;
+    return 0;
+  }
+  od->state |= SILT_DIR_QUEUED;
+  od->pending += 1;
+  b->new_dirs[b->nnew] = i;
+  b->new_ids[b->nnew] = dir;
+  b->new_deep[b->nnew++] = 1;
+  return 1;
+}
+
+// Completes the active unit and emits at most one replacement. Lock held;
+// the worker transfers the emitted item to the queue after releasing it.
+static void finish_listing(silt_tree *t, const work *w, batch *b) {
+  if (w->dir >= t->dir_count) return;
+  silt_dir *d = silt_dir_at(t, w->dir);
+  d->state &= ~SILT_DIR_ACTIVE;
+  if (!(d->state & SILT_DIR_DIRTY)) return;
+  d->state &= ~SILT_DIR_DIRTY;
+  if (!tree_dir_live(t, w->dir)) {
+    d->state &= ~SILT_DIR_DEEP;
+    return;
+  }
+  b->followup = true;
+  b->followup_deep = (d->state & SILT_DIR_DEEP) != 0;
+  d->state &= ~SILT_DIR_DEEP;
+  d->state |= SILT_DIR_QUEUED;
+  tree_propagate(t, w->dir, 0, 0, 0, 1);
+}
+
 // Installs the batch as the new contents of `w->dir`. Lock held.
 static void commit(silt_scanner *s, const work *w, batch *b, listing r) {
   silt_tree *t = s->tree;
   silt_internal *in = silt_int(t);
   b->nnew = 0;
-  if (w->dir >= t->dir_count) return;
+  if (w->dir >= t->dir_count) {
+    finish_listing(t, w, b);
+    return;
+  }
   silt_dir *d = silt_dir_at(t, w->dir);
-  const bool deep = w->deep || (d->state & SILT_DIR_DEEP);
-  d->state &= ~SILT_DIR_DEEP;
-  if (!tree_dir_live(t, w->dir)) return; // its pending was already dropped
+  const bool deep = w->deep;
+  if (!tree_dir_live(t, w->dir)) {
+    finish_listing(t, w, b); // its pending was already dropped
+    return;
+  }
 
   const bool relisted = (d->state & SILT_DIR_LISTED) != 0;
   const uint32_t dir_entry = d->entry;
@@ -327,7 +457,8 @@ static void commit(silt_scanner *s, const work *w, batch *b, listing r) {
     // had rather than replace it with a truncated listing.
     d->state |= SILT_DIR_INCOMPLETE;
     tree_propagate(t, w->dir, 0, 0, 0, pending_delta);
-    t->generation++;
+    TREE_BUMP(t);
+    finish_listing(t, w, b);
     return;
   }
 
@@ -340,17 +471,24 @@ static void commit(silt_scanner *s, const work *w, batch *b, listing r) {
     }
   }
 
-  if (relisted && !deep && !denied &&
-      commit_in_place(t, w->dir, b, &total, &items, &newest)) {
+  n_alloc_new_dirs(b, b->n);
+  if (relisted && !denied && commit_in_place(t, w->dir, b, &total, &items, &newest)) {
+    if (deep) {
+      for (uint32_t k = 0; k < d->count; k++) {
+        const silt_entry *o = silt_entry_at(t, d->first + k);
+        if (o->kind == SILT_KIND_DIR && !(o->flags & (SILT_FLAG_DENIED | SILT_FLAG_MOUNT)))
+          pending_delta += revalidate(t, b, o->aux, k);
+      }
+    }
     goto finish;
   }
 
   {
     const uint32_t n = b->n;
-    // Old folders by name, so a shallow refresh keeps their scanned subtrees.
+    // Old folders by name, so a refresh keeps their scanned subtrees.
     uint32_t *map = NULL;
     uint32_t mask = 0;
-    if (relisted && !deep && old_count > 0) {
+    if (relisted && old_count > 0) {
       uint32_t size = 16;
       while (size < old_count * 2) size *= 2;
       mask = size - 1;
@@ -372,11 +510,6 @@ static void commit(silt_scanner *s, const work *w, batch *b, listing r) {
     uint32_t name_base = tree_put_names(t, b->names, b->nlen, &contiguous);
     items = n;
 
-    if (n > b->newcap) {
-      b->newcap = n;
-      b->new_dirs = xrealloc(b->new_dirs, n * sizeof *b->new_dirs);
-      b->new_ids = xrealloc(b->new_ids, n * sizeof *b->new_ids);
-    }
     for (uint32_t i = 0; i < n; i++) {
       silt_entry e = b->ents[i];
       const uint8_t *local_name = b->names + e.name;
@@ -412,13 +545,15 @@ static void commit(silt_scanner *s, const work *w, batch *b, listing r) {
           od->entry = base + i;
           items += od->items;
           if (od->newest > newest) newest = od->newest;
+          if (deep && b->walk[i]) pending_delta += revalidate(t, b, o->aux, i);
         } else {
           bool walk = b->walk[i];
           e.aux = tree_new_dir(t, base + i, b->ids[i], walk ? 1 : 0,
                                walk ? SILT_DIR_QUEUED : SILT_DIR_LISTED);
           if (walk) {
             b->new_dirs[b->nnew] = i;
-            b->new_ids[b->nnew++] = e.aux;
+            b->new_ids[b->nnew] = e.aux;
+            b->new_deep[b->nnew++] = 0;
             pending_delta++;
           }
         }
@@ -429,7 +564,7 @@ static void commit(silt_scanner *s, const work *w, batch *b, listing r) {
       *silt_entry_at(t, base + i) = e;
     }
 
-    // Folders that disappeared (or every folder, on a deep rescan) drop out.
+    // Folders that disappeared drop out.
     if (relisted) {
       for (uint32_t i = old_first; i < old_first + old_count; i++) {
         const silt_entry *e = silt_entry_at(t, i);
@@ -456,13 +591,15 @@ finish:
                         (denied || incomplete ? SILT_FLAG_DENIED : 0));
   if (denied && !relisted) in->denied++;
   in->dirs_listed++;
+  in->entries_listed += b->n;
 
   int64_t size_delta = total - de->size;
   int64_t items_delta = items - (int64_t)d->items;
   d->newest = newest;
   tree_propagate(t, w->dir, size_delta, items_delta, newest, pending_delta);
   if (relisted && newest < old_newest) tree_recompute_newest(t, de->parent);
-  t->generation++;
+  TREE_BUMP(t);
+  finish_listing(t, w, b);
 }
 
 // MARK: Workers
@@ -472,14 +609,24 @@ static void enqueue_locked(silt_scanner *s, work w) {
   s->q[s->qcount++] = w;
 }
 
-static void process(silt_scanner *s, const work *w, batch *b) {
+static void process(silt_scanner *s, work *w, batch *b) {
   b->n = 0;
   b->nlen = 0;
   b->nout = 0;
+  b->followup = false;
+  b->followup_deep = false;
   // From here on, a change to this folder must queue a fresh listing rather
   // than fold into this one, which may already have read past it.
   silt_tree_lock(s->tree);
-  if (w->dir < s->tree->dir_count) silt_dir_at(s->tree, w->dir)->state &= ~SILT_DIR_QUEUED;
+  if (w->dir < s->tree->dir_count) {
+    silt_dir *d = silt_dir_at(s->tree, w->dir);
+    d->state &= ~SILT_DIR_QUEUED;
+    d->state |= SILT_DIR_ACTIVE;
+    if (d->state & SILT_DIR_DEEP) {
+      w->deep = true;
+      d->state &= ~SILT_DIR_DEEP;
+    }
+  }
   silt_tree_unlock(s->tree);
   listing r = list_dir(b, w->path, w->dir == 0);
 
@@ -490,7 +637,7 @@ static void process(silt_scanner *s, const work *w, batch *b) {
   // Build child paths outside the lock.
   size_t plen = strlen(w->path);
   bool slash = !(plen == 1 && w->path[0] == '/');
-  GROW(b->out, 0, b->outcap, b->nnew);
+  GROW(b->out, b->nout, b->outcap, b->nnew + (b->followup ? 1 : 0));
   for (uint32_t k = 0; k < b->nnew; k++) {
     const silt_entry *e = &b->ents[b->new_dirs[k]];
     size_t len = plen + (slash ? 1 : 0) + e->name_len;
@@ -501,8 +648,11 @@ static void process(silt_scanner *s, const work *w, batch *b) {
     if (slash) path[o++] = '/';
     memcpy(path + o, b->names + e->name, e->name_len);
     path[len] = 0;
-    b->out[b->nout++] = (work){.path = path, .dir = b->new_ids[k], .deep = false};
+    b->out[b->nout++] = (work){.path = path, .dir = b->new_ids[k], .deep = b->new_deep[k] != 0};
   }
+  if (b->followup)
+    b->out[b->nout++] =
+        (work){.path = strdup(w->path), .dir = w->dir, .deep = b->followup_deep};
 }
 
 static void *worker_main(void *arg) {
@@ -545,6 +695,8 @@ static void *worker_main(void *arg) {
   free(b.names);
   free(b.new_dirs);
   free(b.new_ids);
+  free(b.new_deep);
+  free(b.partials);
   free(b.out);
   free(b.buf);
   return NULL;
@@ -604,6 +756,7 @@ void silt_scanner_progress(silt_scanner *s, silt_progress *out) {
   const silt_dir *rd = silt_dir_at(t, root->aux);
   out->bytes = (uint64_t)root->size;
   out->dirs = silt_int(t)->dirs_listed;
+  out->listed = silt_int(t)->entries_listed;
   out->files = rd->items;
   out->denied = silt_int(t)->denied;
   silt_tree_unlock(t);
@@ -670,13 +823,19 @@ void silt_scanner_refresh(silt_scanner *s, uint32_t dir, bool deep) {
     silt_tree_unlock(t);
     return;
   }
+  if (d->state & SILT_DIR_ACTIVE) {
+    d->state |= SILT_DIR_DIRTY;
+    if (deep) d->state |= SILT_DIR_DEEP;
+    silt_tree_unlock(t);
+    return;
+  }
   if ((e->flags & SILT_FLAG_MOUNT) || silt_path(t, d->entry, path, sizeof path) == 0) {
     silt_tree_unlock(t);
     return;
   }
   d->state |= SILT_DIR_QUEUED;
   tree_propagate(t, dir, 0, 0, 0, 1);
-  t->generation++;
+  TREE_BUMP(t);
   silt_tree_unlock(t);
 
   pthread_mutex_lock(&s->qlock);
