@@ -319,12 +319,16 @@ private func allocated(_ path: String) -> Int64 {
     let dir = try #require(f.entry("busy")).aux
     silt_scanner_refresh(f.scanner, dir, false)
 
-    var progress = silt_progress()
+    // A worker counts as active a moment before it marks the folder, so wait
+    // for the folder itself.
+    var listing = false
     let deadline = Date().addingTimeInterval(5)
     repeat {
-        silt_scanner_progress(f.scanner, &progress)
-    } while progress.active == 0 && !progress.idle && Date() < deadline
-    #expect(progress.active == 1)
+        silt_tree_lock(f.tree)
+        listing = silt_dir_at(f.tree, dir).pointee.state & UInt32(SILT_DIR_ACTIVE) != 0
+        silt_tree_unlock(f.tree)
+    } while !listing && Date() < deadline
+    #expect(listing)
     silt_scanner_refresh(f.scanner, dir, false)
     silt_scanner_wait_idle(f.scanner)
 
@@ -391,4 +395,219 @@ private func allocated(_ path: String) -> Int64 {
     }.sorted()
     silt_tree_unlock(f.tree)
     #expect(names == ["a.jpg", "c.pdf"])
+}
+
+// MARK: In-place relisting and memory
+
+extension Fixture {
+    func index(_ rel: String) -> UInt32 {
+        silt_tree_lock(tree)
+        defer { silt_tree_unlock(tree) }
+        return silt_lookup(tree, root.appendingPathComponent(rel).path)
+    }
+
+    func live(_ index: UInt32) -> Bool {
+        silt_tree_lock(tree)
+        defer { silt_tree_unlock(tree) }
+        return silt_is_live(tree, index)
+    }
+
+    var memory: silt_memory {
+        var m = silt_memory()
+        silt_tree_memory_stats(tree, &m)
+        return m
+    }
+
+    func touch(_ rel: String, count: Int, prefix: String) {
+        let dir = root.appendingPathComponent(rel)
+        for i in 0..<count {
+            let fd = open(dir.appendingPathComponent("\(prefix)-\(i)").path, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR)
+            if fd >= 0 { close(fd) }
+        }
+    }
+
+    func remove(_ rel: String, count: Int, prefix: String) {
+        let dir = root.appendingPathComponent(rel)
+        for i in 0..<count { unlink(dir.appendingPathComponent("\(prefix)-\(i)").path) }
+    }
+}
+
+@Test func survivorsKeepTheirIndexWhenAFolderChanges() throws {
+    let f = try Fixture(["w/a.bin": 10_000, "w/b.bin": 20_000, "w/sub/x.bin": 30_000])
+    // The first change moves the folder to a run with room to spare...
+    try Fixture.write(f.root.appendingPathComponent("w/c.bin"), size: 40_000)
+    f.refresh("w")
+    let a = f.index("w/a.bin"), b = f.index("w/b.bin"), sub = f.entry("w/sub")!.aux
+    let run = f.dir("w")!
+    #expect(run.cap > run.count)
+    // ...so later ones happen in place: survivors keep their index.
+    try Fixture.write(f.root.appendingPathComponent("w/a.bin"), size: 90_000)
+    unlink(f.root.appendingPathComponent("w/b.bin").path)
+    try Fixture.write(f.root.appendingPathComponent("w/d.bin"), size: 5_000)
+    f.refresh("w")
+    let after = f.dir("w")!
+    #expect(after.first == run.first)
+    #expect(after.version != run.version)
+    #expect(f.index("w/a.bin") == a && f.live(a))
+    #expect(!f.live(b))
+    #expect(f.entry("w/b.bin") == nil)
+    #expect(f.live(f.index("w/d.bin")))
+    #expect(f.entry("w/sub")!.aux == sub)
+    #expect(f.size("w") == f.expected("w"))
+    #expect(f.size("") == f.expected(""))
+    #expect(f.dir("w")!.items == 5) // a, c, d, sub, sub/x
+    #expect(f.dir("")?.pending == 0)
+}
+
+@Test func aFileBecomingAFolderIsANewEntry() throws {
+    let f = try Fixture(["m/thing": 10_000, "m/other.bin": 1_000])
+    try Fixture.write(f.root.appendingPathComponent("m/extra.bin"), size: 1_000)
+    f.refresh("m") // now it has spare room
+    let old = f.index("m/thing")
+    unlink(f.root.appendingPathComponent("m/thing").path)
+    try Fixture.write(f.root.appendingPathComponent("m/thing/inside.bin"), size: 70_000)
+    f.refresh("m")
+    #expect(!f.live(old))
+    #expect(f.entry("m/thing")?.kind == UInt8(SILT_KIND_DIR))
+    #expect(f.size("m/thing") == f.expected("m/thing"))
+    #expect(f.size("m") == f.expected("m"))
+    #expect(f.dir("")?.pending == 0)
+}
+
+@Test func deepRefreshInPlaceRevalidatesSurvivors() throws {
+    let f = try Fixture(["q/keep/x.bin": 10_000, "q/y.bin": 1_000])
+    try Fixture.write(f.root.appendingPathComponent("q/z.bin"), size: 1_000)
+    f.refresh("q") // spare room from here on
+    try Fixture.write(f.root.appendingPathComponent("q/keep/new.bin"), size: 60_000)
+    try Fixture.write(f.root.appendingPathComponent("q/w.bin"), size: 2_000)
+    let keep = f.entry("q/keep")!.aux
+    f.refresh("q", deep: true)
+    #expect(f.entry("q/keep")!.aux == keep)
+    #expect(f.size("q/keep") == f.expected("q/keep"))
+    #expect(f.size("") == f.expected(""))
+    #expect(f.dir("")?.pending == 0)
+}
+
+@Test func vanishedFolderGivesBackItsSubtree() throws {
+    var layout: [String: Int] = ["v/keep.bin": 1_000]
+    for i in 0..<400 { layout["v/big/f\(i)"] = 10 }
+    let f = try Fixture(layout)
+    let before = f.memory.live_slots
+    try FileManager.default.removeItem(at: f.root.appendingPathComponent("v/big"))
+    f.refresh("v")
+    let after = f.memory
+    // Its 400 entries' run is released; the parent's new run takes a little.
+    #expect(after.live_slots + 380 <= before)
+    #expect(f.size("") == f.expected(""))
+    #expect(f.dir("")?.pending == 0)
+}
+
+@Test func churnKeepsMemoryFlatAndFreesChunks() throws {
+    let f = try Fixture(["hot/seed.bin": 1_000])
+    f.touch("hot", count: 8_000, prefix: "base")
+    f.refresh("hot")
+    // Each round replaces more files than the spare room holds, so the folder
+    // keeps moving to fresh runs; the old ones must be given back.
+    var stale: UInt32 = 0
+    for round in 0..<14 {
+        f.touch("hot", count: 5_000, prefix: "r\(round)")
+        if round > 0 { f.remove("hot", count: 5_000, prefix: "r\(round - 1)") }
+        f.refresh("hot")
+        if round == 5 { stale = f.index("hot/r5-0") }
+    }
+    let m = f.memory
+    #expect(m.chunks_freed > 0)
+    // What stays allocated is on the order of the folder, not of the churn.
+    #expect(m.live_slots < 40_000)
+    #expect(m.entry_bytes <= 4 * 65_536 * 24)
+    #expect(f.dir("hot")!.items == 13_001)
+    #expect(f.size("") == f.expected(""))
+
+    // A stale index into a freed chunk reads as removed and never faults.
+    #expect(stale >= 65_536)
+    silt_tree_lock(f.tree)
+    let e = silt_entry_at(f.tree, stale).pointee
+    var buf = [CChar](repeating: 0, count: 4096)
+    let len = silt_path(f.tree, stale, &buf, 4096)
+    #expect(!silt_is_live(f.tree, stale))
+    silt_tree_unlock(f.tree)
+    #expect(e.flags & UInt8(SILT_FLAG_REMOVED) != 0)
+    #expect(e.name_len == 0 && len == 0) // its chunk is gone
+}
+
+@Test func smallChurnStaysInPlace() throws {
+    let f = try Fixture(["t/seed.bin": 1_000])
+    f.touch("t", count: 2_000, prefix: "keep")
+    try Fixture.write(f.root.appendingPathComponent("t/x.tmp"), size: 1_000)
+    f.refresh("t")
+    let first = f.dir("t")!.first
+    let slots = f.memory.entry_slots
+    let names = f.memory.name_bytes
+    // Temp files come and go; the folder's run absorbs them.
+    for i in 0..<40 {
+        try Fixture.write(f.root.appendingPathComponent("t/tmp-\(i)"), size: 100)
+        if i > 0 { unlink(f.root.appendingPathComponent("t/tmp-\(i - 1)").path) }
+        f.refresh("t")
+    }
+    #expect(f.dir("t")!.first == first)
+    #expect(f.memory.entry_slots == slots)
+    #expect(f.memory.name_bytes - names < 40 * 8) // only the newcomers' names
+    #expect(f.size("t") == f.expected("t"))
+    #expect(f.dir("")?.pending == 0)
+}
+
+@Test func snapshotAfterInPlaceChangesIsCompact() throws {
+    let f = try Fixture(["s/a.bin": 1_000, "s/sub/b.bin": 2_000])
+    try Fixture.write(f.root.appendingPathComponent("s/c.bin"), size: 3_000)
+    f.refresh("s")
+    unlink(f.root.appendingPathComponent("s/a.bin").path)
+    try Fixture.write(f.root.appendingPathComponent("s/d.bin"), size: 4_000)
+    f.refresh("s") // leaves a hole and uses spare room
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("silt-\(UUID().uuidString).snap").path
+    defer { unlink(file) }
+    var meta = silt_snapshot_meta()
+    #expect(silt_tree_save(f.tree, file, &meta))
+    let t = try #require(silt_tree_load(file, &meta))
+    defer { silt_tree_destroy(t) }
+    silt_tree_lock(t)
+    #expect(silt_entry_at(t, 0).pointee.size == f.size(""))
+    let s = silt_lookup(t, f.root.appendingPathComponent("s").path)
+    let d = silt_dir_at(t, silt_entry_at(t, s).pointee.aux).pointee
+    #expect(d.count == 3 && d.cap == 3) // sub, c, d: the hole and the spare room are gone
+    silt_tree_unlock(t)
+    var m = silt_memory()
+    silt_tree_memory_stats(t, &m)
+    #expect(m.live_slots == m.entry_slots)
+}
+
+@Test func removingTheNewestItemUpdatesLastChanged() throws {
+    let f = try Fixture(["r/old.bin": 1_000, "r/new.bin": 1_000])
+    let old = Date(timeIntervalSince1970: 1_700_000_000), new = Date(timeIntervalSince1970: 1_800_000_000)
+    try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: f.root.appendingPathComponent("r/old.bin").path)
+    try FileManager.default.setAttributes([.modificationDate: new], ofItemAtPath: f.root.appendingPathComponent("r/new.bin").path)
+    f.refresh("r")
+    #expect(f.dir("r")?.newest == 1_800_000_000)
+    silt_tree_remove(f.tree, f.index("r/new.bin"))
+    #expect(f.dir("r")?.newest == 1_700_000_000)
+    #expect(f.dir("")?.newest == 1_700_000_000)
+}
+
+@Test func filesThatComeBackReuseTheirNames() throws {
+    var layout: [String: Int] = [:]
+    for i in 0..<40 { layout["n/keep-\(i)"] = 10 }
+    let f = try Fixture(layout)
+    let a = f.root.appendingPathComponent("n/a-fairly-long-file-name-that-keeps-coming-back.tmp")
+    let b = f.root.appendingPathComponent("n/b-fairly-long-file-name-that-keeps-coming-back.tmp")
+    try Fixture.write(a, size: 10)
+    f.refresh("n") // the folder now has spare room
+    let names = f.memory.name_bytes
+    // A save pattern: the same file renamed back and forth between two names.
+    for i in 0..<20 {
+        try FileManager.default.moveItem(at: i % 2 == 0 ? a : b, to: i % 2 == 0 ? b : a)
+        f.refresh("n")
+    }
+    // Each name is stored at most once per run it lives in, not per change.
+    #expect(f.memory.name_bytes - names < 4 * 60)
+    #expect(f.size("n") == f.expected("n"))
+    #expect(f.dir("n")!.items == 41)
 }

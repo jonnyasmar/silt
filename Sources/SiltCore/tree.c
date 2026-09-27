@@ -1,8 +1,10 @@
 #include "internal.h"
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/mman.h>
 
 #define ENTRY_CHUNK (1u << SILT_ENTRY_SHIFT)
 #define DIR_CHUNK (1u << SILT_DIR_SHIFT)
@@ -20,6 +22,38 @@ static void *xmalloc(size_t size) {
   return p;
 }
 
+// MARK: Freed chunks
+
+// Every freed entry chunk points here: one read-only chunk of REMOVED
+// entries, so a stale index anywhere reads as "gone" instead of faulting.
+static silt_entry *dead_chunk;
+static pthread_once_t dead_once = PTHREAD_ONCE_INIT;
+
+static void make_dead_chunk(void) {
+  size_t bytes = (size_t)ENTRY_CHUNK * sizeof(silt_entry);
+  void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (p == MAP_FAILED) abort();
+  silt_entry *e = p;
+  for (uint32_t i = 0; i < ENTRY_CHUNK; i++) {
+    e[i] = (silt_entry){
+        .size = 0,
+        .parent = SILT_NONE,
+        .name = 0,
+        .aux = 0,
+        .name_len = 0,
+        .kind = SILT_KIND_FILE,
+        .flags = SILT_FLAG_REMOVED,
+    };
+  }
+  if (mprotect(p, bytes, PROT_READ) != 0) abort();
+  dead_chunk = e;
+}
+
+silt_entry *tree_dead_chunk(void) {
+  pthread_once(&dead_once, make_dead_chunk);
+  return dead_chunk;
+}
+
 silt_tree *silt_tree_create(const char *root_path) {
   silt_tree *t = xcalloc(1, sizeof *t);
   t->entries = xcalloc(SILT_ENTRY_CHUNKS, sizeof *t->entries);
@@ -27,6 +61,7 @@ silt_tree *silt_tree_create(const char *root_path) {
   t->names = xcalloc(SILT_NAME_CHUNKS, sizeof *t->names);
   silt_internal *in = xcalloc(1, sizeof *in);
   in->lock = OS_UNFAIR_LOCK_INIT;
+  in->chunk_live = xcalloc(SILT_ENTRY_CHUNKS, sizeof *in->chunk_live);
   t->internal = in;
 
   size_t len = strlen(root_path);
@@ -47,6 +82,7 @@ silt_tree *silt_tree_create(const char *root_path) {
       .flags = 0,
   };
   t->entry_count = 1;
+  tree_claim_run(t, 0, 1); // the root's own entry belongs to no run
   return t;
 }
 
@@ -67,14 +103,16 @@ void silt_tree_destroy(silt_tree *t) {
   if (!t) return;
   for (uint32_t i = 0; i < silt_int(t)->guard_count; i++)
     free(silt_int(t)->guards[i]);
+  silt_entry *dead = tree_dead_chunk();
   for (uint32_t i = 0; i < SILT_ENTRY_CHUNKS && t->entries[i]; i++)
-    free(t->entries[i]);
+    if (t->entries[i] != dead) free(t->entries[i]);
   for (uint32_t i = 0; i < SILT_DIR_CHUNKS && t->dirs[i]; i++) free(t->dirs[i]);
   for (uint32_t i = 0; i < SILT_NAME_CHUNKS && t->names[i]; i++)
     free(t->names[i]);
   free(t->entries);
   free(t->dirs);
   free(t->names);
+  free(silt_int(t)->chunk_live);
   free(t->internal);
   free(t);
 }
@@ -110,14 +148,124 @@ uint32_t tree_new_dir(silt_tree *t, uint32_t entry, uint64_t file_id,
       .entry = entry,
       .first = 0,
       .count = 0,
+      .cap = 0,
       .items = 0,
       .newest = 0,
       .pending = pending,
       .state = state,
+      .version = 0,
+      .reserved = 0,
   };
   t->dir_count = id + 1;
   return id;
 }
+
+// MARK: Run accounting
+
+static void maybe_free_chunk(silt_tree *t, uint32_t c) {
+  silt_internal *in = silt_int(t);
+  // The chunk holding the append point may still be written.
+  if (in->chunk_live[c] != 0 || c >= (t->entry_count >> SILT_ENTRY_SHIFT)) return;
+  silt_entry *dead = tree_dead_chunk();
+  if (!t->entries[c] || t->entries[c] == dead) return;
+  free(t->entries[c]);
+  t->entries[c] = dead;
+  in->chunks_freed++;
+}
+
+// Adds `delta` (+1 claim, -1 release) per slot to each chunk the range spans.
+static void account(silt_tree *t, uint32_t first, uint32_t cap, int delta) {
+  uint32_t *live = silt_int(t)->chunk_live;
+  uint64_t i = first, end = (uint64_t)first + cap;
+  while (i < end) {
+    uint32_t c = (uint32_t)(i >> SILT_ENTRY_SHIFT);
+    uint64_t chunk_end = ((uint64_t)c + 1) << SILT_ENTRY_SHIFT;
+    uint32_t n = (uint32_t)((end < chunk_end ? end : chunk_end) - i);
+    if (delta > 0) {
+      live[c] += n;
+    } else {
+      if (live[c] < n) abort(); // released more than was claimed
+      live[c] -= n;
+      if (live[c] == 0) maybe_free_chunk(t, c);
+    }
+    i += n;
+  }
+}
+
+void tree_claim_run(silt_tree *t, uint32_t first, uint32_t cap) {
+  if (cap) account(t, first, cap, 1);
+}
+
+void tree_release_run(silt_tree *t, uint32_t first, uint32_t cap) {
+  if (cap) account(t, first, cap, -1);
+}
+
+void tree_set_entry_count(silt_tree *t, uint32_t count) {
+  uint32_t from = t->entry_count >> SILT_ENTRY_SHIFT;
+  t->entry_count = count;
+  uint32_t to = count >> SILT_ENTRY_SHIFT;
+  for (uint32_t c = from; c < to; c++) maybe_free_chunk(t, c);
+}
+
+void tree_detach(silt_tree *t, uint32_t dir) {
+  uint32_t *stack = NULL;
+  uint32_t n = 0, cap = 0;
+#define DPUSH(x)                                                               \
+  do {                                                                         \
+    if (n == cap) {                                                            \
+      cap = cap ? cap * 2 : 64;                                                \
+      stack = realloc(stack, cap * sizeof *stack);                             \
+      if (!stack) abort();                                                     \
+    }                                                                          \
+    stack[n++] = (x);                                                          \
+  } while (0)
+  DPUSH(dir);
+  while (n) {
+    silt_dir *d = silt_dir_at(t, stack[--n]);
+    if (d->state & SILT_DIR_DETACHED) continue;
+    d->state |= SILT_DIR_DETACHED;
+    // Folders beneath go too; removed ones were detached when removed.
+    for (uint32_t i = d->first, end = d->first + d->count; i < end; i++) {
+      const silt_entry *e = silt_entry_at(t, i);
+      if (e->kind != SILT_KIND_DIR || (e->flags & SILT_FLAG_REMOVED)) continue;
+      if (silt_dir_at(t, e->aux)->entry == i) DPUSH(e->aux);
+    }
+    tree_release_run(t, d->first, d->cap);
+    d->cap = 0;
+  }
+#undef DPUSH
+  free(stack);
+}
+
+void tree_reset_accounting(silt_tree *t) {
+  silt_internal *in = silt_int(t);
+  if (!in->chunk_live) in->chunk_live = xcalloc(SILT_ENTRY_CHUNKS, sizeof *in->chunk_live);
+  else memset(in->chunk_live, 0, SILT_ENTRY_CHUNKS * sizeof *in->chunk_live);
+  tree_claim_run(t, 0, 1);
+  for (uint32_t d = 0; d < t->dir_count; d++) {
+    const silt_dir *x = silt_dir_at(t, d);
+    if (!(x->state & SILT_DIR_DETACHED)) tree_claim_run(t, x->first, x->cap);
+  }
+}
+
+void silt_tree_memory_stats(silt_tree *t, silt_memory *out) {
+  silt_tree_lock(t);
+  const silt_internal *in = silt_int(t);
+  silt_entry *dead = tree_dead_chunk();
+  memset(out, 0, sizeof *out);
+  out->entry_slots = t->entry_count;
+  for (uint32_t c = 0; c < SILT_ENTRY_CHUNKS && t->entries[c]; c++) {
+    out->live_slots += in->chunk_live[c];
+    if (t->entries[c] != dead) out->entry_bytes += (uint64_t)ENTRY_CHUNK * sizeof(silt_entry);
+  }
+  for (uint32_t c = 0; c < SILT_DIR_CHUNKS && t->dirs[c]; c++)
+    out->dir_bytes += (uint64_t)DIR_CHUNK * sizeof(silt_dir);
+  out->name_bytes = t->name_used;
+  out->chunks_freed = in->chunks_freed;
+  silt_tree_unlock(t);
+}
+
+// MARK: Names
 
 static uint32_t name_reserve(silt_tree *t, uint32_t len) {
   uint32_t off = t->name_used;
@@ -363,10 +511,12 @@ void silt_tree_remove(silt_tree *t, uint32_t entry) {
     silt_dir *d = silt_dir_at(t, e->aux);
     items += d->items;
     pending = d->pending;
-    d->state |= SILT_DIR_DETACHED;
+    tree_detach(t, e->aux);
   }
   e->flags |= SILT_FLAG_REMOVED;
+  silt_dir_at(t, e->parent)->version++;
   tree_propagate(t, e->parent, -e->size, -items, 0, -pending);
+  tree_recompute_newest(t, e->parent); // it may have been the newest thing here
   TREE_BUMP(t);
   silt_tree_unlock(t);
 }

@@ -13,7 +13,11 @@ let package = Package(
             name: "SiltCore",
             cSettings: [.unsafeFlags(["-O3", "-Wall", "-Wextra", "-Wno-unused-parameter"])]
         ),
-        .executableTarget(name: "silt-bench", dependencies: ["SiltCore"]),
+        .executableTarget(
+            name: "silt-bench",
+            dependencies: ["SiltCore"],
+            linkerSettings: [.linkedFramework("CoreServices")]
+        ),
         .executableTarget(
             name: "Silt",
             dependencies: ["SiltCore"],

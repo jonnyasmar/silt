@@ -1,14 +1,18 @@
 // SiltCore — the scanning engine and in-memory file tree behind Silt.
 //
-// The tree is a flat, append-only store designed for tens of millions of
-// entries: every entry is 24 bytes, every directory adds 28 more, and names
-// live in a shared byte arena. A directory's children always occupy one
-// contiguous run of entry indices, so listing a folder is a pointer walk.
+// The tree is a flat store designed for tens of millions of entries: every
+// entry is 24 bytes, every directory adds 48 more, and names live in a shared
+// byte arena. A directory's children always occupy one contiguous run of
+// entry indices, so listing a folder is a pointer walk.
 //
-// Storage is chunked and never reallocated, so an index handed to the UI stays
-// valid for the life of the tree. Structural mutation (scans, refreshes,
-// removals) happens under the tree lock; readers that may race a live scan
-// take the same lock around short batches of reads.
+// Refreshes update a run in place where they can: surviving entries keep
+// their index, new ones take spare room at the end of the run, and vanished
+// ones stay behind flagged REMOVED. Only when the room runs out does the
+// folder get a new run. Indices are never reused, and memory under runs that
+// no longer belong to any folder is returned to the system; reading such an
+// index is still safe and yields a REMOVED entry. Structural mutation
+// (scans, refreshes, removals) happens under the tree lock; readers that may
+// race a live scan take the same lock around short batches of reads.
 #pragma once
 
 #include <stdbool.h>
@@ -66,10 +70,13 @@ typedef struct silt_dir {
   uint32_t entry;   // index of this directory's own entry
   uint32_t first;   // index of the first child entry
   uint32_t count;   // number of child entries (including removed ones)
+  uint32_t cap;     // slots reserved for the run: `count` plus room to grow
   uint32_t items;   // descendants, files and folders
   uint32_t newest;  // newest file mtime anywhere in the subtree
   uint32_t pending; // folders in this subtree (self included) not yet listed
   uint32_t state;
+  uint32_t version; // changes whenever entries join or leave the run
+  uint32_t reserved;
 } silt_dir;
 
 #define SILT_ENTRY_SHIFT 16
@@ -124,6 +131,18 @@ void silt_tree_unlock(silt_tree *t);
 // Mutation counter, safe to read without the tree lock.
 uint64_t silt_tree_generation(const silt_tree *t);
 
+typedef struct silt_memory {
+  uint64_t entry_slots;  // entry indices handed out so far (never reused)
+  uint64_t live_slots;   // slots held by current runs, spare room included
+  uint64_t entry_bytes;  // entry storage currently allocated
+  uint64_t dir_bytes;    // directory records
+  uint64_t name_bytes;   // name arena in use
+  uint64_t chunks_freed; // entry chunks returned to the system
+} silt_memory;
+
+// Where the tree's memory is going. Takes the lock.
+void silt_tree_memory_stats(silt_tree *t, silt_memory *out);
+
 // MARK: Reading (hold the lock while a scan or refresh may be running)
 
 // Writes the absolute path of `entry` into `buf` (NUL-terminated). Returns the
@@ -140,7 +159,10 @@ uint32_t silt_children_sorted(const silt_tree *t, uint32_t dir, int key,
 // directories that have been listed.
 uint32_t silt_lookup(const silt_tree *t, const char *path);
 
-// True if `entry` is still reachable from the root.
+// True if `entry` is still reachable from the root. An entry stands for a
+// name in a folder: a file deleted and recreated under the same name between
+// two listings keeps its entry (folders are also matched by inode). Anything
+// acting on a file should check it on disk, as the app does.
 bool silt_is_live(const silt_tree *t, uint32_t entry);
 
 // MARK: Scanning

@@ -14,6 +14,10 @@ typedef struct silt_internal {
   uint64_t denied;
   char *guards[SILT_MAX_GUARDS];
   uint32_t guard_count;
+  // Per entry chunk: slots that belong to a current run (spare room
+  // included). A chunk behind the append point with none left is freed.
+  uint32_t *chunk_live;
+  uint64_t chunks_freed;
 } silt_internal;
 
 bool tree_is_guarded(const silt_tree *t, const char *path);
@@ -24,6 +28,19 @@ static inline silt_internal *silt_int(const silt_tree *t) {
 
 // All of these require the tree lock.
 void tree_reserve_entries(silt_tree *t, uint32_t n);
+// Run bookkeeping: `claim` when slots [first, first + cap) start belonging to
+// a folder, `release` when they stop. Released chunks may be freed.
+void tree_claim_run(silt_tree *t, uint32_t first, uint32_t cap);
+void tree_release_run(silt_tree *t, uint32_t first, uint32_t cap);
+// Moves the append point to `count`, freeing chunks left behind empty.
+void tree_set_entry_count(silt_tree *t, uint32_t count);
+// Detaches `dir` and every folder beneath it, releasing their runs. Pending
+// counts are the caller's business (the subtree's total is `dir`'s pending).
+void tree_detach(silt_tree *t, uint32_t dir);
+// Rebuilds chunk accounting from the runs (after loading a snapshot).
+void tree_reset_accounting(silt_tree *t);
+// The shared, read-only chunk that freed chunks point at.
+silt_entry *tree_dead_chunk(void);
 uint32_t tree_new_dir(silt_tree *t, uint32_t entry, uint64_t file_id,
                       uint32_t pending, uint32_t state);
 // Copies `len` bytes of names into the arena. If they fit contiguously the

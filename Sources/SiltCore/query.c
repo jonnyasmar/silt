@@ -64,7 +64,8 @@ static void heap_offer(heap *h, uint32_t entry, uint32_t tag) {
   }
 }
 
-// Pops everything so the output ends up largest-first.
+// Pops everything so the output ends up largest-first, dropping anything
+// that stopped being live while the walk let others in.
 static uint32_t heap_finish(heap *h) {
   uint32_t n = h->n;
   while (h->n > 1) {
@@ -73,7 +74,14 @@ static uint32_t heap_finish(heap *h) {
     sift_down(h, 0);
   }
   h->n = 0;
-  return n;
+  uint32_t kept = 0;
+  for (uint32_t k = 0; k < n; k++) {
+    if (!silt_is_live(h->t, h->idx[k])) continue;
+    h->idx[kept] = h->idx[k];
+    if (h->tag) h->tag[kept] = h->tag[k];
+    kept++;
+  }
+  return kept;
 }
 
 // MARK: Depth-first walk
@@ -93,18 +101,17 @@ static void wpush(walker *w, uint32_t dir) {
 }
 
 // Lets anyone waiting on the lock (the UI, scanner commits) in every few
-// thousand entries. A relist leaves the old run allocated, but it is no
-// longer live and must not be returned by the query.
+// thousand entries. Meanwhile the folder may have been updated in place,
+// which keeps every slot the walk has yet to visit valid (vanished entries
+// read as REMOVED), or moved to a new run, which ends the walk of it.
 static inline bool walk_breathe(silt_tree *t, uint32_t *budget, uint32_t dir,
-                                uint32_t first, uint32_t count) {
+                                uint32_t first) {
   if (++*budget < 8192) return true;
   *budget = 0;
   silt_tree_unlock(t);
   sched_yield();
   silt_tree_lock(t);
-  if (!tree_dir_live(t, dir)) return false;
-  const silt_dir *d = silt_dir_at(t, dir);
-  return d->first == first && d->count == count;
+  return tree_dir_live(t, dir) && silt_dir_at(t, dir)->first == first;
 }
 
 // Calls `visit` for every live entry under `root_dir`. `visit` returns true to
@@ -121,7 +128,7 @@ static inline bool walk_breathe(silt_tree *t, uint32_t *budget, uint32_t dir,
       uint32_t first_ = d_->first, count_ = d_->count;                         \
       for (uint32_t index = first_, end_ = first_ + count_; index < end_;      \
            index++) {                                                          \
-        if (!walk_breathe((t), &budget_, dir_, first_, count_)) break;          \
+        if (!walk_breathe((t), &budget_, dir_, first_)) break;                  \
         const silt_entry *e = silt_entry_at((t), index);                       \
         if (e->flags & SILT_FLAG_REMOVED) continue;                            \
         bool descend_ = e->kind == SILT_KIND_DIR;                              \
