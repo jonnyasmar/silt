@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <mach/vm_statistics.h>
 #include <sys/mman.h>
 
 #define ENTRY_CHUNK (1u << SILT_ENTRY_SHIFT)
@@ -12,12 +13,6 @@
 
 static void *xcalloc(size_t n, size_t size) {
   void *p = calloc(n, size);
-  if (!p) abort();
-  return p;
-}
-
-static void *xmalloc(size_t size) {
-  void *p = malloc(size);
   if (!p) abort();
   return p;
 }
@@ -49,9 +44,59 @@ static void make_dead_chunk(void) {
   dead_chunk = e;
 }
 
+// Chunks come straight from the kernel, so freeing one really returns it:
+// malloc keeps freed blocks this size around, still counted against the app.
+#define CHUNK_TAG VM_MAKE_TAG(240) // shows as "Memory Tag 240" in vmmap
+
+void *tree_chunk_alloc(size_t bytes) {
+  void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, CHUNK_TAG, 0);
+  if (p == MAP_FAILED) abort();
+  return p;
+}
+
+void tree_chunk_free(void *p, size_t bytes) {
+  if (p) munmap(p, bytes);
+}
+
 silt_entry *tree_dead_chunk(void) {
   pthread_once(&dead_once, make_dead_chunk);
   return dead_chunk;
+}
+
+// Zero pages cost nothing until touched, and these are never written.
+static silt_dir *zero_dirs;
+static uint8_t *zero_names;
+static pthread_once_t zero_once = PTHREAD_ONCE_INIT;
+
+static void make_zero_chunks(void) {
+  void *d = mmap(NULL, (size_t)DIR_CHUNK * sizeof(silt_dir), PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
+  void *n = mmap(NULL, NAME_CHUNK, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (d == MAP_FAILED || n == MAP_FAILED) abort();
+  zero_dirs = d;
+  zero_names = n;
+}
+
+silt_dir *tree_zero_dir_chunk(void) {
+  pthread_once(&zero_once, make_zero_chunks);
+  return zero_dirs;
+}
+
+uint8_t *tree_zero_name_chunk(void) {
+  pthread_once(&zero_once, make_zero_chunks);
+  return zero_names;
+}
+
+uint64_t tree_checksum(uint64_t h, const void *p, size_t len) {
+  const uint8_t *b = p;
+  size_t words = len / 8;
+  for (size_t i = 0; i < words; i++) {
+    uint64_t w;
+    memcpy(&w, b + i * 8, 8);
+    h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+    h ^= h >> 29;
+  }
+  for (size_t i = words * 8; i < len; i++) h = (h ^ b[i]) * 0x100000001B3ull;
+  return h;
 }
 
 silt_tree *silt_tree_create(const char *root_path) {
@@ -104,11 +149,14 @@ void silt_tree_destroy(silt_tree *t) {
   for (uint32_t i = 0; i < silt_int(t)->guard_count; i++)
     free(silt_int(t)->guards[i]);
   silt_entry *dead = tree_dead_chunk();
+  silt_dir *zd = tree_zero_dir_chunk();
+  uint8_t *zn = tree_zero_name_chunk();
   for (uint32_t i = 0; i < SILT_ENTRY_CHUNKS && t->entries[i]; i++)
-    if (t->entries[i] != dead) free(t->entries[i]);
-  for (uint32_t i = 0; i < SILT_DIR_CHUNKS && t->dirs[i]; i++) free(t->dirs[i]);
+    if (t->entries[i] != dead) tree_chunk_free(t->entries[i], ENTRY_CHUNK * sizeof(silt_entry));
+  for (uint32_t i = 0; i < SILT_DIR_CHUNKS && t->dirs[i]; i++)
+    if (t->dirs[i] != zd) tree_chunk_free(t->dirs[i], DIR_CHUNK * sizeof(silt_dir));
   for (uint32_t i = 0; i < SILT_NAME_CHUNKS && t->names[i]; i++)
-    free(t->names[i]);
+    if (t->names[i] != zn) tree_chunk_free(t->names[i], NAME_CHUNK);
   free(t->entries);
   free(t->dirs);
   free(t->names);
@@ -133,7 +181,7 @@ void tree_reserve_entries(silt_tree *t, uint32_t n) {
   if (need >= SILT_NONE) abort();
   uint32_t last = need == 0 ? 0 : (uint32_t)((need - 1) >> SILT_ENTRY_SHIFT);
   for (uint32_t c = t->entry_count >> SILT_ENTRY_SHIFT; c <= last; c++) {
-    if (!t->entries[c]) t->entries[c] = xmalloc(ENTRY_CHUNK * sizeof(silt_entry));
+    if (!t->entries[c]) t->entries[c] = tree_chunk_alloc(ENTRY_CHUNK * sizeof(silt_entry));
   }
 }
 
@@ -142,7 +190,7 @@ uint32_t tree_new_dir(silt_tree *t, uint32_t entry, uint64_t file_id,
   uint32_t id = t->dir_count;
   if (id == SILT_NONE) abort();
   uint32_t c = id >> SILT_DIR_SHIFT;
-  if (!t->dirs[c]) t->dirs[c] = xmalloc(DIR_CHUNK * sizeof(silt_dir));
+  if (!t->dirs[c]) t->dirs[c] = tree_chunk_alloc(DIR_CHUNK * sizeof(silt_dir));
   *silt_dir_at(t, id) = (silt_dir){
       .file_id = file_id,
       .entry = entry,
@@ -168,7 +216,7 @@ static void maybe_free_chunk(silt_tree *t, uint32_t c) {
   if (in->chunk_live[c] != 0 || c >= (t->entry_count >> SILT_ENTRY_SHIFT)) return;
   silt_entry *dead = tree_dead_chunk();
   if (!t->entries[c] || t->entries[c] == dead) return;
-  free(t->entries[c]);
+  tree_chunk_free(t->entries[c], ENTRY_CHUNK * sizeof(silt_entry));
   t->entries[c] = dead;
   in->chunks_freed++;
 }
@@ -258,9 +306,10 @@ void silt_tree_memory_stats(silt_tree *t, silt_memory *out) {
     out->live_slots += in->chunk_live[c];
     if (t->entries[c] != dead) out->entry_bytes += (uint64_t)ENTRY_CHUNK * sizeof(silt_entry);
   }
+  silt_dir *zd = tree_zero_dir_chunk();
   for (uint32_t c = 0; c < SILT_DIR_CHUNKS && t->dirs[c]; c++)
-    out->dir_bytes += (uint64_t)DIR_CHUNK * sizeof(silt_dir);
-  out->name_bytes = t->name_used;
+    if (t->dirs[c] != zd) out->dir_bytes += (uint64_t)DIR_CHUNK * sizeof(silt_dir);
+  out->name_bytes = in->parked ? 0 : t->name_used;
   out->chunks_freed = in->chunks_freed;
   silt_tree_unlock(t);
 }
@@ -276,7 +325,7 @@ static uint32_t name_reserve(silt_tree *t, uint32_t len) {
   }
   uint32_t c = off >> SILT_NAME_SHIFT;
   if (c >= SILT_NAME_CHUNKS) abort();
-  if (!t->names[c]) t->names[c] = xmalloc(NAME_CHUNK);
+  if (!t->names[c]) t->names[c] = tree_chunk_alloc(NAME_CHUNK);
   t->name_used = off + len;
   return off;
 }

@@ -76,9 +76,30 @@ struct silt_scanner {
 
 static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
-static void *xrealloc(void *p, size_t size) {
-  void *q = realloc(p, size);
+// Working buffers that can grow big (the queue, a huge folder's batch) come
+// straight from the kernel above a threshold, so freeing them really gives
+// the memory back: malloc keeps large freed blocks, still counted against
+// the app. Callers pass the size they asked for before.
+#define BIG_BUFFER (64u << 10)
+
+static void buf_free(void *p, size_t bytes) {
+  if (!p) return;
+  if (bytes < BIG_BUFFER) free(p);
+  else tree_chunk_free(p, bytes);
+}
+
+static void *buf_resize(void *p, size_t old_bytes, size_t new_bytes) {
+  if (new_bytes < BIG_BUFFER && old_bytes < BIG_BUFFER) {
+    void *q = realloc(p, new_bytes);
+    if (!q) abort();
+    return q;
+  }
+  void *q = new_bytes < BIG_BUFFER ? malloc(new_bytes) : tree_chunk_alloc(new_bytes);
   if (!q) abort();
+  if (p) {
+    memcpy(q, p, old_bytes < new_bytes ? old_bytes : new_bytes);
+    buf_free(p, old_bytes);
+  }
   return q;
 }
 
@@ -87,7 +108,8 @@ static void *xrealloc(void *p, size_t size) {
     if ((count) + (extra) > (cap)) {                                           \
       uint32_t c_ = (cap) ? (cap) : 64;                                        \
       while ((count) + (extra) > c_) c_ *= 2;                                  \
-      (ptr) = xrealloc((ptr), (size_t)c_ * sizeof(*(ptr)));                    \
+      (ptr) = buf_resize((ptr), (size_t)(cap) * sizeof(*(ptr)),                \
+                         (size_t)c_ * sizeof(*(ptr)));                         \
       (cap) = c_;                                                              \
     }                                                                          \
   } while (0)
@@ -118,28 +140,29 @@ static struct attrlist plain_attrs = {
 static void batch_grow(batch *b) {
   if (b->n < b->cap) return;
   uint32_t cap = b->cap ? b->cap * 2 : 256;
-  b->ents = xrealloc(b->ents, cap * sizeof *b->ents);
-  b->ids = xrealloc(b->ids, cap * sizeof *b->ids);
-  b->walk = xrealloc(b->walk, cap);
-  b->match = xrealloc(b->match, cap * sizeof *b->match);
-  b->reuse = xrealloc(b->reuse, cap * sizeof *b->reuse);
+  const size_t was = b->cap;
+  b->ents = buf_resize(b->ents, was * sizeof *b->ents, cap * sizeof *b->ents);
+  b->ids = buf_resize(b->ids, was * sizeof *b->ids, cap * sizeof *b->ids);
+  b->walk = buf_resize(b->walk, was, cap);
+  b->match = buf_resize(b->match, was * sizeof *b->match, cap * sizeof *b->match);
+  b->reuse = buf_resize(b->reuse, was * sizeof *b->reuse, cap * sizeof *b->reuse);
   b->cap = cap;
 }
 
 static void batch_free(batch *b) {
-  free(b->ents);
-  free(b->ids);
-  free(b->walk);
-  free(b->match);
-  free(b->reuse);
-  free(b->names);
-  free(b->new_dirs);
-  free(b->new_ids);
-  free(b->new_deep);
-  free(b->partials);
-  free(b->out);
-  free(b->map);
-  free(b->hit);
+  buf_free(b->ents, (size_t)b->cap * sizeof *b->ents);
+  buf_free(b->ids, (size_t)b->cap * sizeof *b->ids);
+  buf_free(b->walk, b->cap);
+  buf_free(b->match, (size_t)b->cap * sizeof *b->match);
+  buf_free(b->reuse, (size_t)b->cap * sizeof *b->reuse);
+  buf_free(b->names, b->ncap);
+  buf_free(b->new_dirs, (size_t)b->newcap * sizeof *b->new_dirs);
+  buf_free(b->new_ids, (size_t)b->newcap * sizeof *b->new_ids);
+  buf_free(b->new_deep, b->newcap);
+  buf_free(b->partials, (size_t)b->partialcap * sizeof *b->partials);
+  buf_free(b->out, (size_t)b->outcap * sizeof *b->out);
+  buf_free(b->map, (size_t)b->mapcap * sizeof *b->map);
+  buf_free(b->hit, b->hitcap);
 }
 
 // After listing a big folder, give its buffers back rather than keep them
@@ -397,7 +420,7 @@ static void index_old(const silt_tree *t, batch *b, uint32_t first, uint32_t cou
   uint64_t size = 16;
   while (size < (uint64_t)count * 2) size *= 2;
   if (size > b->mapcap) {
-    b->map = xrealloc(b->map, (size_t)size * sizeof *b->map);
+    b->map = buf_resize(b->map, (size_t)b->mapcap * sizeof *b->map, (size_t)size * sizeof *b->map);
     b->mapcap = (uint32_t)size;
   }
   b->mask = (uint32_t)size - 1;
@@ -472,10 +495,10 @@ static bool commit_in_place(silt_tree *t, uint32_t dir_id, batch *b,
 
 static void n_alloc_new_dirs(batch *b, uint32_t n) {
   if (n <= b->newcap) return;
+  b->new_dirs = buf_resize(b->new_dirs, (size_t)b->newcap * sizeof *b->new_dirs, (size_t)n * sizeof *b->new_dirs);
+  b->new_ids = buf_resize(b->new_ids, (size_t)b->newcap * sizeof *b->new_ids, (size_t)n * sizeof *b->new_ids);
+  b->new_deep = buf_resize(b->new_deep, b->newcap, n);
   b->newcap = n;
-  b->new_dirs = xrealloc(b->new_dirs, n * sizeof *b->new_dirs);
-  b->new_ids = xrealloc(b->new_ids, n * sizeof *b->new_ids);
-  b->new_deep = xrealloc(b->new_deep, n);
 }
 
 // Queues an in-place re-listing of subfolder `dir` (batch index `i`) as part
@@ -541,7 +564,7 @@ static bool commit_diff(silt_tree *t, const work *w, batch *b, bool deep, tally 
   silt_dir *d = silt_dir_at(t, w->dir);
   const uint32_t first = d->first, count = d->count, n = b->n;
   if (count > b->hitcap) {
-    b->hit = xrealloc(b->hit, count);
+    b->hit = buf_resize(b->hit, b->hitcap, count);
     b->hitcap = count;
   }
   memset(b->hit, 0, count);
@@ -973,7 +996,7 @@ void silt_scanner_destroy(silt_scanner *s) {
   pthread_mutex_unlock(&s->qlock);
   for (int i = 0; i < s->nthreads; i++) pthread_join(s->threads[i], NULL);
   free(s->threads);
-  free(s->q);
+  buf_free(s->q, (size_t)s->qcap * sizeof *s->q);
   pthread_mutex_destroy(&s->qlock);
   pthread_cond_destroy(&s->qcond);
   pthread_cond_destroy(&s->idle_cond);

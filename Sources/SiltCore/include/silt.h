@@ -232,6 +232,18 @@ bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *me
 // another format version. The tree's root path is stored in the file.
 silt_tree *silt_tree_load(const char *path, silt_snapshot_meta *meta);
 
+// MARK: Parking
+
+// Writes the tree's storage to `path` exactly as it is and frees it. Until
+// silt_tree_unpark the tree is an empty shell: reads are safe but see nothing
+// (every entry removed), and nothing may modify it, so no scanner may be
+// running. Takes the lock. Returns false (changing nothing) on I/O error.
+bool silt_tree_park(silt_tree *t, const char *path);
+// Reads a parked tree back. Every index and dir id means what it did before.
+// Returns false, leaving the tree parked, if the file is missing or damaged.
+bool silt_tree_unpark(silt_tree *t, const char *path);
+bool silt_tree_is_parked(silt_tree *t);
+
 // MARK: Queries (each takes the lock itself; safe during a scan)
 
 // The `cap` largest files under `dir`, largest first. Returns the count.

@@ -39,20 +39,7 @@ typedef struct snap_header {
   silt_snapshot_meta meta;
 } snap_header;
 
-// A fast word-wise checksum, to catch a damaged file that still decompresses.
-// Splitting the input at multiples of 8 bytes doesn't change the result.
-static uint64_t checksum(uint64_t h, const void *p, size_t len) {
-  const uint8_t *b = p;
-  size_t words = len / 8;
-  for (size_t i = 0; i < words; i++) {
-    uint64_t w;
-    memcpy(&w, b + i * 8, 8);
-    h = (h ^ w) * 0x9E3779B97F4A7C15ull;
-    h ^= h >> 29;
-  }
-  for (size_t i = words * 8; i < len; i++) h = (h ^ b[i]) * 0x100000001B3ull;
-  return h;
-}
+// The checksum (tree_checksum) catches a damaged file that still decompresses.
 
 #define CHECKSUM_SEED 0x5117C0DEull
 
@@ -116,7 +103,7 @@ bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *me
   silt_tree_lock(t);
   const silt_entry *root = silt_entry_at(t, 0);
   const silt_dir *root_dir = silt_dir_at(t, root->aux);
-  if (root_dir->pending != 0) {
+  if (silt_int(t)->parked || root_dir->pending != 0) {
     silt_tree_unlock(t);
     return false;
   }
@@ -124,10 +111,10 @@ bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *me
   entries.cap = ((size_t)root_dir->items + 1) * sizeof(silt_entry);
   dirs.cap = (size_t)t->dir_count * sizeof(silt_dir);
   names.cap = (size_t)t->name_used + ((size_t)t->name_used / NAME_CHUNK + 1) * 0x10000;
-  entries.p = malloc(entries.cap);
-  dirs.p = malloc(dirs.cap);
-  names.p = malloc(names.cap);
-  if (!entries.p || !dirs.p || !names.p) abort();
+  // Straight from the kernel, so they're really gone once the save is done.
+  entries.p = tree_chunk_alloc(entries.cap);
+  dirs.p = tree_chunk_alloc(dirs.cap);
+  names.p = tree_chunk_alloc(names.cap);
 
   silt_entry *r = take(&entries, sizeof *r);
   *r = *root;
@@ -213,7 +200,7 @@ bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *me
   h.dir_count = (uint32_t)(dirs.n / sizeof(silt_dir));
   h.name_bytes = (uint32_t)names.n;
   h.raw_bytes = entries.n + dirs.n + names.n;
-  h.checksum = checksum(checksum(checksum(CHECKSUM_SEED, entries.p, entries.n), dirs.p, dirs.n), names.p, names.n);
+  h.checksum = tree_checksum(tree_checksum(tree_checksum(CHECKSUM_SEED, entries.p, entries.n), dirs.p, dirs.n), names.p, names.n);
   h.meta = *meta;
 
   // Write beside the target, then rename over it. A unique temporary per
@@ -247,9 +234,9 @@ bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *me
   }
   if (stream) compression_stream_destroy(&z);
   free(out);
-  free(entries.p);
-  free(dirs.p);
-  free(names.p);
+  tree_chunk_free(entries.p, entries.cap);
+  tree_chunk_free(dirs.p, dirs.cap);
+  tree_chunk_free(names.p, names.cap);
   if (f) ok = (fclose(f) == 0) && ok;
   if (f && ok) ok = rename(tmp, path) == 0;
   if (f && !ok) unlink(tmp);
@@ -330,7 +317,7 @@ static uint64_t loaded_checksum(const silt_tree *t, const snap_header *h) {
   for (int k = 0; k < 3; k++) {
     for (uint64_t done = 0, c = 0; done < parts[k].total; c++) {
       uint64_t len = parts[k].total - done < parts[k].chunk_bytes ? parts[k].total - done : parts[k].chunk_bytes;
-      sum = checksum(sum, parts[k].chunks[c], (size_t)len);
+      sum = tree_checksum(sum, parts[k].chunks[c], (size_t)len);
       done += len;
     }
   }
@@ -355,8 +342,7 @@ static bool aim(compression_stream *z, sink *s) {
   size_t c = (size_t)(s->done / s->chunk_bytes);
   size_t off = (size_t)(s->done % s->chunk_bytes);
   if (!s->chunks[c]) {
-    s->chunks[c] = malloc(s->chunk_bytes);
-    if (!s->chunks[c]) return false;
+    s->chunks[c] = tree_chunk_alloc(s->chunk_bytes);
   }
   uint64_t left = s->total - s->done;
   size_t room = s->chunk_bytes - off;

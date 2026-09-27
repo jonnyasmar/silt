@@ -8,6 +8,7 @@
 #include <CoreServices/CoreServices.h>
 #include <dispatch/dispatch.h>
 #include <mach/mach.h>
+#include <malloc/malloc.h>
 #include <pthread.h>
 #include <sys/stat.h>
 #include <stdio.h>
@@ -178,6 +179,33 @@ int main(int argc, char **argv) {
            (loaded_fp - base) / 1e6);
     if (loaded) silt_tree_destroy(loaded);
     unlink(snap);
+  }
+  const char *park = getenv("SILT_PARK");
+  if (park) {
+    // Park and unpark, reporting time, file size and footprint.
+    silt_scanner_destroy(scanner);
+    scanner = NULL;
+    malloc_zone_pressure_relief(NULL, 0);
+    uint64_t f0 = footprint();
+    double t0 = now_s();
+    bool ok = silt_tree_park(tree, park);
+    double t1 = now_s();
+    malloc_zone_pressure_relief(NULL, 0);
+    uint64_t f1 = footprint();
+    if (getenv("SILT_VMMAP")) {
+      char cmd[128];
+      snprintf(cmd, sizeof cmd, "vmmap --summary %d | grep -E 'MALLOC_(LARGE|SMALL|MEDIUM)|Physical footprint'", getpid());
+      system(cmd);
+    }
+    struct stat st;
+    stat(park, &st);
+    bool back = ok && silt_tree_unpark(tree, park);
+    double t2 = now_s();
+    uint64_t f2 = footprint();
+    printf("park: ok=%d in %.2fs, file %.0f MB, footprint %.0f -> %.0f MB; unpark ok=%d in %.2fs, footprint %.0f MB\n",
+           ok, t1 - t0, st.st_size / 1e6, f0 / 1e6, f1 / 1e6, back, t2 - t1, f2 / 1e6);
+    unlink(park);
+    scanner = silt_scanner_start_idle(tree, threads);
   }
   const char *watch = getenv("SILT_WATCH");
   if (watch) {

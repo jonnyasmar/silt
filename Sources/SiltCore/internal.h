@@ -18,6 +18,7 @@ typedef struct silt_internal {
   // included). A chunk behind the append point with none left is freed.
   uint32_t *chunk_live;
   uint64_t chunks_freed;
+  bool parked; // storage is in a park file; every chunk is a shared stand-in
 } silt_internal;
 
 bool tree_is_guarded(const silt_tree *t, const char *path);
@@ -39,8 +40,18 @@ void tree_set_entry_count(silt_tree *t, uint32_t count);
 void tree_detach(silt_tree *t, uint32_t dir);
 // Rebuilds chunk accounting from the runs (after loading a snapshot).
 void tree_reset_accounting(silt_tree *t);
+// Storage for entry, folder and name chunks (fixed sizes per kind).
+void *tree_chunk_alloc(size_t bytes);
+void tree_chunk_free(void *p, size_t bytes);
 // The shared, read-only chunk that freed chunks point at.
 silt_entry *tree_dead_chunk(void);
+// Shared, read-only, all-zero stand-ins for a parked tree's folder and name
+// chunks.
+silt_dir *tree_zero_dir_chunk(void);
+uint8_t *tree_zero_name_chunk(void);
+// A fast word-wise checksum. Splitting the input at multiples of 8 bytes
+// doesn't change the result.
+uint64_t tree_checksum(uint64_t h, const void *p, size_t len);
 uint32_t tree_new_dir(silt_tree *t, uint32_t entry, uint64_t file_id,
                       uint32_t pending, uint32_t state);
 // Copies `len` bytes of names into the arena. If they fit contiguously the

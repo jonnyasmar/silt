@@ -611,3 +611,83 @@ extension Fixture {
     #expect(f.size("n") == f.expected("n"))
     #expect(f.dir("n")!.items == 41)
 }
+
+// MARK: Parking
+
+@Test func parkingRoundTripsExactly() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("silt-park-\(UUID().uuidString)").resolvingSymlinksInPath()
+    defer { try? FileManager.default.removeItem(at: root) }
+    for i in 0..<300 { try Fixture.write(root.appendingPathComponent("d\(i % 7)/f\(i).bin"), size: 1_000 + i) }
+    let t = silt_tree_create(root.path)!
+    defer { silt_tree_destroy(t) }
+    var s = silt_scanner_start(t, 4)!
+    silt_scanner_wait_idle(s)
+    // Churn a folder so there are tombstones, spare room and new names.
+    try Fixture.write(root.appendingPathComponent("d0/extra.bin"), size: 5_000)
+    unlink(root.appendingPathComponent("d0/f0.bin").path)
+    silt_tree_lock(t)
+    let d0 = silt_entry_at(t, silt_lookup(t, root.appendingPathComponent("d0").path)).pointee.aux
+    silt_tree_unlock(t)
+    silt_scanner_refresh(s, d0, false)
+    silt_scanner_wait_idle(s)
+    silt_scanner_destroy(s)
+
+    func snapshot() -> (UInt32, Int64, UInt32, UInt32) {
+        silt_tree_lock(t)
+        defer { silt_tree_unlock(t) }
+        let i = silt_lookup(t, root.appendingPathComponent("d3/f10.bin").path)
+        return (t.pointee.entry_count, silt_entry_at(t, 0).pointee.size, i, silt_dir_at(t, d0).pointee.version)
+    }
+    let before = snapshot()
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("silt-\(UUID().uuidString).park").path
+    defer { unlink(file) }
+    #expect(silt_tree_park(t, file))
+    #expect(silt_tree_is_parked(t))
+    var m = silt_memory()
+    silt_tree_memory_stats(t, &m)
+    #expect(m.entry_bytes == 0 && m.dir_bytes == 0)
+    // Reads are safe and see nothing.
+    silt_tree_lock(t)
+    #expect(silt_lookup(t, root.appendingPathComponent("d3/f10.bin").path) == 0xFFFF_FFFF)
+    #expect(!silt_is_live(t, before.2))
+    silt_tree_unlock(t)
+    var none = [UInt32](repeating: 0, count: 10)
+    #expect(silt_top_files(t, 0, &none, 10) == 0)
+
+    #expect(silt_tree_unpark(t, file))
+    #expect(!silt_tree_is_parked(t))
+    let after = snapshot()
+    #expect(after == before) // same indices, same totals
+    silt_tree_lock(t)
+    #expect(silt_is_live(t, before.2))
+    silt_tree_unlock(t)
+
+    // And it takes refreshes again.
+    try Fixture.write(root.appendingPathComponent("d0/later.bin"), size: 70_000)
+    s = silt_scanner_start_idle(t, 2)!
+    silt_scanner_refresh(s, d0, false)
+    silt_scanner_wait_idle(s)
+    silt_scanner_destroy(s)
+    silt_tree_lock(t)
+    #expect(silt_lookup(t, root.appendingPathComponent("d0/later.bin").path) != 0xFFFF_FFFF)
+    #expect(silt_dir_at(t, 0).pointee.pending == 0)
+    silt_tree_unlock(t)
+}
+
+@Test func damagedParkFileLeavesTheTreeParked() throws {
+    let f = try Fixture(["a/b.bin": 10_000, "c.bin": 2_000]) // its scanner is idle: nothing will touch the tree
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("silt-\(UUID().uuidString).park").path
+    defer { unlink(file) }
+    #expect(silt_tree_park(f.tree, file))
+    // Flip a byte in the payload.
+    let h = try FileHandle(forUpdating: URL(fileURLWithPath: file))
+    let end = try h.seekToEnd()
+    try h.seek(toOffset: end - 3)
+    let byte = try h.read(upToCount: 1)!
+    try h.seek(toOffset: end - 3)
+    h.write(Data([byte[0] ^ 0x5A]))
+    try h.close()
+    #expect(!silt_tree_unpark(f.tree, file))
+    #expect(silt_tree_is_parked(f.tree))
+    #expect(!silt_tree_unpark(f.tree, file + ".missing"))
+}
