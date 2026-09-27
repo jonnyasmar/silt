@@ -64,6 +64,7 @@ struct ReclaimView: View {
                             for f in safeFindings { session.mark(entries: f.entries, reason: f.title) }
                         }
                         .controlSize(.small)
+                        .fixedSize()
                         .help("Marks every Safe to clear item for review in Cleanup")
                     }
                 }
@@ -107,7 +108,9 @@ private struct Chip: View {
             Text(title).foregroundStyle(.secondary)
             Text(value).fontWeight(.semibold).monospacedDigit()
         }
-.font(.system(size: 12))
+        .font(.system(size: 12))
+        .lineLimit(1)
+        .fixedSize() // the subtitle gives way instead
         .padding(.horizontal, 9)
         .padding(.vertical, 3)
         .background(color.opacity(0.1), in: Capsule())

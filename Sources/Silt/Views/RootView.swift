@@ -160,8 +160,8 @@ private struct LocationRow: View {
 
     @ViewBuilder
     private var trailing: some View {
-        if let session, session.phase == .scanning {
-            ProgressView().controlSize(.mini)
+        if let session, let activity = session.activity {
+            ActivityBadge(activity: activity)
         } else if let avail = location.available {
             Text("\(Fmt.bytesShort(avail)) free")
         } else if let session {
@@ -179,8 +179,10 @@ private struct FolderSessionRow: View {
             Label(session.title, systemImage: "folder")
                 .lineLimit(1)
             Spacer(minLength: 6)
-            if session.phase == .scanning {
-                ProgressView().controlSize(.mini)
+            if let activity = session.activity {
+                ActivityBadge(activity: activity)
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundStyle(.secondary)
             } else {
                 Text(Fmt.bytes(session.stats.bytes))
                     .font(.system(size: 11).monospacedDigit())
@@ -188,6 +190,68 @@ private struct FolderSessionRow: View {
             }
         }
         .contextMenu { Button("Close Scan", action: close) }
+    }
+}
+
+/// A slim bar along the top of the content while a scan, rescan or catch-up
+/// runs: it fills when there's something to measure against and sweeps when
+/// there isn't.
+struct ActivityStrip: View {
+    let activity: Session.Activity?
+
+    var body: some View {
+        GeometryReader { g in
+            ZStack(alignment: .leading) {
+                if let activity {
+                    Rectangle().fill(Brand.color.opacity(0.15))
+                    if let f = activity.fraction {
+                        Rectangle()
+                            .fill(Brand.color)
+                            .frame(width: max(3, g.size.width * f))
+                            .animation(.easeOut(duration: 0.4), value: f)
+                    } else {
+                        TimelineView(.animation) { t in
+                            let cycle = 1.6
+                            let phase = t.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: cycle) / cycle
+                            let w = g.size.width * 0.3
+                            Rectangle()
+                                .fill(LinearGradient(colors: [Brand.color.opacity(0), Brand.color, Brand.color.opacity(0)],
+                                                     startPoint: .leading, endPoint: .trailing))
+                                .frame(width: w)
+                                .offset(x: -w + (g.size.width + w) * phase)
+                        }
+                    }
+                }
+            }
+        }
+        .frame(height: 3)
+        .clipped()
+        .opacity(activity == nil ? 0 : 1)
+        .animation(.easeOut(duration: 0.5), value: activity == nil)
+        .allowsHitTesting(false)
+        .accessibilityElement()
+        .accessibilityLabel(activity?.label ?? "")
+        .accessibilityValue(activity?.fraction.map { Fmt.percent($0) } ?? "")
+    }
+}
+
+/// Progress in a sidebar row: a ring and a percentage, or a spinner when
+/// there's nothing to measure against.
+struct ActivityBadge: View {
+    let activity: Session.Activity
+
+    var body: some View {
+        HStack(spacing: 5) {
+            if let f = activity.fraction {
+                Text("\(Int(f * 100))%")
+                ProgressView(value: f)
+                    .progressViewStyle(.circular)
+                    .controlSize(.mini)
+            } else {
+                ProgressView().controlSize(.mini)
+            }
+        }
+        .help(activity.fraction.map { "\(activity.label) · \(Int($0 * 100))%" } ?? activity.label)
     }
 }
 
@@ -246,7 +310,7 @@ struct PaneHeader<Trailing: View>: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(title).font(.system(size: 15, weight: .semibold))
+            Text(title).font(.system(size: 15, weight: .semibold)).fixedSize()
             Text(subtitle)
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
@@ -276,6 +340,7 @@ struct Detail: View {
             VStack(spacing: 0) {
                 content(session)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .overlay(alignment: .top) { ActivityStrip(activity: session.activity) }
                 if session.markedCount > 0 {
                     CleanupBar(session: session, reviewing: $model.reviewingCleanup)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -479,7 +544,14 @@ struct StatusBar: View {
         switch session.phase {
         case .scanning:
             HStack(spacing: 6) {
-                ProgressView().controlSize(.mini)
+                if let f = session.activity?.fraction, !session.stalled {
+                    ProgressView(value: f)
+                        .progressViewStyle(.linear)
+                        .frame(width: 70)
+                        .controlSize(.small)
+                } else {
+                    ProgressView().controlSize(.mini)
+                }
                 if session.stalled {
                     Text("Waiting on macOS — look for a permission prompt")
                         .foregroundStyle(.orange)
@@ -531,6 +603,8 @@ private struct Chip: View {
                 Image(systemName: symbol).foregroundStyle(tint)
                 Text(text).foregroundStyle(hovering ? .primary : .secondary)
             }
+            .lineLimit(1)
+            .fixedSize()
             .padding(.horizontal, 7)
             .padding(.vertical, 2)
             .background(tint.opacity(hovering ? 0.16 : 0.09), in: Capsule())

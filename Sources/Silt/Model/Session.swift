@@ -104,6 +104,9 @@ final class Session: Identifiable {
 
     /// Set by the tree view that currently owns the selection.
     @ObservationIgnored var quickLook: (() -> Void)?
+    /// How the file tree was left, so switching locations or panes and coming
+    /// back doesn't collapse everything.
+    @ObservationIgnored var treeState = TreeState()
     /// Called once if the tree is running out of entry indices (they're never
     /// reused, so a folder churning for days could get there): the window
     /// replaces this session with a fresh one.
@@ -930,6 +933,30 @@ final class Session: Identifiable {
             try? await Task.sleep(for: .seconds(seconds))
             guard !Task.isCancelled else { return }
             self?.toast = nil
+        }
+    }
+
+    // MARK: Activity
+
+    /// Long-running work on this location, for progress bars: the first scan
+    /// (measured against the volume's used inode count, when it's a volume),
+    /// a rescan, or catching up after a relaunch. No fraction when there's
+    /// nothing to measure against.
+    struct Activity: Equatable {
+        let fraction: Double?
+        let label: String
+    }
+
+    var activity: Activity? {
+        switch phase {
+        case .scanning:
+            guard let est = scanEstimate, est > 0 else { return Activity(fraction: nil, label: "Scanning") }
+            return Activity(fraction: min(0.99, Double(stats.items) / Double(est)), label: "Scanning")
+        case .live:
+            if let r = rescanState {
+                return Activity(fraction: r.fraction, label: r.explicit ? "Rescanning" : "Checking for changes")
+            }
+            return catchingUp ? Activity(fraction: nil, label: "Catching up on changes") : nil
         }
     }
 

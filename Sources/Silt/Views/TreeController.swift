@@ -62,6 +62,15 @@ final class SiltOutlineView: NSOutlineView {
     }
 }
 
+/// How the file tree was left: which folders were open, what was selected,
+/// and what was at the top, so coming back to a location or pane looks the
+/// same. Folders are kept by dir id, which survives refreshes.
+struct TreeState {
+    var expanded: [UInt32] = [] // outermost first
+    var selection: [ItemRef] = []
+    var top: ItemRef?
+}
+
 /// Drives one NSOutlineView over a session's tree: lazy children, live
 /// refresh while a scan runs, animated re-sorting, and the item actions.
 @MainActor
@@ -121,6 +130,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     }
 
     func teardown() {
+        if !source.isList { session.treeState = captureState() }
         session.removeListener(self)
         if QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
             QLPreviewPanel.shared().orderOut(nil)
@@ -812,6 +822,56 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
 
     /// Selects a folder and scrolls to it, opening its ancestors so the row
     /// exists.
+    // MARK: Remembered state
+
+    private var restored = false
+
+    private func captureState() -> TreeState {
+        var state = TreeState()
+        for r in 0..<outline.numberOfRows {
+            if let n = outline.item(atRow: r) as? Node, n.isDir, outline.isItemExpanded(n) { state.expanded.append(n.dir) }
+        }
+        state.selection = selectedNodes().filter(\.isReal).map(\.ref)
+        let visible = outline.rows(in: scroll.contentView.bounds)
+        if visible.length > 0, let n = outline.item(atRow: visible.location) as? Node, n.isReal { state.top = n.ref }
+        return state
+    }
+
+    /// Reopens what was open when this location's tree was last shown. Rows
+    /// are expanded outermost first, so each one's children exist in time.
+    func restoreState() {
+        guard !source.isList, !restored else { return }
+        restored = true
+        let state = session.treeState
+        guard !state.expanded.isEmpty || !state.selection.isEmpty else { return }
+        _ = outline.numberOfRows // loads the top level
+        for dir in state.expanded {
+            guard let n = dirNodes[dir], !outline.isItemExpanded(n), outline.row(forItem: n) >= 0 else { continue }
+            outline.expandItem(n)
+        }
+        let rows = IndexSet(state.selection.compactMap { row(of: $0) })
+        if !rows.isEmpty { outline.selectRowIndexes(rows, byExtendingSelection: false) }
+        if let top = state.top, let r = row(of: top) {
+            outline.scroll(NSPoint(x: 0, y: outline.rect(ofRow: r).minY))
+        } else if let r = rows.first {
+            outline.scrollRowToVisible(r)
+        }
+    }
+
+    /// The row showing `ref`, if it's in view of the tree right now.
+    private func row(of ref: ItemRef) -> Int? {
+        if ref.isDir {
+            guard let n = dirNodes[ref.dir] else { return nil }
+            let r = outline.row(forItem: n)
+            return r >= 0 ? r : nil
+        }
+        let parent: UInt32? = tree.withLock { tree.isLive(ref.entry) ? tree.entry(ref.entry).parent : nil }
+        guard let parent, let p = dirNodes[parent], outline.isItemExpanded(p) || p === root,
+              let n = p.children?.first(where: { $0.kind == .file && $0.entry == ref.entry }) else { return nil }
+        let r = outline.row(forItem: n)
+        return r >= 0 ? r : nil
+    }
+
     func select(_ ref: ItemRef) {
         guard ref.isDir else { return }
         var chain: [UInt32] = tree.withLock {
@@ -960,6 +1020,7 @@ struct TreeView: NSViewRepresentable {
     func makeNSView(context: Context) -> NSScrollView {
         let c = context.coordinator
         DispatchQueue.main.async {
+            c.restoreState()
             // Take the keyboard only if nobody else has it: never out of the
             // search field while someone is typing.
             guard let window = c.outline.window else { return }
