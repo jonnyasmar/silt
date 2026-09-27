@@ -11,7 +11,7 @@ struct RootView: View {
         } detail: {
             Detail(model: model)
                 .inspector(isPresented: inspectorBinding) {
-                    if let s = model.current {
+                    if let s = model.current, s.isAwake {
                         InspectorView(session: s)
                             .inspectorColumnWidth(min: 250, ideal: 290, max: 380)
                     }
@@ -110,12 +110,12 @@ struct Sidebar: View {
         List(selection: selection) {
             Section("Locations") {
                 ForEach(model.locations) { loc in
-                    LocationRow(location: loc, session: model.sessions.first { $0.url.path == loc.url.path })
+                    LocationRow(location: loc, session: model.backing(loc.url.path))
                         .tag(loc.url.path)
                 }
-                ForEach(model.sessions.filter { s in !model.locations.contains { $0.url.path == s.url.path } }) { s in
-                    FolderSessionRow(session: s) { model.closeSession(s) }
-                        .tag(s.url.path)
+                ForEach(model.folders, id: \.self) { path in
+                    FolderSessionRow(path: path, session: model.backing(path)) { model.closeFolder(path) }
+                        .tag(path)
                 }
             }
             Section {
@@ -134,9 +134,9 @@ struct Sidebar: View {
 
     private var selection: Binding<String?> {
         Binding(
-            get: { model.current?.url.path },
+            get: { model.viewing },
             set: { path in
-                guard let path, path != model.current?.url.path else { return }
+                guard let path, path != model.viewing else { return }
                 model.scan(URL(fileURLWithPath: path))
             }
         )
@@ -160,36 +160,58 @@ private struct LocationRow: View {
 
     @ViewBuilder
     private var trailing: some View {
-        if let session, let activity = session.activity {
+        let own = session?.url.path == location.url.path
+        if let session, own, let activity = session.activity {
             ActivityBadge(activity: activity)
         } else if let avail = location.available {
             Text("\(Fmt.bytesShort(avail)) free")
-        } else if let session {
-            Text(Fmt.bytes(session.stats.bytes))
+        } else if let session, let size = session.size(ofView: location.url.path) {
+            Text(Fmt.bytes(size))
         }
     }
 }
 
+/// A folder opened with Scan Folder…: its own scan, or a view into a bigger
+/// one that covers it.
 private struct FolderSessionRow: View {
-    let session: Session
+    let path: String
+    let session: Session?
     let close: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
-            Label(session.title, systemImage: "folder")
+            Label(FileManager.default.displayName(atPath: path), systemImage: "folder")
                 .lineLimit(1)
             Spacer(minLength: 6)
-            if let activity = session.activity {
-                ActivityBadge(activity: activity)
-                    .font(.system(size: 11).monospacedDigit())
-                    .foregroundStyle(.secondary)
-            } else {
-                Text(Fmt.bytes(session.stats.bytes))
-                    .font(.system(size: 11).monospacedDigit())
-                    .foregroundStyle(.secondary)
+            Group {
+                if let session, session.url.path == path, let activity = session.activity {
+                    ActivityBadge(activity: activity)
+                } else if let size = session?.size(ofView: path) {
+                    Text(Fmt.bytes(size))
+                }
             }
+            .font(.system(size: 11).monospacedDigit())
+            .foregroundStyle(.secondary)
         }
-        .contextMenu { Button("Close Scan", action: close) }
+        .help(session.map { $0.url.path == path ? path : "\(path), shown from the \($0.title) scan" } ?? path)
+        .contextMenu { Button("Close", action: close) }
+    }
+}
+
+/// Shown for the moment a parked location takes to come back.
+private struct WakingView: View {
+    let session: Session
+    let name: String
+
+    var body: some View {
+        VStack(spacing: 10) {
+            ProgressView().controlSize(.small)
+            Text("Loading \(name)…")
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay(alignment: .top) { ActivityStrip(activity: Session.Activity(fraction: nil, label: "Loading")) }
     }
 }
 
@@ -336,7 +358,9 @@ struct Detail: View {
     @Bindable var model: WindowModel
 
     var body: some View {
-        if let session = model.current {
+        if let session = model.current, !session.isAwake {
+            WakingView(session: session, name: model.viewing.map { FileManager.default.displayName(atPath: $0) } ?? session.title)
+        } else if let session = model.current {
             VStack(spacing: 0) {
                 content(session)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)

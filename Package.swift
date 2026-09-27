@@ -28,5 +28,10 @@ let package = Package(
             linkerSettings: [.linkedFramework("Quartz")]
         ),
         .testTarget(name: "SiltCoreTests", dependencies: ["SiltCore"]),
+        .testTarget(
+            name: "SiltAppTests",
+            dependencies: ["Silt"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
     ]
 )

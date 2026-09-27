@@ -103,6 +103,19 @@ Other features:
   location shows it immediately, then FSEvents replays everything that changed
   since, so only those folders are re-listed. Removable and network volumes
   always rescan, and ⇧⌘R forces a fresh scan.
+- **One copy of everything.** A location or folder inside a scan that's
+  already open (Home inside Macintosh HD, a project inside `~/dev`) is shown
+  from that scan, instantly, rather than scanned again. If the smaller one
+  was scanned first, it folds into the bigger one when that finishes; marks
+  and open folders carry over. Each view keeps its own place.
+- **Hidden scans park.** A location that's been out of sight for two minutes
+  (or any hidden one, when macOS runs short of memory) writes its tree to
+  `~/Library/Caches/com.jonnyasmar.silt/Parked` exactly as it is and frees
+  it: Storage (7.6M items) goes from ~520 MB to ~26 MB, and comes back in
+  about half a second when shown again, then catches up on what changed.
+  Marks, open folders, Reclaim results and duplicates survive.
+- Tree chunks and big working buffers come straight from the kernel, so
+  memory the engine frees really goes back to the system.
 - **Rescans happen in place.** Every folder keeps its size and identity while
   its fresh listing replaces it, so the tree stays usable. The status bar
   shows a percentage, and folders still being re-checked show a hatched bar.

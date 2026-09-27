@@ -116,6 +116,12 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         root = makeRoot(for: source)
         configureOutline()
         session.addListener(self) { [weak self] in self?.treeChanged() }
+        if !source.isList {
+            session.captureTreeState = { [weak self] in
+                guard let self, !self.source.isList else { return }
+                self.session.treeStates[self.root.dir] = self.captureState()
+            }
+        }
         if source.isList {
             NotificationCenter.default.addObserver(forName: .siltFocusResults, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
@@ -130,7 +136,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     }
 
     func teardown() {
-        if !source.isList { session.treeState = captureState() }
+        if !source.isList { session.treeStates[root.dir] = captureState() }
         session.removeListener(self)
         if QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
             QLPreviewPanel.shared().orderOut(nil)
@@ -235,6 +241,8 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
 
     func setSource(_ newSource: TreeSource) {
         guard newSource != source else { return }
+        // Each folder the tree is rooted at keeps its own open folders.
+        if !source.isList { session.treeStates[root.dir] = captureState() }
         let previous = source.isList ? root.children ?? [] : []
         source = newSource
         root = makeRoot(for: newSource)
@@ -245,7 +253,13 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         }
         let selected = selectedNodes()
         outline.reloadData()
-        if newSource.isList { restoreSelection(selected) } else { outline.scrollRowToVisible(0) }
+        if newSource.isList {
+            restoreSelection(selected)
+        } else {
+            outline.scrollRowToVisible(0)
+            restored = false
+            restoreState()
+        }
     }
 
     // MARK: Nodes
@@ -842,7 +856,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     func restoreState() {
         guard !source.isList, !restored else { return }
         restored = true
-        let state = session.treeState
+        guard let state = session.treeStates[root.dir] else { return }
         guard !state.expanded.isEmpty || !state.selection.isEmpty else { return }
         _ = outline.numberOfRows // loads the top level
         for dir in state.expanded {

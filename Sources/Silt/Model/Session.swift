@@ -104,9 +104,15 @@ final class Session: Identifiable {
 
     /// Set by the tree view that currently owns the selection.
     @ObservationIgnored var quickLook: (() -> Void)?
-    /// How the file tree was left, so switching locations or panes and coming
-    /// back doesn't collapse everything.
-    @ObservationIgnored var treeState = TreeState()
+    /// How the file tree was left under each folder it was rooted at, so
+    /// switching locations, views or panes and coming back doesn't collapse
+    /// everything.
+    @ObservationIgnored var treeStates: [UInt32: TreeState] = [:]
+    /// Called once the location is scanned (or caught up) and settled.
+    @ObservationIgnored var onLive: (() -> Void)?
+    /// Set by the tree view on screen: saves its state into `treeStates` now.
+    @ObservationIgnored var captureTreeState: (() -> Void)?
+    @ObservationIgnored private var reportedLive = false
     /// Called once if the tree is running out of entry indices (they're never
     /// reused, so a folder churning for days could get there): the window
     /// replaces this session with a fresh one.
@@ -137,6 +143,25 @@ final class Session: Identifiable {
     @ObservationIgnored private var rootInode: UInt64 = 0
     @ObservationIgnored private var rootVolume: String?
 
+    /// Whether the tree is in memory; see `park()`.
+    enum Residency { case awake, parking, parked, waking }
+    private(set) var residency: Residency = .awake
+    var isAwake: Bool { residency == .awake }
+    /// When this location was last on screen (nil while it is).
+    @ObservationIgnored var hiddenSince: TimeInterval?
+    @ObservationIgnored fileprivate var wakeWhenParked = false
+    @ObservationIgnored fileprivate var closed = false
+    @ObservationIgnored fileprivate var parkedEvents: [String: FSWatcher.Event] = [:]
+    @ObservationIgnored fileprivate var parkedOverflow = false
+    @ObservationIgnored fileprivate var parkedMaxEventId: FSEventStreamEventId = 0
+    @ObservationIgnored fileprivate var parkedSpecial: [FSWatcher.Event] = []
+
+    /// The location or folder this scan is being shown as.
+    private(set) var viewPath: String = ""
+    @ObservationIgnored fileprivate var viewFocus: [String: UInt32] = [:]
+    @ObservationIgnored fileprivate var pendingFocus: String?
+    @ObservationIgnored fileprivate var viewSizes: [String: Int64] = [:]
+
     /// Marked for cleanup, with an optional reason ("node_modules", "copy of …").
     private(set) var marks: [MarkKey: MarkInfo] = [:]
     /// Deduplicated total of everything marked (nested marks count once).
@@ -144,7 +169,7 @@ final class Session: Identifiable {
     private(set) var markedCount = 0
     @ObservationIgnored private var marksDirty = false
     @ObservationIgnored private var lastMarksRecompute: TimeInterval = 0
-    @ObservationIgnored private var marksRestored = false
+    @ObservationIgnored fileprivate var marksRestored = false
 
     /// What the volume's used space holds beyond the scan, for whole volumes.
     private(set) var hidden: HiddenSpace?
@@ -187,8 +212,10 @@ final class Session: Identifiable {
         var id: UInt32 { dir }
     }
 
-    /// Reclaim suggestions, shared by the Reclaim pane and the overview.
+    /// Reclaim suggestions for the whole scan, shared by the Reclaim pane and
+    /// the overview. `findings(under:)` narrows them to a view.
     private(set) var findings: [Finding] = []
+    @ObservationIgnored private var scoped: (dir: UInt32, source: Int, findings: [Finding])?
     private(set) var analyzing = false
     @ObservationIgnored private var analyzedVersion = -1
     @ObservationIgnored private var lastAnalysis: TimeInterval = 0
@@ -259,11 +286,17 @@ final class Session: Identifiable {
     }
 
     func close() {
+        closed = true
+        duplicates.cancel()
         timer?.invalidate()
         timer = nil
         watcher?.stop()
         watcher = nil
-        tree.stop()
+        switch residency {
+        case .awake: tree.stop()
+        case .parked: try? FileManager.default.removeItem(atPath: parkFile)
+        case .parking, .waking: break // the worker cleans up when it's done
+        }
     }
 
     // MARK: Live updates
@@ -278,6 +311,7 @@ final class Session: Identifiable {
     }
 
     private func tick() {
+        guard residency == .awake else { return } // nothing to show, nothing to update
         let p = tree.progress
         let gen = tree.generation
         let now = ProcessInfo.processInfo.systemUptime
@@ -305,10 +339,12 @@ final class Session: Identifiable {
             baselineDate = Date()
             malloc_zone_pressure_relief(nil, 0) // scan batches are done with
             measureHidden(now: now)
+            reportLive()
         }
 
         if gen != lastGeneration {
             lastGeneration = gen
+            resolvePendingFocus()
             repairFocus()
             notifyListeners()
             if now - lastVersionBump > 0.2 || phase == .live {
@@ -378,8 +414,9 @@ final class Session: Identifiable {
     }
 
     /// At quit: save synchronously if anything changed since the last save.
+    /// (A parked location's snapshot was brought up to date when it parked.)
     func saveSnapshotNow() {
-        guard phase == .live, !catchingUp, tree.generation != savedGeneration else { return }
+        guard isAwake, phase == .live, !catchingUp, tree.generation != savedGeneration else { return }
         if Snapshots.save(tree, url: url, eventId: lastEventId, fullDiskAccess: fullDiskAccess) {
             savedGeneration = tree.generation
         }
@@ -424,6 +461,27 @@ final class Session: Identifiable {
     }
 
     private func handle(_ events: [FSWatcher.Event]) {
+        // Parked (or on the way in or out): remember which folders changed,
+        // once each, and catch up on waking.
+        if residency != .awake {
+            for e in events {
+                parkedMaxEventId = max(parkedMaxEventId, e.id)
+                // A remount or wrapped ids needs its own handling on waking,
+                // however many other changes pile up.
+                if e.rootChanged || e.idsWrapped { parkedSpecial.append(e) }
+                guard !parkedOverflow else { continue }
+                if let old = parkedEvents[e.path] {
+                    parkedEvents[e.path] = FSWatcher.Event(path: e.path, flags: old.flags | e.flags, id: max(old.id, e.id))
+                } else {
+                    parkedEvents[e.path] = e
+                }
+            }
+            if parkedEvents.count > 50_000 {
+                parkedOverflow = true // cheaper to re-check everything on waking
+                parkedEvents = [:]
+            }
+            return
+        }
         // Changes that land mid-scan are applied once the scan settles, so the
         // scan never races its own refreshes.
         if phase == .scanning {
@@ -446,7 +504,10 @@ final class Session: Identifiable {
         var rootChanged = false, wrapped = false
         for event in events {
             if event.id > lastEventId && event.id != UInt64(kFSEventStreamEventIdSinceNow) { lastEventId = event.id }
-            if event.historyDone { catchingUp = false }
+            if event.historyDone {
+                catchingUp = false
+                reportLive()
+            }
             if event.rootChanged { rootChanged = true }
             if event.idsWrapped { wrapped = true }
         }
@@ -531,6 +592,11 @@ final class Session: Identifiable {
         if root == "/" && path.hasPrefix(dataPrefix + "/") {
             path = String(path.dropFirst(dataPrefix.count))
         }
+        // /var, /tmp and /etc are links into /private: FSEvents reports the
+        // real path, the root may be the familiar one.
+        if path.hasPrefix("/private/") && !root.hasPrefix("/private/") && root != "/" {
+            path = String(path.dropFirst("/private".count))
+        }
         guard path == root || path.hasPrefix(root == "/" ? "/" : root + "/") else { return nil }
         while true {
             let e = tree.lookup(path)
@@ -547,6 +613,7 @@ final class Session: Identifiable {
     /// place: the tree stays browsable, sizes update as folders are
     /// revisited, and `rescanState` reports progress.
     func rescan(_ ref: ItemRef? = nil) {
+        guard isAwake else { return }
         let dir = ref?.dir ?? 0
         guard dir != NONE else { return }
         startRescan(dir, explicit: true)
@@ -914,6 +981,7 @@ final class Session: Identifiable {
     }
 
     private func refreshParents(of items: [Target]) {
+        guard isAwake else { return } // parked since: its events will catch it up
         var dirs = Set<UInt32>()
         tree.withLock {
             for t in items { dirs.insert(tree.entry(t.entry).parent) }
@@ -936,6 +1004,35 @@ final class Session: Identifiable {
         }
     }
 
+    /// The findings inside folder `dir` (a view such as Home inside the
+    /// Macintosh HD scan), with their sizes recounted.
+    func findings(under dir: UInt32) -> [Finding] {
+        guard dir != 0, isAwake else { return findings }
+        let source = analyzedVersion
+        if let s = scoped, s.dir == dir, s.source == source { return s.findings }
+        let result: [Finding] = tree.withLock {
+            findings.compactMap { f in
+                let inside = f.entries.filter { i in
+                    guard tree.isLive(i) else { return false }
+                    var p = tree.entry(i).parent
+                    if tree.entry(i).isDir && tree.entry(i).aux == dir { return true }
+                    while p != NONE {
+                        if p == dir { return true }
+                        p = tree.entry(tree.dirEntry(p)).parent
+                    }
+                    return false
+                }
+                guard !inside.isEmpty else { return nil }
+                var g = Finding(id: f.id, title: f.title, detail: f.detail, symbol: f.symbol, safety: f.safety,
+                                entries: inside, bytes: inside.reduce(Int64(0)) { $0 + tree.entry($1).size })
+                g.isTrash = f.isTrash
+                return g
+            }
+        }
+        scoped = (dir, source, result)
+        return result
+    }
+
     // MARK: Activity
 
     /// Long-running work on this location, for progress bars: the first scan
@@ -948,6 +1045,9 @@ final class Session: Identifiable {
     }
 
     var activity: Activity? {
+        if residency == .waking || (residency == .parking && wakeWhenParked) {
+            return Activity(fraction: nil, label: "Loading")
+        }
         switch phase {
         case .scanning:
             guard let est = scanEstimate, est > 0 else { return Activity(fraction: nil, label: "Scanning") }
@@ -1083,6 +1183,7 @@ extension Session {
 
     /// Adds or removes `refs`; if every one is already marked, unmarks them.
     func toggleMarks(_ refs: [ItemRef], reason: String? = nil) {
+        guard isAwake else { return }
         let keys = tree.withLock { refs.compactMap { markKey(for: $0) } }
         guard !keys.isEmpty else { return }
         if keys.allSatisfy({ marks[$0] != nil }) {
@@ -1096,6 +1197,7 @@ extension Session {
     }
 
     func mark(_ refs: [ItemRef], reason: String) {
+        guard isAwake, !refs.isEmpty else { return } // e.g. a search that finished after parking
         for (k, info) in captureMarks(refs) where marks[k] == nil {
             marks[k] = MarkInfo(reason: reason, dev: info.dev, ino: info.ino)
         }
@@ -1103,15 +1205,18 @@ extension Session {
     }
 
     func mark(entries: [UInt32], reason: String) {
+        guard isAwake else { return }
         mark(tree.withLock { entries.filter { tree.isLive($0) }.map { ref(forEntry: $0) } }, reason: reason)
     }
 
     func unmark(_ keys: [MarkKey]) {
+        guard isAwake else { return }
         for k in keys { marks.removeValue(forKey: k) }
         marksChanged()
     }
 
     func clearMarks() {
+        guard isAwake else { return }
         marks = [:]
         marksChanged()
     }
@@ -1252,11 +1357,13 @@ extension Session {
 
     // MARK: Persisted marks
 
-    private var marksDefaultsKey: String { "marks:" + url.path }
+    fileprivate var marksDefaultsKey: String { "marks:" + url.path }
 
     /// Marks survive a relaunch: saved by path and identity, restored when
     /// the same objects are still there.
     fileprivate func persistMarks() {
+        // A parked tree resolves nothing; what's saved stays as it is.
+        guard isAwake else { return }
         let entries: [[String: Any]] = tree.withLock {
             marks.compactMap { key, info in
                 guard let i = resolve(key) else { return nil }
@@ -1268,6 +1375,11 @@ extension Session {
 
     fileprivate func restoreMarks() {
         guard let saved = UserDefaults.standard.array(forKey: marksDefaultsKey) as? [[String: Any]] else { return }
+        importMarks(saved)
+    }
+
+    /// Marks saved as paths plus the exact file each was made on.
+    fileprivate func importMarks(_ saved: [[String: Any]]) {
         for m in saved {
             guard let path = m["path"] as? String, let dev = m["dev"] as? Int, let ino = m["ino"] as? Int,
                   let ref = liveRef(path: path) else { continue }
@@ -1385,5 +1497,249 @@ extension Session {
         if found != changes { changes = found }
         let net = tree.withLock { tree.entry(0).size } - (base[0] ?? 0)
         if net != netChange { netChange = net }
+    }
+}
+
+// MARK: - Parking
+
+extension Session {
+    static var parkDirectory: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("com.jonnyasmar.silt/Parked", isDirectory: true)
+    }
+
+    fileprivate var parkFile: String {
+        Session.parkDirectory.appendingPathComponent(id.uuidString + ".park").path
+    }
+
+    /// Settled enough to put away: not scanning, rescanning, catching up or
+    /// about to re-list anything, and no duplicate search running.
+    var canPark: Bool {
+        guard residency == .awake, phase == .live, !catchingUp, rescanBase == nil, dueAt.isEmpty,
+              deferredDeep.isEmpty, heldEvents.isEmpty, !saving, !analyzing else { return false }
+        switch duplicates.phase {
+        case .collecting, .comparing: return false
+        default: break
+        }
+        return tree.progress.idle
+    }
+
+    /// Writes the tree to a file and frees its memory. Everything that refers
+    /// into it (marks, open folders, Reclaim results, duplicates) stays valid:
+    /// it comes back exactly as it was.
+    func park() {
+        guard canPark else { return }
+        residency = .parking
+        let tree = tree, url = url, eventId = lastEventId, fda = fullDiskAccess, file = parkFile
+        let generation = tree.generation
+        let refreshSnapshot = Snapshots.eligible(url) && generation != savedGeneration
+        try? FileManager.default.createDirectory(at: Session.parkDirectory, withIntermediateDirectories: true)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            tree.stopScanner()
+            // A relaunch should still open this instantly.
+            let saved = refreshSnapshot && Snapshots.save(tree, url: url, eventId: eventId, fullDiskAccess: fda)
+            let parked = tree.park(to: file)
+            if !parked { tree.resumeIdle() }
+            malloc_zone_pressure_relief(nil, 0)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, !self.closed else {
+                        try? FileManager.default.removeItem(atPath: file)
+                        return
+                    }
+                    if saved { self.savedGeneration = generation }
+                    self.residency = parked ? .parked : .awake
+                    if !parked { self.releaseParkedEvents() } // it stayed; catch up now
+                    if self.wakeWhenParked {
+                        self.wakeWhenParked = false
+                        self.wake()
+                    }
+                }
+            }
+        }
+    }
+
+    /// Brings a parked tree back, then catches up on what changed meanwhile.
+    func wake() {
+        switch residency {
+        case .awake, .waking:
+            return
+        case .parking:
+            wakeWhenParked = true
+        case .parked:
+            residency = .waking
+            let tree = tree, file = parkFile
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let ok = tree.unpark(from: file)
+                if ok { tree.resumeIdle() }
+                try? FileManager.default.removeItem(atPath: file)
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        guard let self, !self.closed else { return }
+                        guard ok else {
+                            // The file is gone or damaged: start this location over.
+                            self.residency = .parked
+                            self.onNeedsRebuild?()
+                            return
+                        }
+                        self.residency = .awake
+                        self.lastGeneration = .max // everything showing it should look again
+                        self.releaseParkedEvents()
+                        self.resolvePendingFocus()
+                        self.version += 1
+                        self.quietVersion += 1
+                    }
+                }
+            }
+        }
+    }
+
+    private func releaseParkedEvents() {
+        let events = Array(parkedEvents.values)
+        let special = parkedSpecial
+        let overflow = parkedOverflow
+        parkedEvents = [:]
+        parkedSpecial = []
+        parkedOverflow = false
+        if !special.isEmpty { apply(special) } // remounts: reattach the stream first
+        if overflow {
+            lastEventId = max(lastEventId, parkedMaxEventId)
+            startRescan(0, explicit: false)
+        } else if !events.isEmpty {
+            apply(events)
+        }
+    }
+
+    fileprivate func reportLive() {
+        guard !reportedLive, phase == .live, !catchingUp else { return }
+        reportedLive = true
+        onLive?()
+    }
+}
+
+// MARK: - Views
+
+extension Session {
+    /// Whether this scan reaches `path`: inside its root and not across a
+    /// mount point (another volume gets its own scan). Needs no tree, so it
+    /// answers while parked too.
+    func covers(_ path: String) -> Bool {
+        let root = url.path
+        let prefix = root == "/" ? "/" : root + "/"
+        guard path != root, path.hasPrefix(prefix) else { return false }
+        for m in Mounts.all() where m.path != root && m.path.hasPrefix(prefix) {
+            if path == m.path || path.hasPrefix(m.path + "/") { return false }
+        }
+        return true
+    }
+
+    /// Lock held. The folder at `path`, if the scan has listed it.
+    func dirID(forPath path: String) -> UInt32? {
+        let e = tree.lookup(path)
+        guard e != NONE else { return nil }
+        let entry = tree.entry(e)
+        return entry.isDir ? entry.aux : nil
+    }
+
+    /// Shows this scan as `path`: its root, or a folder inside it. Each view
+    /// comes back where it was left.
+    func enter(view path: String) {
+        viewPath = path
+        selection = []
+        if path == url.path {
+            focus = viewFocus[path] ?? 0
+            pendingFocus = nil
+            return
+        }
+        pendingFocus = path
+        if let saved = viewFocus[path] {
+            focus = saved
+            pendingFocus = nil
+        }
+        resolvePendingFocus()
+    }
+
+    /// The size to show beside a view in the sidebar: the whole scan, or the
+    /// folder it opened as (the last known size while parked).
+    func size(ofView path: String) -> Int64? {
+        _ = version // follow changes
+        if path == url.path { return stats.bytes }
+        guard isAwake else { return viewSizes[path] }
+        let size: Int64? = tree.withLock {
+            guard let d = dirID(forPath: path) else { return nil }
+            return tree.entry(tree.dirEntry(d)).size
+        }
+        if let size { viewSizes[path] = size }
+        return size ?? viewSizes[path]
+    }
+
+    /// Remembers where the current view was left.
+    func leaveView() {
+        viewFocus[viewPath] = focus
+    }
+
+    /// A view's folder the scan hadn't reached yet: until it does, show the
+    /// nearest folder it has.
+    fileprivate func resolvePendingFocus() {
+        guard let target = pendingFocus, isAwake else { return }
+        let (exact, nearest): (UInt32?, UInt32) = tree.withLock {
+            if let d = dirID(forPath: target) { return (d, d) }
+            var p = (target as NSString).deletingLastPathComponent
+            while p.count > url.path.count {
+                if let d = dirID(forPath: p) { return (nil, d) }
+                p = (p as NSString).deletingLastPathComponent
+            }
+            return (nil, 0)
+        }
+        if let exact {
+            pendingFocus = nil
+            if focus != exact { focus = exact }
+        } else {
+            if focus != nearest { focus = nearest }
+            if phase == .live && !catchingUp { pendingFocus = nil } // it isn't coming
+        }
+    }
+
+    /// Takes over the marks of a scan this one now covers.
+    func adoptMarks(from other: Session) {
+        // Our own saved marks first, or saving the merged set would lose them.
+        if !marksRestored {
+            marksRestored = true
+            restoreMarks()
+        }
+        if other.isAwake { other.persistMarks() }
+        let key = other.marksDefaultsKey
+        guard let saved = UserDefaults.standard.array(forKey: key) as? [[String: Any]] else { return }
+        importMarks(saved)
+        UserDefaults.standard.removeObject(forKey: key)
+        persistMarks()
+    }
+
+    /// Takes over how a covered scan was left: where each of its views was
+    /// focused and which folders were open, found again by path. (A parked
+    /// scan's is lost: reading it would mean waking it.)
+    func adoptView(from other: Session) {
+        guard other.isAwake else { return }
+        other.captureTreeState?() // the tree on screen hasn't saved its state yet
+        other.leaveView()
+        let otherTree = other.tree
+        func path(_ d: UInt32) -> String? {
+            d < otherTree.raw.pointee.dir_count && otherTree.isLive(otherTree.dirEntry(d))
+                ? (d == 0 ? other.url.path : otherTree.path(of: otherTree.dirEntry(d))) : nil
+        }
+        let (states, focuses): ([(String, [String])], [(String, String)]) = otherTree.withLock {
+            let states = other.treeStates.compactMap { root, state in path(root).map { ($0, state.expanded.compactMap(path)) } }
+            let focuses = other.viewFocus.compactMap { view, d in path(d).map { (view, $0) } }
+            return (states, focuses)
+        }
+        tree.withLock {
+            for (root, open) in states {
+                guard let r = dirID(forPath: root) else { continue }
+                treeStates[r] = TreeState(expanded: open.compactMap { dirID(forPath: $0) })
+            }
+            for (view, focusPath) in focuses {
+                if let d = dirID(forPath: focusPath) { viewFocus[view] = d }
+            }
+        }
     }
 }

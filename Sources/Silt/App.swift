@@ -19,6 +19,8 @@ struct SiltApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
+        // Parked trees belong to the run that parked them.
+        try? FileManager.default.removeItem(at: Session.parkDirectory)
         // Icon Services is slow to wake the first time; do it while the
         // window is still being built.
         DispatchQueue.global(qos: .userInitiated).async {
@@ -84,8 +86,23 @@ enum ItemAction { case reveal, open, up, quickLook, copyPath, trash, delete, mar
 @MainActor
 @Observable
 final class WindowModel {
+    /// Scans held by this window. A location or folder inside one of them is
+    /// shown from it rather than scanned again.
     private(set) var sessions: [Session] = []
-    var current: Session?
+    /// The scan being shown. Whatever stops being shown starts its clock
+    /// toward parking; whatever is shown wakes up.
+    private(set) var current: Session? {
+        didSet {
+            guard current !== oldValue else { return }
+            oldValue?.hiddenSince = ProcessInfo.processInfo.systemUptime
+            current?.hiddenSince = nil
+            current?.wake()
+        }
+    }
+    /// The location or folder on screen: `current`'s root, or a folder inside it.
+    private(set) var viewing: String?
+    /// Folders opened with Scan Folder… (sidebar locations aside), in order.
+    private(set) var folders: [String] = []
     var pane: Pane = .files
     var search = ""
     var showInspector = true
@@ -107,6 +124,7 @@ final class WindowModel {
                   hasFullDiskAccess || UserDefaults.standard.bool(forKey: "scanWithoutFDA")
                   || !touchesPrivateFolders(last.path) {
             scan(last)
+            if let view = UserDefaults.standard.string(forKey: "lastView"), view != last.path { scan(URL(fileURLWithPath: view)) }
         }
         if let i = CommandLine.arguments.firstIndex(of: "--pane"), i + 1 < CommandLine.arguments.count,
            let p = Pane(rawValue: CommandLine.arguments[i + 1]) {
@@ -121,13 +139,39 @@ final class WindowModel {
                 MainActor.assumeIsolated { self?.refreshLocations() }
             }
         }
+        parkTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.parkHidden(after: Self.parkAfter) }
+        }
+        let pressure = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
+        pressure.setEventHandler { [weak self] in
+            MainActor.assumeIsolated { self?.parkHidden(after: 0) }
+        }
+        pressure.resume()
+        memoryPressure = pressure
     }
 
-    /// Snapshots every live scan in every window (at quit).
+    /// How long a location stays in memory after it's no longer on screen.
+    private static let parkAfter: TimeInterval = 120
+    @ObservationIgnored private var parkTimer: Timer?
+    @ObservationIgnored private var memoryPressure: DispatchSourceMemoryPressure?
+
+    /// Puts away scans that have been out of sight for `after` seconds (all of
+    /// them, right away, when macOS runs short of memory).
+    private func parkHidden(after: TimeInterval) {
+        let now = ProcessInfo.processInfo.systemUptime
+        for s in sessions where s !== current {
+            guard let hidden = s.hiddenSince, now - hidden >= after, s.canPark else { continue }
+            s.park()
+        }
+    }
+
+    /// Snapshots every live scan in every window (at quit), and clears away
+    /// parked trees.
     static func saveAll() {
         for m in active.compactMap(\.model) {
             for s in m.sessions { s.saveSnapshotNow() }
         }
+        try? FileManager.default.removeItem(at: Session.parkDirectory)
     }
 
     /// Opens `url` in the frontmost window (Dock drops, `open -a Silt dir`).
@@ -179,8 +223,13 @@ final class WindowModel {
         let path = url.resolvingSymlinksInPath().path
         search = ""
         if let existing = sessions.first(where: { $0.url.path == path }) {
-            current = existing
-            UserDefaults.standard.set(path, forKey: "lastScan")
+            show(existing, as: path)
+            return
+        }
+        // Already inside a scan: show it from there, instantly and without a
+        // second copy in memory. The deepest covering scan wins.
+        if let host = sessions.filter({ $0.covers(path) }).max(by: { $0.url.path.count < $1.url.path.count }) {
+            show(host, as: path)
             return
         }
         refreshLocations()
@@ -219,12 +268,22 @@ final class WindowModel {
     }
 
     private func start(_ url: URL) {
-        UserDefaults.standard.set(url.resolvingSymlinksInPath().path, forKey: "lastScan")
         let session = Session(url: url, guardPrivateFolders: !hasFullDiskAccess)
         adopt(session)
         sessions.append(session)
-        current = session
+        show(session, as: session.url.path)
         pane = .files
+    }
+
+    /// Puts `session` on screen as `path` (its root or a folder inside it).
+    private func show(_ session: Session, as path: String) {
+        if let old = current, viewing != nil { old.leaveView() }
+        current = session
+        viewing = path
+        session.enter(view: path)
+        if !locations.contains(where: { $0.url.path == path }), !folders.contains(path) { folders.append(path) }
+        UserDefaults.standard.set(session.url.path, forKey: "lastScan")
+        UserDefaults.standard.set(path, forKey: "lastView")
     }
 
     private func adopt(_ session: Session) {
@@ -232,6 +291,32 @@ final class WindowModel {
             guard let self, let session else { return }
             self.rebuild(session)
         }
+        session.onLive = { [weak self, weak session] in
+            guard let self, let session else { return }
+            self.absorb(into: session)
+        }
+    }
+
+    /// Scans that `host` now covers (Home, once Macintosh HD is scanned) fold
+    /// into it: their marks and open folders move over, their views are shown
+    /// from `host`, and their memory goes.
+    private func absorb(into host: Session) {
+        guard host.isAwake, sessions.contains(where: { $0 === host }) else { return }
+        for s in sessions where s !== host && host.covers(s.url.path) {
+            host.adoptMarks(from: s)
+            host.adoptView(from: s)
+            let shown = current === s
+            let view = viewing
+            s.close()
+            sessions.removeAll { $0 === s }
+            if shown { show(host, as: view ?? s.url.path) }
+        }
+    }
+
+    /// The scan a sidebar row is shown from: its own, or one covering it.
+    func backing(_ path: String) -> Session? {
+        sessions.first { $0.url.path == path }
+            ?? sessions.filter { $0.covers(path) }.max { $0.url.path.count < $1.url.path.count }
     }
 
     /// Swaps a session for a compacted copy of itself: saved and reloaded
@@ -243,12 +328,18 @@ final class WindowModel {
         let fresh = Session(url: old.url, guardPrivateFolders: !hasFullDiskAccess)
         adopt(fresh)
         sessions[i] = fresh
-        if current === old { current = fresh }
+        if current === old { show(fresh, as: viewing ?? fresh.url.path) }
     }
 
-    /// Rescans in place: everything stays visible while it's re-checked.
+    /// Rescans in place: everything stays visible while it's re-checked. A
+    /// view into a bigger scan re-checks just its own folder.
     func rescan() {
-        current?.rescan()
+        guard let s = current, s.isAwake else { return }
+        if let v = viewing, v != s.url.path, let d = s.tree.withLock({ s.dirID(forPath: v) }) {
+            s.rescan(ItemRef(entry: s.tree.withLock { s.tree.dirEntry(d) }, dir: d))
+        } else {
+            s.rescan()
+        }
     }
 
     /// Throws the scan away and starts over (rarely needed).
@@ -259,13 +350,28 @@ final class WindowModel {
         let fresh = Session(url: old.url, guardPrivateFolders: !hasFullDiskAccess, fresh: true)
         adopt(fresh)
         sessions[i] = fresh
-        current = fresh
+        show(fresh, as: viewing ?? fresh.url.path)
     }
 
-    func closeSession(_ session: Session) {
-        session.close()
-        sessions.removeAll { $0 === session }
-        if current === session { current = sessions.last }
+    /// Closes a folder row: its own scan (and the views into it), or just the
+    /// view when a bigger scan covers it.
+    func closeFolder(_ path: String) {
+        folders.removeAll { $0 == path }
+        if let own = sessions.first(where: { $0.url.path == path }) {
+            own.close()
+            sessions.removeAll { $0 === own }
+            folders.removeAll { backing($0) == nil } // views that went with it
+        }
+        if let v = viewing, v != path, let s = backing(v) {
+            if current !== s { show(s, as: v) }
+        } else if let host = backing(path) {
+            show(host, as: host.url.path)
+        } else if let next = sessions.last {
+            show(next, as: next.url.path)
+        } else {
+            current = nil
+            viewing = nil
+        }
     }
 
     func chooseFolder() {
@@ -292,7 +398,7 @@ final class WindowModel {
             }
             return
         }
-        guard let s = current else { return }
+        guard let s = current, s.isAwake else { return } // still loading: nothing to act on
         let sel = s.selection
         switch action {
         case .reveal: s.reveal(sel)

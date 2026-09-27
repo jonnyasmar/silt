@@ -6,7 +6,7 @@ struct ReclaimView: View {
     let model: WindowModel
     @State private var expanded: Set<String> = []
 
-    private var findings: [Finding] { session.findings }
+    private var findings: [Finding] { session.findings(under: session.focus) }
     private var analyzing: Bool { session.analyzing || (session.phase == .live && session.findings.isEmpty && session.version == 0) }
 
     var body: some View {
@@ -46,7 +46,9 @@ struct ReclaimView: View {
     private var header: some View {
         let safe = findings.filter { $0.safety == .safe }.reduce(Int64(0)) { $0 + $1.bytes }
         let review = findings.filter { $0.safety == .review }.reduce(Int64(0)) { $0 + $1.bytes }
-        let place = session.title
+        let place = session.focus == 0 ? session.title : session.tree.withLock {
+            session.tree.name(of: session.tree.entry(session.tree.dirEntry(session.focus)))
+        }
         let safeFindings = findings.filter { $0.safety == .safe && !$0.isTrash }
         return PaneHeader(
             title: "Reclaim",

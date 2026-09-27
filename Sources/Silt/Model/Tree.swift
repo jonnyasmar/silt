@@ -1,4 +1,5 @@
 import Foundation
+import os
 import SiltCore
 
 let NONE: UInt32 = 0xFFFF_FFFF
@@ -11,7 +12,16 @@ let NONE: UInt32 = 0xFFFF_FFFF
 final class Tree: @unchecked Sendable {
     let raw: UnsafeMutablePointer<silt_tree>
     let rootPath: String
-    private(set) var scanner: OpaquePointer?
+    /// The scanner is created and destroyed on other threads when parking, so
+    /// every use of it goes through this lock: the C API forbids using a
+    /// scanner while it's being destroyed.
+    private let scannerLock = OSAllocatedUnfairLock()
+    private var _scanner: OpaquePointer?
+    private func withScanner<T>(_ body: (OpaquePointer?) -> T) -> T {
+        scannerLock.lock()
+        defer { scannerLock.unlock() }
+        return body(_scanner)
+    }
 
     init(path: String) {
         rootPath = path
@@ -25,7 +35,7 @@ final class Tree: @unchecked Sendable {
     }
 
     deinit {
-        if let scanner { silt_scanner_destroy(scanner) }
+        if let _scanner { silt_scanner_destroy(_scanner) }
         silt_tree_destroy(raw)
     }
 
@@ -34,26 +44,44 @@ final class Tree: @unchecked Sendable {
     private static var threads: Int32 { Int32(max(8, ProcessInfo.processInfo.activeProcessorCount * 2)) }
 
     func startScan() {
-        scanner = silt_scanner_start(raw, Self.threads)
+        scannerLock.lock()
+        _scanner = silt_scanner_start(raw, Self.threads)
+        scannerLock.unlock()
     }
 
     /// For a restored tree: workers only, waiting for refreshes.
     func startIdle() {
-        scanner = silt_scanner_start_idle(raw, Self.threads)
+        scannerLock.lock()
+        if _scanner == nil { _scanner = silt_scanner_start_idle(raw, Self.threads) }
+        scannerLock.unlock()
     }
 
     func stop() {
-        if let scanner { silt_scanner_cancel(scanner) }
+        withScanner { if let s = $0 { silt_scanner_cancel(s) } }
     }
+
+    /// Ends the workers for good (before parking); refreshes do nothing until
+    /// `resumeIdle`.
+    func stopScanner() {
+        scannerLock.lock()
+        if let _scanner { silt_scanner_destroy(_scanner) }
+        _scanner = nil
+        scannerLock.unlock()
+    }
+
+    func resumeIdle() { startIdle() }
+
+    func park(to path: String) -> Bool { silt_tree_park(raw, path) }
+    func unpark(from path: String) -> Bool { silt_tree_unpark(raw, path) }
 
     var progress: silt_progress {
         var p = silt_progress()
-        if let scanner { silt_scanner_progress(scanner, &p) }
+        withScanner { if let s = $0 { silt_scanner_progress(s, &p) } }
         return p
     }
 
     func refresh(dir: UInt32, deep: Bool) {
-        if let scanner { silt_scanner_refresh(scanner, dir, deep) }
+        withScanner { if let s = $0 { silt_scanner_refresh(s, dir, deep) } }
     }
 
     func remove(entry: UInt32) { silt_tree_remove(raw, entry) }
