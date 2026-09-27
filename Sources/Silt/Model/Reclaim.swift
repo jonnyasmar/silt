@@ -72,33 +72,41 @@ enum Reclaim {
               safety: .review),
     ]
 
+    /// Build output and dependencies, found by folder name. They count only in
+    /// projects of yours (see `Place`), next to a file that proves the
+    /// project is there to rebuild them.
     private struct Pattern {
         let name: String
-        let sibling: String? // a file that must sit next to the folder
+        let markers: [String] // one of these must sit next to the folder
         let id: String
         let title: String
         let detail: String
+        var safety: Finding.Safety = .safe
     }
 
+    private static let js = ["package.json"]
     private static let patterns: [Pattern] = [
-        Pattern(name: "node_modules", sibling: "package.json", id: "node_modules", title: "node_modules",
-                detail: "JavaScript dependencies. Reinstall with your package manager."),
-        Pattern(name: ".build", sibling: "Package.swift", id: "swiftpm", title: "SwiftPM build output",
+        Pattern(name: "node_modules", markers: js, id: "node_modules", title: "node_modules",
+                detail: "JavaScript dependencies of your projects. Reinstall with your package manager."),
+        Pattern(name: ".build", markers: ["Package.swift"], id: "swiftpm", title: "SwiftPM build output",
                 detail: "`.build` folders next to Package.swift."),
-        Pattern(name: "DerivedData", sibling: nil, id: "project-deriveddata", title: "Project DerivedData",
+        Pattern(name: "DerivedData", markers: [], id: "project-deriveddata", title: "Project DerivedData",
                 detail: "Xcode build folders kept inside projects."),
-        Pattern(name: "Pods", sibling: "Podfile", id: "pods", title: "CocoaPods",
+        Pattern(name: "Pods", markers: ["Podfile"], id: "pods", title: "CocoaPods",
                 detail: "Reinstalled by `pod install`."),
-        Pattern(name: ".next", sibling: nil, id: "next", title: "Next.js build caches",
+        Pattern(name: ".next", markers: js, id: "next", title: "Next.js build caches",
                 detail: "`.next` folders; rebuilt by `next build`."),
-        Pattern(name: ".turbo", sibling: nil, id: "turbo", title: "Turborepo caches", detail: "Local task caches."),
-        Pattern(name: ".parcel-cache", sibling: nil, id: "parcel", title: "Parcel caches", detail: "Bundler caches."),
-        Pattern(name: ".svelte-kit", sibling: nil, id: "sveltekit", title: "SvelteKit output",
+        Pattern(name: ".turbo", markers: js, id: "turbo", title: "Turborepo caches", detail: "Local task caches."),
+        Pattern(name: ".parcel-cache", markers: js, id: "parcel", title: "Parcel caches", detail: "Bundler caches."),
+        Pattern(name: ".svelte-kit", markers: js, id: "sveltekit", title: "SvelteKit output",
                 detail: "Generated on the next dev or build."),
-        Pattern(name: ".gradle", sibling: "settings.gradle", id: "project-gradle", title: "Project Gradle caches",
-                detail: "Per-project Gradle state."),
-        Pattern(name: ".venv", sibling: nil, id: "venv", title: "Python virtualenvs",
-                detail: "Recreate from requirements or your lockfile."),
+        Pattern(name: ".gradle", markers: ["settings.gradle", "settings.gradle.kts", "build.gradle", "build.gradle.kts"],
+                id: "project-gradle", title: "Project Gradle caches", detail: "Per-project Gradle state."),
+        Pattern(name: ".venv", markers: ["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile",
+                                         "uv.lock", "poetry.lock"],
+                id: "venv", title: "Python virtualenvs",
+                detail: "Environments for your Python projects. Recreate them from requirements or your lockfile.",
+                safety: .review),
     ]
 
     private static let installerExts = ["dmg", "pkg", "mpkg", "iso", "xip"]
@@ -155,24 +163,31 @@ enum Reclaim {
         let names = patterns.map(\.name)
         let matches = tree.findDirs(named: names, under: dir, limit: 20_000)
         var grouped: [Int: [UInt32]] = [:]
-        var orphanedModules: [UInt32] = []
+        var leftoverModules: [UInt32] = []
         tree.withLock {
+            var repos: [UInt32: Bool] = [:]
             for m in matches {
-                let p = patterns[m.which]
-                if let sibling = p.sibling {
-                    let path = tree.path(of: m.entry)
-                    let parent = (path as NSString).deletingLastPathComponent
-                    guard tree.lookup(parent + "/" + sibling) != NONE else {
-                        // Dependencies whose project is gone.
-                        if p.name == "node_modules" && !isInside(tree, m.entry, claimed: claimed) {
-                            orphanedModules.append(m.entry)
-                        }
-                        continue
-                    }
-                }
                 // Skip anything inside a known location we already listed.
                 if isInside(tree, m.entry, claimed: claimed) { continue }
-                grouped[m.which, default: []].append(m.entry)
+                let p = patterns[m.which]
+                let path = tree.path(of: m.entry)
+                // The same names inside an app or an installed tool (Homebrew,
+                // asdf, an Electron app's runtime) are part of that software.
+                guard Place.of(path, home: home).isYours else { continue }
+                let parent = (path as NSString).deletingLastPathComponent
+                if p.name == "node_modules" {
+                    // <prefix>/lib/node_modules holds global packages.
+                    let parentName = (parent as NSString).lastPathComponent
+                    if parentName == "lib" || parentName == "libexec" { continue }
+                }
+                let marked = p.markers.isEmpty || p.markers.contains { tree.lookup(parent + "/" + $0) != NONE }
+                if marked {
+                    grouped[m.which, default: []].append(m.entry)
+                } else if p.name == "node_modules", inRepository(tree, tree.entry(m.entry).parent, cache: &repos) {
+                    // A project that no longer has a package.json, usually after
+                    // switching branches. Only worth a look: nothing reinstalls it.
+                    leftoverModules.append(m.entry)
+                }
             }
         }
         for (which, entries) in grouped {
@@ -180,16 +195,15 @@ enum Reclaim {
             let bytes = sizes(entries)
             guard bytes > 50_000_000 else { continue }
             findings.append(Finding(id: p.id, title: p.title, detail: p.detail, symbol: "hammer",
-                                    safety: .safe, entries: entries, bytes: bytes))
+                                    safety: p.safety, entries: entries, bytes: bytes))
         }
 
-        // node_modules with no package.json beside them: nothing installs them.
-        let orphanedModuleBytes = sizes(orphanedModules)
-        if orphanedModuleBytes > 20_000_000 {
-            findings.append(Finding(id: "node-orphaned", title: "Orphaned node_modules",
-                                    detail: "Dependency folders whose `package.json` is gone. Nothing will reinstall them.",
-                                    symbol: "shippingbox", safety: .safe, entries: orphanedModules,
-                                    bytes: orphanedModuleBytes))
+        let leftoverBytes = sizes(leftoverModules)
+        if leftoverBytes > 20_000_000 {
+            findings.append(Finding(id: "node-leftover", title: "node_modules without a package.json",
+                                    detail: "In your repositories, but with no `package.json` beside them: often left behind after switching branches. Check each one; nothing will reinstall them.",
+                                    symbol: "shippingbox", safety: .review, entries: leftoverModules,
+                                    bytes: leftoverBytes))
         }
 
         // Rust build output wherever it lives: `.rustc_info.json` marks the root
@@ -221,6 +235,7 @@ enum Reclaim {
                 let root = tree.dirEntry(e.parent)
                 guard tree.isLive(root), !claimed.contains(root), !isInside(tree, root, claimed: claimed) else { continue }
                 let path = tree.path(of: root)
+                if case .bundle = Place.of(path, home: home) { continue }
                 let parent = (path as NSString).deletingLastPathComponent
                 let inProject = tree.lookup(parent + "/Cargo.toml") != NONE
                 if inProject || links.contains(path) { linkedRust.append(root) } else { orphanedRust.append(root) }
@@ -239,8 +254,13 @@ enum Reclaim {
                                     symbol: "hammer", safety: .safe, entries: linkedRust, bytes: linkedRustBytes))
         }
 
+        // Files only you put somewhere: an installer inside an app, or a
+        // system asset nobody has touched in a year, is part of that software.
+        func yours(_ e: UInt32) -> Bool {
+            tree.withLock { !isInside(tree, e, claimed: claimed) && Place.of(tree.path(of: e), home: home).isYours }
+        }
         let installers = tree.findFiles(extensions: installerExts, under: dir, limit: 2_000)
-            .map(\.entry).filter { e in !tree.withLock { isInside(tree, e, claimed: claimed) } }
+            .map(\.entry).filter(yours)
         let installerBytes = sizes(installers)
         if installerBytes > 50_000_000 {
             findings.append(Finding(id: "installers", title: "Installers & disk images",
@@ -250,7 +270,7 @@ enum Reclaim {
         }
 
         let models = tree.findFiles(extensions: modelExts, under: dir, limit: 2_000)
-            .map(\.entry).filter { e in !tree.withLock { isInside(tree, e, claimed: claimed) } }
+            .map(\.entry).filter(yours)
         let modelBytes = sizes(models)
         if modelBytes > 200_000_000 {
             findings.append(Finding(id: "models", title: "Model weights",
@@ -260,7 +280,7 @@ enum Reclaim {
 
         let yearAgo = Date().addingTimeInterval(-365 * 86400)
         let stale = tree.staleFiles(under: dir, minSize: 250_000_000, before: yearAgo, limit: 500)
-            .filter { e in !tree.withLock { isInside(tree, e, claimed: claimed) } }
+            .filter(yours)
         let staleBytes = sizes(stale)
         if staleBytes > 0 {
             findings.append(Finding(id: "stale", title: "Large files untouched for a year",
@@ -358,6 +378,33 @@ enum Reclaim {
             }
         }
         return out
+    }
+
+    /// Lock held. True if folder `dir` or one above it holds a `.git` (a
+    /// folder, or a file in a git worktree). Answers are cached per folder.
+    private static func inRepository(_ tree: Tree, _ dir: UInt32, cache: inout [UInt32: Bool]) -> Bool {
+        var chain: [UInt32] = []
+        var d = dir
+        var found = false
+        while d != NONE {
+            if let known = cache[d] {
+                found = known
+                break
+            }
+            chain.append(d)
+            let run = tree.dir(d)
+            let hasGit = (run.first..<(run.first + run.count)).contains { k in
+                let c = tree.entry(k)
+                return !c.isRemoved && c.name_len == 4 && tree.name(of: c) == ".git"
+            }
+            if hasGit {
+                found = true
+                break
+            }
+            d = tree.entry(tree.dirEntry(d)).parent
+        }
+        for c in chain { cache[c] = found }
+        return found
     }
 
     /// Lock held. True if any ancestor of `entry` is in `claimed`.

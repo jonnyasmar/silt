@@ -285,6 +285,10 @@ final class DuplicateFinder {
         if !includeManaged {
             paths = paths.filter { !buildProducts.contains(($0.1 as NSString).pathExtension.lowercased()) }
         }
+        // Copies inside apps, installed tools and macOS are theirs to keep:
+        // only your own files are offered.
+        let home = NSHomeDirectory()
+        paths = paths.filter { Place.of($0.1, home: home).isYours }
         if Task.isCancelled { return }
 
         // 2. Real sizes and identities: stored sizes are shares of allocations,

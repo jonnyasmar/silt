@@ -24,7 +24,7 @@ enum Guide {
         if e.isDir {
             return folder(tree: tree, entry: e, name: name, path: path)
         }
-        return file(name: name)
+        return file(name: name, path: path)
     }
 
     private static func has(_ tree: Tree, dir: UInt32, child: String) -> Bool {
@@ -69,71 +69,121 @@ enum Guide {
         e.parent != NONE && has(tree, dir: e.parent, child: name)
     }
 
+    /// Advice for a project's build output or dependencies, which only holds
+    /// in a project of yours: inside an app or an installed tool, the same
+    /// names are part of software that won't rebuild them.
+    private static func inProject(_ g: Guidance, _ place: Place, what: String) -> Guidance {
+        guard !place.isYours else { return g }
+        let title: String
+        if case .bundle(let app) = place { title = "Part of \(app)" } else { title = "Part of an installed tool" }
+        return Guidance(tag: "", title: title, detail: place.caution(for: what), safety: .keep)
+    }
+
     private static func folder(tree: Tree, entry e: silt_entry, name: String, path: () -> String) -> Guidance? {
+        let home = NSHomeDirectory()
         switch name {
         case "node_modules":
-            return sibling(tree, of: e, "package.json")
-                ? Guidance(tag: "Dependencies", title: "JavaScript dependencies",
-                           detail: "Installed packages for the project next to it. `\(installCommand(tree, e))` puts them back."
-                               + projectNote(tree, e),
-                           safety: .safe)
-                : Guidance(tag: "Orphaned", title: "Orphaned dependencies",
-                           detail: "There's no package.json beside it, so no project will reinstall these.",
-                           safety: .safe)
+            let place = Place.of(path())
+            let parent = e.parent == NONE ? "" : tree.name(of: tree.entry(tree.dirEntry(e.parent)))
+            if place.isYours && (parent == "lib" || parent == "libexec") {
+                // <prefix>/lib/node_modules: where `npm install -g` and Node
+                // version managers put global packages, npm itself included.
+                return Guidance(tag: "", title: "Global packages",
+                                detail: "Packages installed with `npm install -g` or by a Node version manager, npm itself often among them. Removing this folder uninstalls them all.",
+                                safety: .keep)
+            }
+            if sibling(tree, of: e, "package.json") {
+                return inProject(Guidance(tag: "Dependencies", title: "JavaScript dependencies",
+                                          detail: "Installed packages for the project next to it. `\(installCommand(tree, e))` puts them back."
+                                              + projectNote(tree, e),
+                                          safety: .safe), place, what: "these packages")
+            }
+            return inProject(Guidance(tag: "Leftover", title: "Dependencies without a project",
+                                      detail: "There’s no package.json beside it, so it may be left over from a project that moved on, often after switching branches. Check before removing it: nothing will reinstall it.",
+                                      safety: .review), place, what: "these packages")
         case "DerivedData":
-            return Guidance(tag: "Build output", title: "Xcode build output",
-                            detail: "Intermediate build products. Xcode recreates them on the next build.", safety: .safe)
+            let p = path()
+            let g = Guidance(tag: "Build output", title: "Xcode build output",
+                             detail: "Intermediate build products. Xcode recreates them on the next build.", safety: .safe)
+            return p.hasSuffix("/Library/Developer/Xcode/DerivedData") ? g : inProject(g, Place.of(p), what: "this folder")
         case ".build":
             if sibling(tree, of: e, "Package.swift") {
-                return Guidance(tag: "Build output", title: "SwiftPM build output",
-                                detail: "Rebuilt by `swift build`.", safety: .safe)
+                return inProject(Guidance(tag: "Build output", title: "SwiftPM build output",
+                                          detail: "Rebuilt by `swift build`.", safety: .safe), Place.of(path()), what: "this folder")
             }
         case "Pods":
             if sibling(tree, of: e, "Podfile") {
-                return Guidance(tag: "Dependencies", title: "CocoaPods", detail: "Reinstalled by `pod install`.", safety: .safe)
+                return inProject(Guidance(tag: "Dependencies", title: "CocoaPods", detail: "Reinstalled by `pod install`.",
+                                          safety: .safe), Place.of(path()), what: "these pods")
+            }
+        case ".gradle":
+            if ["settings.gradle", "settings.gradle.kts", "build.gradle", "build.gradle.kts"].contains(where: { sibling(tree, of: e, $0) }) {
+                return inProject(Guidance(tag: "Cache", title: "Gradle project cache",
+                                          detail: "Per-project Gradle state, recreated on the next build.", safety: .safe),
+                                 Place.of(path()), what: "this folder")
             }
         case ".next", ".nuxt", ".turbo", ".parcel-cache", ".svelte-kit", ".angular", "__pycache__", ".pytest_cache",
-             ".mypy_cache", ".ruff_cache", ".gradle":
-            return Guidance(tag: "Cache", title: "Build cache",
-                            detail: "Generated by your tools and recreated the next time they run.", safety: .safe)
+             ".mypy_cache", ".ruff_cache":
+            return inProject(Guidance(tag: "Cache", title: "Build cache",
+                                      detail: "Generated by your tools and recreated the next time they run.", safety: .safe),
+                             Place.of(path()), what: "this folder")
         case ".venv", "venv":
             if has(tree, dir: e.aux, child: "pyvenv.cfg") {
-                return Guidance(tag: "Environment", title: "Python virtual environment",
-                                detail: "Recreate it from your requirements or lockfile.", safety: .review)
+                return inProject(Guidance(tag: "Environment", title: "Python virtual environment",
+                                          detail: "Recreate it from your requirements or lockfile.", safety: .review),
+                                 Place.of(path()), what: "this environment")
             }
         case ".git":
             return Guidance(tag: "History", title: "Git repository data",
                             detail: "Every commit and branch of this project. Deleting it erases the history; `git gc` can shrink it instead.",
                             safety: .keep)
         case "Caches":
-            return Guidance(tag: "Cache", title: "App caches",
-                            detail: "Apps rebuild these as needed. Quit large apps before clearing them.", safety: .safe)
+            let p = path()
+            if p == home + "/Library/Caches" || (p.hasPrefix(home + "/Library/Containers/") && p.hasSuffix("/Data/Library/Caches")) {
+                return Guidance(tag: "Cache", title: "App caches",
+                                detail: "Apps rebuild these as needed. Quit large apps before clearing them.", safety: .safe)
+            }
+            if p == "/Library/Caches" {
+                return Guidance(tag: "Cache", title: "Shared caches",
+                                detail: "Caches for every user and for system services. Some are rebuilt only slowly; clear them from the apps that own them.",
+                                safety: .review)
+            }
         case ".Trash", ".Trashes":
             return Guidance(tag: "Trash", title: "Trash",
                             detail: "Already deleted, but still using space until the Trash is emptied.", safety: .safe)
-        case "Downloads":
+        case "Downloads" where path() == home + "/Downloads":
             return Guidance(tag: "", title: "Downloads",
                             detail: "Everything you've downloaded. Installers and archives here are usually safe to thin out.",
                             safety: .review)
         case "iOS DeviceSupport", "watchOS DeviceSupport", "tvOS DeviceSupport", "visionOS DeviceSupport":
-            return Guidance(tag: "Cache", title: "Device support files",
-                            detail: "Debug symbols Xcode copies from devices. Re-copied the next time you connect one.",
-                            safety: .safe)
+            if path().hasPrefix(home + "/Library/Developer/Xcode/") {
+                return Guidance(tag: "Cache", title: "Device support files",
+                                detail: "Debug symbols Xcode copies from devices. Re-copied the next time you connect one.",
+                                safety: .safe)
+            }
         case "Archives" where path().hasSuffix("Developer/Xcode/Archives"):
             return Guidance(tag: "", title: "Xcode archives",
                             detail: "Past app builds. Keep any you might need for crash symbolication.", safety: .review)
         default:
             break
         }
-        // Cargo target folders, wherever they live.
+        // Cargo target folders, wherever they live (build output even in a
+        // tool's folder, but never inside an app).
         if has(tree, dir: e.aux, child: ".rustc_info.json") {
-            return Guidance(tag: "Build output", title: "Rust build output",
-                            detail: "A cargo target folder. The next `cargo build` recreates it, though a full rebuild can take a while."
-                                + (sibling(tree, of: e, "Cargo.toml") ? projectNote(tree, e) : ""),
-                            safety: .safe)
+            let g = Guidance(tag: "Build output", title: "Rust build output",
+                             detail: "A cargo target folder. The next `cargo build` recreates it, though a full rebuild can take a while."
+                                 + (sibling(tree, of: e, "Cargo.toml") ? projectNote(tree, e) : ""),
+                             safety: .safe)
+            let place = Place.of(path())
+            if case .bundle = place { return inProject(g, place, what: "this folder") }
+            return g
         }
         let ext = (name as NSString).pathExtension.lowercased()
         if ext == "app" {
+            let place = Place.of(path())
+            if case .bundle = place {
+                return Guidance(tag: "", title: "Helper app", detail: place.caution(for: "it"), safety: .keep)
+            }
             return Guidance(tag: "", title: "Application",
                             detail: "Moving an app to the Trash uninstalls it. Its settings and caches in ~/Library may stay behind.",
                             safety: .review)
@@ -144,24 +194,29 @@ enum Guide {
         return nil
     }
 
-    private static func file(name: String) -> Guidance? {
+    private static func file(name: String, path: () -> String) -> Guidance? {
         let ext = (name as NSString).pathExtension.lowercased()
+        let g: Guidance
         switch ext {
         case "dmg", "pkg", "mpkg", "iso", "xip":
-            return Guidance(tag: "Installer", title: "Installer",
-                            detail: "Once the software is installed, the installer is rarely needed again.", safety: .review)
+            g = Guidance(tag: "Installer", title: "Installer",
+                         detail: "Once the software is installed, the installer is rarely needed again.", safety: .review)
         case "ipsw":
-            return Guidance(tag: "Firmware", title: "iPhone or iPad firmware",
-                            detail: "Finder downloads it again when a device needs it.", safety: .safe)
+            g = Guidance(tag: "Firmware", title: "iPhone or iPad firmware",
+                         detail: "Finder downloads it again when a device needs it.", safety: .safe)
         case "gguf", "safetensors", "ckpt", "pth", "onnx":
-            return Guidance(tag: "Model", title: "Model weights",
-                            detail: "A local AI model. Delete it if you no longer run it; you can download it again.",
-                            safety: .review)
-        case "crash", "ips", "hprof", "core":
-            return Guidance(tag: "Diagnostic", title: "Crash or memory dump",
-                            detail: "Diagnostic output. Rarely needed after the problem is solved.", safety: .safe)
+            g = Guidance(tag: "Model", title: "Model weights",
+                         detail: "A local AI model. Delete it if you no longer run it; you can download it again.",
+                         safety: .review)
+        case "crash", "ips", "hprof":
+            g = Guidance(tag: "Diagnostic", title: "Crash or memory dump",
+                         detail: "Diagnostic output. Rarely needed after the problem is solved.", safety: .safe)
         default:
             return nil
         }
+        // An installer or model shipped inside an app is part of the app.
+        let place = Place.of(path())
+        if case .bundle = place { return inProject(g, place, what: "it") }
+        return g
     }
 }
