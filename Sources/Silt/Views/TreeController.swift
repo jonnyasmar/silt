@@ -262,8 +262,8 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     /// Lock held.
     private func buildChildren(_ node: Node, order fullOrder: [UInt32]) -> [Node] {
         let d = tree.dir(node.dir)
-        let relisted = node.stamp.first != d.first || node.stamp.count != d.count
-        node.stamp = (d.first, d.count)
+        let relisted = node.stamp != (d.first, d.count, d.version)
+        node.stamp = (d.first, d.count, d.version)
         node.order = fullOrder
         var order = fullOrder[...]
         var more: Node?
@@ -307,6 +307,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         if node.dir == 0, !source.isList, session.isVolume, session.unseenBytes > 0 {
             let u = node.unseenNode ?? Node(summary: .unseen, parent: node)
             node.unseenNode = u
+            u.expandable = !(session.hidden?.parts.isEmpty ?? true)
             let bytes = session.unseenBytes
             let at = sortKey == .size && !ascending
                 ? (result.firstIndex { valueSize($0) < bytes } ?? result.count)
@@ -383,8 +384,25 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         case .list: node.children = buildList(node)
         case .dir: node.children = buildChildren(node, order: sortedOrder(node))
         case .group: break // members were assigned by buildList
+        case .unseen: node.children = hiddenParts(node)
         default: node.children = []
         }
+    }
+
+    /// Rows breaking down the hidden space, reusing existing ones by id.
+    private func hiddenParts(_ node: Node) -> [Node] {
+        let old = Dictionary((node.children ?? []).compactMap { c in c.partID.map { ($0, c) } }) { a, _ in a }
+        return (session.hidden?.parts ?? []).map { part in
+            let n = old[part.id] ?? Node(summary: .hiddenPart, parent: node)
+            n.partID = part.id
+            n.partTitle = part.title
+            n.partKind = part.kind
+            return n
+        }
+    }
+
+    private func hiddenPart(_ n: Node) -> HiddenSpace.Part? {
+        session.hidden?.parts.first { $0.id == n.partID }
     }
 
     private func node(_ item: Any?) -> Node { (item as? Node) ?? root }
@@ -398,9 +416,14 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         case .dir: tree.entry(tree.dirEntry(n.dir)).size
         case .more: n.moreBytes
         case .unseen: session.unseenBytes
+        case .hiddenPart: hiddenPart(n)?.bytes ?? 0
         case .group: (n.children ?? []).reduce(0) { $0 + tree.entry($1.entry).size }
         case .list: 0
         }
+    }
+
+    private var showsProgress: Bool {
+        session.phase == .scanning || session.rescanState != nil || session.catchingUp
     }
 
     /// Lock held.
@@ -419,7 +442,10 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             v.items = Int(d.items)
             v.modified = d.newest
             v.flags = e.flags
-            v.growing = d.pending > 0
+            // Hatched only while a scan or rescan is working through the tree:
+            // on a busy disk some folder is always being re-listed, and routine
+            // updates shouldn't make everything look unfinished.
+            v.growing = d.pending > 0 && showsProgress
             v.isDir = true
             v.hasItems = true
             v.growth = session.growth(of: n.dir, now: e.size)
@@ -429,6 +455,8 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             v.hasItems = true
         case .unseen:
             v.size = session.unseenBytes
+        case .hiddenPart:
+            v.size = hiddenPart(n)?.bytes ?? 0
         case .group:
             v.size = valueSize(n)
             v.modified = (n.children ?? []).map { tree.entry($0.entry).aux }.max() ?? 0
@@ -477,7 +505,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
 
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
         let n = node(item)
-        n.shownExpandable = (n.isDir || n.kind == .group) && n.expandable
+        n.shownExpandable = (n.isDir || n.kind == .group || n.kind == .unseen) && n.expandable
         return n.shownExpandable
     }
 
@@ -595,7 +623,10 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     }
 
     func outlineViewSelectionDidChange(_ notification: Notification) {
-        session.selection = selectedNodes().filter(\.isReal).map(\.ref)
+        let nodes = selectedNodes()
+        session.selection = nodes.filter(\.isReal).map(\.ref)
+        session.hiddenSelection = nodes.count == 1 && (nodes[0].kind == .unseen || nodes[0].kind == .hiddenPart)
+            ? (nodes[0].partID ?? "all") : nil
         session.quickLook = { [weak self] in self?.toggleQuickLook() }
         if QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
             quickLookURLs = session.urls(session.selection)
@@ -644,9 +675,17 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
                 }
                 guard n.isDir, tree.isLive(tree.dirEntry(n.dir)) else { continue }
                 let d = tree.dir(n.dir)
+                if let u = n.unseenNode, u.expandable == (session.hidden?.parts.isEmpty ?? true) {
+                    u.expandable.toggle()
+                    expandFlips.append(u)
+                }
+                if let u = n.unseenNode, outline.isItemExpanded(u),
+                   (u.children ?? []).map(\.partID) != (session.hidden?.parts ?? []).map(\.id) {
+                    structural.append((u, hiddenParts(u)))
+                }
                 let hasUnseen = n.children?.contains { $0.kind == .unseen } ?? false
                 let wantsUnseen = n.dir == 0 && !source.isList && session.isVolume && session.unseenBytes > 0
-                if d.first != n.stamp.first || d.count != n.stamp.count || hasUnseen != wantsUnseen {
+                if n.stamp != (d.first, d.count, d.version) || hasUnseen != wantsUnseen {
                     structural.append((n, buildChildren(n, order: sortedOrder(n))))
                 } else if reorderDue {
                     let order = sortedOrder(n)

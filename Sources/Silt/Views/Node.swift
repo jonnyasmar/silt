@@ -6,7 +6,7 @@ import UniformTypeIdentifiers
 /// NSOutlineView's expansion and selection (which key on object identity)
 /// survive refreshes. File nodes are recreated when their folder is relisted.
 final class Node: NSObject {
-    enum Kind { case file, dir, more, unseen, list, group }
+    enum Kind { case file, dir, more, unseen, hiddenPart, list, group }
 
     let kind: Kind
     /// Files: fixed entry index. Folders: resolved through `dir`.
@@ -18,7 +18,9 @@ final class Node: NSObject {
     weak var parent: Node?
 
     var children: [Node]?
-    var stamp: (first: UInt32, count: UInt32) = (NONE, 0)
+    /// The folder's run as last built: a change in any part means entries
+    /// joined or left it.
+    var stamp: (first: UInt32, count: UInt32, version: UInt32) = (NONE, 0, 0)
     var order: [UInt32] = []
     var expandable = false
     /// What the outline last asked about, so changes can be pushed to it.
@@ -32,6 +34,10 @@ final class Node: NSObject {
     var unseenNode: Node?
     /// Largest-files groups: same name and size in several places.
     var groupKey: String?
+    /// Hidden-space parts: which `HiddenSpace.Part` this row stands for.
+    var partID: String?
+    var partTitle = ""
+    var partKind: HiddenSpace.Part.Kind = .unreadable
     /// Guide.classify, computed once (nil inside means "nothing to say").
     var guidance: Guidance??
 
@@ -86,6 +92,7 @@ final class Node: NSObject {
         switch kind {
         case .more: s = ""
         case .unseen: s = "System & hidden space"
+        case .hiddenPart: s = partTitle
         case .list: s = ""
         default:
             let buf = UnsafeBufferPointer(start: silt_name_ptr(tree.raw, nameOffset), count: Int(nameLength))
@@ -101,6 +108,14 @@ final class Node: NSObject {
         switch kind {
         case .more: image = Icons.symbol("ellipsis.circle")
         case .unseen: image = Icons.symbol("lock.circle")
+        case .hiddenPart:
+            let symbol = switch partKind {
+            case .purgeable: "clock.arrow.circlepath"
+            case .volume: "internaldrive"
+            case .unmounted: "externaldrive.badge.minus"
+            case .unreadable: "lock"
+            }
+            image = Icons.symbol(symbol)
         case .list: image = NSImage()
         case .dir: image = Icons.folder(name: name(in: tree), path: path)
         case .file, .group: image = Icons.file(name: name(in: tree), symlink: entryKind == UInt8(SILT_KIND_SYMLINK))

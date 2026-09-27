@@ -82,13 +82,24 @@ Other features:
   that appends the entries and pushes size deltas up the ancestor chain. So
   every folder's total is correct-so-far at every instant, and the UI shows it
   live.
-- The tree is flat, chunked, and append-only: 24 bytes per entry, 40 per
-  folder, and names in a shared arena. About 1.2M entries fit in ~55 MB.
-- After the scan, an FSEvents stream re-lists only the folders that changed.
-  Unchanged listings are updated in place.
+- The tree is flat and chunked: 24 bytes per entry, 48 per folder, and names
+  in a shared arena. About 1.2M entries fit in ~55 MB.
+- After the scan, an FSEvents stream re-lists only the folders that changed,
+  and a re-listing updates the folder where it is: files that are still there
+  keep their slot and name, new ones take spare room at the end, and vanished
+  ones are marked removed. A folder only moves when it outgrows that room,
+  and memory no folder uses any more goes back to the system. On a drive with
+  cargo builds running, memory stays flat where it used to grow by
+  ~200 MB a minute.
+- Big folders that change constantly (build output, browser caches) are
+  re-listed at a pace that scales with their size, a 60,000-file folder at
+  most every 2.4 s; small folders update immediately. Whole-tree views
+  (Largest, Types, the inspector's breakdown) refresh at most every second
+  per two million items.
 - **Instant relaunch.** A settled scan is saved as a compacted, LZ4-compressed
   snapshot (about 26 MB for 1.2M items) in
-  `~/Library/Caches/com.jonnyasmar.silt/Snapshots`. Reopening the same
+  `~/Library/Caches/com.jonnyasmar.silt/Snapshots`. Saving and loading stream
+  through a small buffer instead of holding extra copies of the tree. Reopening the same
   location shows it immediately, then FSEvents replays everything that changed
   since, so only those folders are re-listed. Removable and network volumes
   always rescan, and ⇧⌘R forces a fresh scan.
@@ -110,3 +121,9 @@ or APFS clones are split between the files sharing them. Full clones count
 it shares. On a volume full of cloned cargo target folders, Silt reports
 1,143 GB against 1,157 GB used according to `df` (the rest is APFS metadata and
 snapshots). The inspector shows a clone's full size alongside its share.
+
+For whole volumes, the difference between what the volume says is in use and
+what the scan found appears as **System & hidden space**. Expand it (or
+select it) to see what it's made of: purgeable space (local Time Machine
+snapshots and caches macOS frees by itself), the other volumes sharing the
+disk (swap, Preboot, Recovery), and data only macOS can read.

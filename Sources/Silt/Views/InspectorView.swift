@@ -25,7 +25,10 @@ struct InspectorView: View {
         let _ = session.version
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                if session.selection.count > 1 {
+                if session.selection.isEmpty, let pick = session.hiddenSelection, let hidden = session.hidden {
+                    HiddenSpaceCard(hidden: hidden, highlight: pick, volume: session.title,
+                                    used: session.capacity.map { $0.total - $0.free } ?? 0)
+                } else if session.selection.count > 1 {
                     multiple
                 } else if let s = summary(for: session.selection.first ?? ItemRef(entry: 0, dir: session.focus)) {
                     single(s)
@@ -356,7 +359,7 @@ struct Composition: View {
                 Text("—").foregroundStyle(.tertiary)
             }
         }
-        .task(id: "\(dir)-\(session.phase == .live ? session.version / 4 : session.version / 40)") {
+        .task(id: "\(dir)-\(session.phase == .live ? session.quietVersion : session.version / 40)") {
             let tree = session.tree
             let d = dir
             let stats = await Task.detached(priority: .utility) { tree.extensionStats(under: d, limit: 2000) }.value
@@ -425,5 +428,145 @@ private struct GuidanceCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(tint.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(tint.opacity(0.2)))
+    }
+}
+
+/// The inspector for "System & hidden space": what the volume holds beyond
+/// the files Silt can reach, and what (if anything) to do about it.
+private struct HiddenSpaceCard: View {
+    let hidden: HiddenSpace
+    let highlight: String
+    let volume: String
+    let used: Int64
+    @State private var copied = false
+
+    private static let command = "tmutil deletelocalsnapshots /"
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "lock.circle")
+                .font(.system(size: 34, weight: .light))
+                .foregroundStyle(.secondary)
+                .frame(width: 44, height: 44)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("System & hidden space")
+                    .font(.system(size: 15, weight: .semibold))
+                Text("In use, but outside any folder Silt can read")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+        }
+
+        VStack(alignment: .leading, spacing: 4) {
+            let parts = Fmt.bytesParts(hidden.total)
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(parts.number)
+                    .font(.system(size: 28, weight: .semibold, design: .rounded).monospacedDigit())
+                    .contentTransition(.numericText())
+                Text(parts.unit)
+                    .font(.system(size: 15, weight: .medium, design: .rounded))
+                    .foregroundStyle(.secondary)
+            }
+            if used > 0 {
+                Text("\(Fmt.percent(Double(hidden.total) / Double(used))) of what \(volume) has in use")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+        }
+
+        if !hidden.parts.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionTitle("What it is")
+                ForEach(hidden.parts) { part in
+                    PartRow(part: part, highlighted: highlight == part.id)
+                }
+            }
+        }
+
+        if !hidden.snapshots.isEmpty {
+            snapshots
+        }
+    }
+
+    @ViewBuilder
+    private var snapshots: some View {
+        let dates = hidden.snapshots.compactMap(LocalSnapshots.date(of:))
+        VStack(alignment: .leading, spacing: 8) {
+            SectionTitle("Local snapshots")
+            Text(summary(dates))
+                .font(.system(size: 12))
+                .fixedSize(horizontal: false, vertical: true)
+            Text("macOS deletes them on its own as space runs low, so there’s usually nothing to do. To get the space back now, run this in Terminal:")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                Text(Self.command)
+                    .font(.system(size: 11.5, design: .monospaced))
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                Button(copied ? "Copied" : "Copy") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(Self.command, forType: .string)
+                    copied = true
+                }
+                .controlSize(.small)
+            }
+            Text("That removes Time Machine’s local restore points on this Mac. Backups on your backup disk aren’t touched.")
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func summary(_ dates: [Date]) -> String {
+        let n = hidden.snapshots.count
+        let what = "\(n) Time Machine snapshot\(n == 1 ? "" : "s")"
+        guard let first = dates.min(), let last = dates.max() else { return what + "." }
+        let f = Date.FormatStyle(date: .abbreviated, time: .shortened)
+        if n == 1 { return "\(what), from \(first.formatted(f))." }
+        return "\(what), taken between \(first.formatted(f)) and \(last.formatted(f))."
+    }
+
+    private struct PartRow: View {
+        let part: HiddenSpace.Part
+        let highlighted: Bool
+
+        private var symbol: String {
+            switch part.kind {
+            case .purgeable: "clock.arrow.circlepath"
+            case .volume: "internaldrive"
+            case .unmounted: "externaldrive.badge.minus"
+            case .unreadable: "lock"
+            }
+        }
+
+        var body: some View {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: symbol)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 14)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(part.title).font(.system(size: 12, weight: .medium))
+                        Spacer(minLength: 6)
+                        Text(Fmt.bytes(part.bytes))
+                            .font(.system(size: 12).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(part.detail)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(highlighted ? 8 : 0)
+            .background(highlighted ? AnyShapeStyle(.quaternary.opacity(0.5)) : AnyShapeStyle(.clear),
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
     }
 }

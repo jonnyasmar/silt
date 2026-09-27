@@ -260,7 +260,7 @@ final class ShareCell: NSTableCellView, ValueCell {
         switch node.kind {
         case .dir: c = Brand.ochre
         case .file, .group: c = FileCategory.of(name: node.nameForColor).nsColor
-        case .more, .unseen, .list: c = .tertiaryLabelColor
+        case .more, .unseen, .hiddenPart, .list: c = .tertiaryLabelColor
         }
         let f = values.share
         if abs(f - fraction) < 0.0005 && abs(values.bar - bar) < 0.0005 && c == color && values.growing == growing {

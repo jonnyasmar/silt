@@ -3,7 +3,7 @@ import SwiftUI
 /// Recompute keys for list panes: every so often while scanning, then on
 /// each change once live (the task debounces those).
 @MainActor private func refreshKey(_ session: Session) -> String {
-    session.phase == .live ? "live-\(session.version)" : "scan-\(session.version / 10)"
+    session.phase == .live ? "live-\(session.quietVersion)" : "scan-\(session.version / 10)"
 }
 
 struct LargestFiles: View {

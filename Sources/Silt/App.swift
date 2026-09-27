@@ -221,9 +221,29 @@ final class WindowModel {
     private func start(_ url: URL) {
         UserDefaults.standard.set(url.resolvingSymlinksInPath().path, forKey: "lastScan")
         let session = Session(url: url, guardPrivateFolders: !hasFullDiskAccess)
+        adopt(session)
         sessions.append(session)
         current = session
         pane = .files
+    }
+
+    private func adopt(_ session: Session) {
+        session.onNeedsRebuild = { [weak self, weak session] in
+            guard let self, let session else { return }
+            self.rebuild(session)
+        }
+    }
+
+    /// Swaps a session for a compacted copy of itself: saved and reloaded
+    /// where snapshots are kept, rescanned elsewhere.
+    private func rebuild(_ old: Session) {
+        guard let i = sessions.firstIndex(where: { $0 === old }) else { return }
+        old.saveSnapshotNow()
+        old.close()
+        let fresh = Session(url: old.url, guardPrivateFolders: !hasFullDiskAccess)
+        adopt(fresh)
+        sessions[i] = fresh
+        if current === old { current = fresh }
     }
 
     /// Rescans in place: everything stays visible while it's re-checked.
@@ -237,6 +257,7 @@ final class WindowModel {
         old.close()
         refreshLocations()
         let fresh = Session(url: old.url, guardPrivateFolders: !hasFullDiskAccess, fresh: true)
+        adopt(fresh)
         sessions[i] = fresh
         current = fresh
     }

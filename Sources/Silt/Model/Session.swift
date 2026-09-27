@@ -72,6 +72,12 @@ final class Session: Identifiable {
     /// Bumps (at most ~5×/s) whenever tree contents change. Views that show
     /// derived numbers read it to know when to recompute.
     private(set) var version = 0
+    /// Like `version`, but for views that re-walk the whole tree: once live,
+    /// it moves at most every second per two million items, so a disk that
+    /// never stops changing doesn't keep them busy.
+    private(set) var quietVersion = 0
+    @ObservationIgnored private var quietSource = 0
+    @ObservationIgnored private var lastQuietBump: TimeInterval = 0
     private(set) var capacity: (total: Int64, available: Int64, free: Int64)?
     var focus: UInt32 = 0
     var selection: [ItemRef] = []
@@ -98,6 +104,11 @@ final class Session: Identifiable {
 
     /// Set by the tree view that currently owns the selection.
     @ObservationIgnored var quickLook: (() -> Void)?
+    /// Called once if the tree is running out of entry indices (they're never
+    /// reused, so a folder churning for days could get there): the window
+    /// replaces this session with a fresh one.
+    @ObservationIgnored var onNeedsRebuild: (() -> Void)?
+    @ObservationIgnored private var askedForRebuild = false
 
     /// When the scan being shown was saved, if it came from a snapshot.
     private(set) var restoredFrom: Date?
@@ -115,6 +126,11 @@ final class Session: Identifiable {
     @ObservationIgnored private var rescanBase: (listed: UInt64, total: Int)?
     @ObservationIgnored private var deepAt: [UInt32: TimeInterval] = [:]
     @ObservationIgnored private var deferredDeep: Set<UInt32> = []
+    /// Big folders that change constantly (build output, browser caches) are
+    /// re-listed at a pace that scales with their size rather than on every
+    /// event: when each was last listed, and when it's next due.
+    @ObservationIgnored private var listedAt: [UInt32: TimeInterval] = [:]
+    @ObservationIgnored private var dueAt: [UInt32: TimeInterval] = [:]
     @ObservationIgnored private var rootInode: UInt64 = 0
     @ObservationIgnored private var rootVolume: String?
 
@@ -126,6 +142,13 @@ final class Session: Identifiable {
     @ObservationIgnored private var marksDirty = false
     @ObservationIgnored private var lastMarksRecompute: TimeInterval = 0
     @ObservationIgnored private var marksRestored = false
+
+    /// What the volume's used space holds beyond the scan, for whole volumes.
+    private(set) var hidden: HiddenSpace?
+    /// The hidden-space row (or one of its parts) the tree has selected.
+    var hiddenSelection: String?
+    @ObservationIgnored private var snapshots: [String] = []
+    @ObservationIgnored private var lastSnapshotCheck: TimeInterval = -.infinity
 
     /// For whole volumes: roughly how many items a full scan will find
     /// (the volume's used inode count), so the first scan can show a percentage.
@@ -166,6 +189,7 @@ final class Session: Identifiable {
     private(set) var analyzing = false
     @ObservationIgnored private var analyzedVersion = -1
     @ObservationIgnored private var lastAnalysis: TimeInterval = 0
+    @ObservationIgnored private var analysisCost: TimeInterval = 0
 
     /// Without Full Disk Access, opening another app's container pops a
     /// privacy prompt and blocks the scanning thread until it's answered, so
@@ -277,6 +301,7 @@ final class Session: Identifiable {
             (baseline, baselineExpanded) = Session.sizes(tree, depth: 4)
             baselineDate = Date()
             malloc_zone_pressure_relief(nil, 0) // scan batches are done with
+            measureHidden(now: now)
         }
 
         if gen != lastGeneration {
@@ -290,7 +315,15 @@ final class Session: Identifiable {
             marksDirty = true
         }
 
+        if version != quietSource,
+           phase == .scanning || now - lastQuietBump > max(1, Double(stats.items) / 2_000_000) {
+            quietSource = version
+            lastQuietBump = now
+            quietVersion += 1
+        }
+
         tickRescan(p, now: now)
+        releaseDueRefreshes(now: now)
         if marksDirty { recomputeMarks(force: false) }
         if phase == .live, !marksRestored, !catchingUp {
             marksRestored = true
@@ -302,9 +335,14 @@ final class Session: Identifiable {
             computeChanges()
         }
 
+        if !askedForRebuild, tree.raw.pointee.entry_count > 3_500_000_000 {
+            askedForRebuild = true
+            onNeedsRebuild?()
+        }
         if now - lastCapacityCheck > 3 {
             lastCapacityCheck = now
             capacity = Locations.volumeCapacity(for: url)
+            measureHidden(now: now)
         }
         if !inTrash.isEmpty, now - lastTrashCheck > 5 {
             lastTrashCheck = now
@@ -422,15 +460,49 @@ final class Session: Identifiable {
             if same { tree.refresh(dir: 0, deep: false) } else { requestDeep(0) }
         }
         if wrapped { requestDeep(0) }
+        var sizes: [UInt32: UInt32] = [:]
         tree.withLock {
             for event in events {
                 if event.rootChanged || event.historyDone { continue }
                 guard let dir = nearestListedDir(for: event.path, root: root) else { continue }
                 targets[dir] = (targets[dir] ?? false) || event.mustScanSubdirs
+                sizes[dir] = tree.dir(dir).count
             }
         }
+        let now = ProcessInfo.processInfo.systemUptime
         for (dir, deep) in targets {
-            if deep { requestDeep(dir) } else { tree.refresh(dir: dir, deep: false) }
+            if deep { requestDeep(dir) } else { refreshPaced(dir, children: sizes[dir] ?? 0, now: now) }
+        }
+    }
+
+    /// Re-lists `dir` now, or once its pace allows: at most every 40 µs per
+    /// child (a 60,000-file build folder every 2.4 s), capped at 5 s. Small
+    /// folders are never held back.
+    private func refreshPaced(_ dir: UInt32, children: UInt32, now: TimeInterval) {
+        let gap = min(5, Double(children) * 40e-6)
+        guard gap >= 0.1 else {
+            tree.refresh(dir: dir, deep: false)
+            return
+        }
+        if let last = listedAt[dir], now - last < gap {
+            if dueAt[dir] == nil { dueAt[dir] = last + gap }
+            return
+        }
+        listedAt[dir] = now
+        tree.refresh(dir: dir, deep: false)
+    }
+
+    private func releaseDueRefreshes(now: TimeInterval) {
+        if !dueAt.isEmpty {
+            for (dir, due) in dueAt where due <= now {
+                dueAt.removeValue(forKey: dir)
+                listedAt[dir] = now
+                tree.refresh(dir: dir, deep: false)
+            }
+        }
+        // Forget folders that have gone quiet.
+        if listedAt.count > 256 {
+            listedAt = listedAt.filter { now - $0.value < 10 }
         }
     }
 
@@ -864,12 +936,32 @@ final class Session: Identifiable {
     // MARK: Volume gap
 
     /// Space the volume reports as used that the scan couldn't see: snapshots,
-    /// the sealed system volume's extras, swap, and unreadable folders.
+    /// other volumes in its container, swap, and unreadable folders.
     var unseenBytes: Int64 {
-        guard isVolume, phase == .live, let capacity else { return 0 }
-        let used = capacity.total - capacity.free
-        let gap = used - stats.bytes
-        return gap > capacity.total / 200 ? gap : 0
+        guard isVolume, phase == .live else { return 0 }
+        return hidden?.total ?? 0
+    }
+
+    /// Re-measures the hidden space; local snapshots are listed every few
+    /// minutes, off the main thread.
+    fileprivate func measureHidden(now: TimeInterval) {
+        guard isVolume, phase == .live, let capacity else {
+            if hidden != nil { hidden = nil }
+            return
+        }
+        if now - lastSnapshotCheck > 180 {
+            lastSnapshotCheck = now
+            let path = url.path
+            Task { [weak self] in
+                let names = await Task.detached(priority: .utility) { LocalSnapshots.list(for: path) }.value
+                guard let self else { return }
+                self.snapshots = names
+                self.measureHidden(now: ProcessInfo.processInfo.systemUptime)
+            }
+        }
+        let next = HiddenSpace.measure(url: url, scanned: stats.bytes, capacity: capacity,
+                                       unreadable: stats.denied, snapshots: snapshots)
+        if next != hidden { hidden = next }
     }
 }
 
@@ -1165,17 +1257,21 @@ extension Session {
 
     /// Re-runs the Reclaim analysis when the tree settles and has changed.
     fileprivate func tickAnalysis(now: TimeInterval) {
-        guard phase == .live, !analyzing, version != analyzedVersion, now - lastAnalysis > 3,
-              rescanBase == nil else { return }
+        // A disk that never stops changing would keep this running forever,
+        // so it waits ten times as long as the last pass took.
+        guard phase == .live, !analyzing, version != analyzedVersion,
+              now - lastAnalysis > max(3, analysisCost * 10), rescanBase == nil else { return }
         analyzing = true
         lastAnalysis = now
         let v = version
         let tree = tree
         Task { [weak self] in
+            let start = ProcessInfo.processInfo.systemUptime
             let result = await Task.detached(priority: .utility) {
                 Reclaim.analyze(tree: tree, under: 0)
             }.value
             guard let self else { return }
+            self.analysisCost = ProcessInfo.processInfo.systemUptime - start
             self.findings = result
             self.analyzedVersion = v
             self.analyzing = false

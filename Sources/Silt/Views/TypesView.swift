@@ -22,7 +22,7 @@ struct TypesView: View {
             Divider()
             ScrollView { content }
         }
-        .task(id: "\(session.focus)-\(session.phase == .live ? session.version / 4 : session.version / 40)") {
+        .task(id: "\(session.focus)-\(session.phase == .live ? session.quietVersion : session.version / 40)") {
             let tree = session.tree
             let focus = session.focus
             let result = await Task.detached(priority: .userInitiated) {
