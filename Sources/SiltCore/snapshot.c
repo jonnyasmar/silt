@@ -138,9 +138,9 @@ bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *me
     queue[qtail++] = (b);                                                      \
   } while (0)
 
-  bool incomplete = (root_dir->state & SILT_DIR_INCOMPLETE) != 0;
+  bool failed = false;
   PUSH(root->aux, 0);
-  while (qhead < qtail && !incomplete) {
+  while (qhead < qtail && !failed) {
     uint32_t old_id = queue[qhead++], new_id = queue[qhead++];
     const silt_dir *od = silt_dir_at(t, old_id);
     uint32_t first = (uint32_t)(entries.n / sizeof(silt_entry));
@@ -151,7 +151,7 @@ bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *me
       silt_entry *ne = take(&entries, sizeof *ne);
       uint32_t name = ne ? put_name(&names, silt_name_ptr(t, e->name), e->name_len) : SILT_NONE;
       if (name == SILT_NONE) {
-        incomplete = true; // counts disagree with the tree: don't persist it
+        failed = true; // counts disagree with the tree: don't persist it
         break;
       }
       *ne = *e;
@@ -159,12 +159,12 @@ bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *me
       ne->name = name;
       if (e->kind == SILT_KIND_DIR) {
         // A listing that failed partway may be missing changes whose events
-        // were already consumed: never persist it.
-        if (silt_dir_at(t, e->aux)->state & SILT_DIR_INCOMPLETE) incomplete = true;
+        // were already consumed. It keeps its INCOMPLETE state, and whoever
+        // loads the snapshot lists it again.
         uint32_t child_new = (uint32_t)(dirs.n / sizeof(silt_dir));
         silt_dir *nd = take(&dirs, sizeof *nd);
         if (!nd) {
-          incomplete = true;
+          failed = true;
           break;
         }
         *nd = *silt_dir_at(t, e->aux);
@@ -183,13 +183,12 @@ bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *me
     nd->count = count;
     nd->cap = count; // compacted: no spare room
     nd->version = 0;
-    nd->reserved = 0;
   }
 #undef PUSH
   silt_tree_unlock(t);
   free(queue);
 
-  bool ok = !incomplete;
+  bool ok = !failed;
   snap_header h;
   memset(&h, 0, sizeof h);
   memcpy(h.magic, SNAP_MAGIC, 8);
@@ -351,19 +350,34 @@ static bool aim(compression_stream *z, sink *s) {
   return true;
 }
 
+// Reads the header and checks it describes a file this build can load.
+static bool read_header(FILE *f, snap_header *h) {
+  struct stat st;
+  return fstat(fileno(f), &st) == 0 && fread(h, sizeof *h, 1, f) == 1 &&
+         memcmp(h->magic, SNAP_MAGIC, 8) == 0 && h->version == SNAP_VERSION &&
+         h->entry_size == sizeof(silt_entry) && h->dir_size == sizeof(silt_dir) &&
+         h->entry_count != 0 && h->dir_count != 0 && h->entry_count <= MAX_ENTRIES &&
+         h->dir_count <= MAX_DIRS && h->name_bytes <= MAX_NAMES &&
+         h->compressed_bytes == (uint64_t)st.st_size - sizeof *h &&
+         h->raw_bytes == (uint64_t)h->entry_count * sizeof(silt_entry) +
+                             (uint64_t)h->dir_count * sizeof(silt_dir) + h->name_bytes;
+}
+
+bool silt_snapshot_peek(const char *path, silt_snapshot_meta *meta) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return false;
+  snap_header h;
+  bool ok = read_header(f, &h);
+  fclose(f);
+  if (ok && meta) *meta = h.meta;
+  return ok;
+}
+
 silt_tree *silt_tree_load(const char *path, silt_snapshot_meta *meta) {
   FILE *f = fopen(path, "rb");
   if (!f) return NULL;
-  struct stat st;
   snap_header h;
-  if (fstat(fileno(f), &st) != 0 || fread(&h, sizeof h, 1, f) != 1 ||
-      memcmp(h.magic, SNAP_MAGIC, 8) != 0 || h.version != SNAP_VERSION ||
-      h.entry_size != sizeof(silt_entry) || h.dir_size != sizeof(silt_dir) ||
-      h.entry_count == 0 || h.dir_count == 0 || h.entry_count > MAX_ENTRIES ||
-      h.dir_count > MAX_DIRS || h.name_bytes > MAX_NAMES ||
-      h.compressed_bytes != (uint64_t)st.st_size - sizeof h ||
-      h.raw_bytes != (uint64_t)h.entry_count * sizeof(silt_entry) +
-                         (uint64_t)h.dir_count * sizeof(silt_dir) + h.name_bytes) {
+  if (!read_header(f, &h)) {
     fclose(f);
     return NULL;
   }

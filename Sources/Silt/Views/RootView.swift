@@ -18,7 +18,7 @@ struct RootView: View {
                 }
         }
         .navigationTitle(model.current?.title ?? "Silt")
-        .navigationSubtitle(model.current?.phase == .scanning ? "Scanning…" : "")
+        .navigationSubtitle(subtitle)
         .toolbar { toolbar }
         .modifier(SearchWhenScanned(model: model))
         .focusedSceneValue(\.windowModel, model)
@@ -33,6 +33,15 @@ struct RootView: View {
             }
             return true
         }
+    }
+
+    private var subtitle: String {
+        guard let s = model.current else { return "" }
+        if s.phase == .scanning { return "Scanning…" }
+        guard s.showsSavedScan else { return "" }
+        let what = s.catchingUp ? "catching up…" : "rechecking…"
+        guard let saved = s.restoredFrom, Date().timeIntervalSince(saved) >= 60 else { return what.capitalizedFirstLetter }
+        return "Scan from \(Fmt.age(UInt32(saved.timeIntervalSince1970))) · \(what)"
     }
 
     private var inspectorBinding: Binding<Bool> {
@@ -563,6 +572,24 @@ struct StatusBar: View {
         return Fmt.age(UInt32(max(0, d.timeIntervalSince1970)))
     }
 
+    private var showingSaved: String {
+        guard let d = session.restoredFrom, Date().timeIntervalSince(d) >= 60 else { return "Showing the last scan" }
+        return "Showing the scan from \(restoredAge)"
+    }
+
+    private func liveHelp(_ s: ScanStats) -> String {
+        if session.catchingUp {
+            return "These sizes are from the scan saved \(restoredAge). Silt is replaying what changed since; hatched rows may be out of date until it’s done."
+        }
+        if session.recheckingSince != nil {
+            return "The scan saved \(restoredAge) is too old to catch up on, so Silt is reading every folder again. Hatched rows haven’t been checked yet."
+        }
+        if session.restoredFrom != nil {
+            return "Restored from the scan saved \(restoredAge), then caught up with every change since. Watching for more."
+        }
+        return "Scanned in \(Fmt.duration(s.finished)). Watching for changes."
+    }
+
     @ViewBuilder
     private func leading(_ s: ScanStats) -> some View {
         switch session.phase {
@@ -596,20 +623,19 @@ struct StatusBar: View {
                         .frame(width: 70)
                         .controlSize(.small)
                     Text(r.explicit ? "Rescanning in place · \(Int(r.fraction * 100))%"
-                                    : "Checking for changes · \(Int(r.fraction * 100))%")
+                         : session.recheckingSince != nil ? "\(showingSaved) · rechecking · \(Int(r.fraction * 100))%"
+                         : "Checking for changes · \(Int(r.fraction * 100))%")
                         .monospacedDigit()
                 } else if session.catchingUp {
                     ProgressView().controlSize(.mini)
-                    Text("Catching up on changes since \(restoredAge)")
+                    Text("\(showingSaved) · catching up")
                 } else {
                     Circle().fill(.green).frame(width: 6, height: 6)
                     Text("Live · \(Fmt.compactCount(s.items)) items")
                         .monospacedDigit()
                 }
             }
-            .help(session.restoredFrom != nil
-                  ? "Restored from the scan saved \(restoredAge), then caught up with every change since. Watching for more."
-                  : "Scanned in \(Fmt.duration(s.finished)). Watching for changes.")
+            .help(liveHelp(s))
         }
     }
 }

@@ -123,6 +123,19 @@ final class Session: Identifiable {
     private(set) var restoredFrom: Date?
     /// Replaying file-system history since that snapshot.
     private(set) var catchingUp = false
+    /// Set while a snapshot FSEvents can't bring up to date (too old, or the
+    /// volume's history was reset) is checked again in place: folders not
+    /// listed since this moment (unix seconds) still show what it saw.
+    private(set) var recheckingSince: UInt32?
+    /// What's on screen may be out of date: a restored scan that hasn't
+    /// caught up yet.
+    var showsSavedScan: Bool { catchingUp || recheckingSince != nil }
+
+    /// Whether a folder's contents may still be what a saved scan saw. Until
+    /// a catch-up ends, any folder might yet turn out to have changed.
+    func isStale(_ d: silt_dir) -> Bool {
+        catchingUp || recheckingSince.map { d.listed_at < $0 } ?? false
+    }
     @ObservationIgnored private let fullDiskAccess: Bool
     @ObservationIgnored private var lastEventId: FSEventStreamEventId = 0
     @ObservationIgnored private var lastSave: TimeInterval = 0
@@ -231,16 +244,14 @@ final class Session: Identifiable {
         let values = try? resolved.resourceValues(forKeys: [.isVolumeKey])
         isVolume = values?.isVolume == true || resolved.path == "/"
         fullDiskAccess = !guardPrivateFolders
-        var restored = fresh ? nil : Snapshots.load(for: resolved, fullDiskAccess: fullDiskAccess)
-        // A restore is only as good as the replay behind it.
-        var replay: FSWatcher?
-        if let r = restored {
-            replay = Session.makeWatcher(path: resolved.path, since: r.eventId, session: nil)
-            if replay?.running != true {
-                silt_tree_destroy(r.tree)
-                restored = nil
-                replay = nil
-            }
+        let restored = fresh ? nil : Snapshots.load(for: resolved, fullDiskAccess: fullDiskAccess)
+        // Catching up is only as good as the replay behind it; without one,
+        // the saved scan is shown while everything is checked again.
+        var replayable = restored?.replayable ?? false
+        if let r = restored, replayable {
+            let replay = Session.makeWatcher(path: resolved.path, since: r.eventId, session: nil)
+            replayable = replay.running
+            replay.stop()
         }
         tree = restored.map { Tree(restored: $0.tree, path: resolved.path) } ?? Tree(path: resolved.path)
         if guardPrivateFolders {
@@ -258,10 +269,21 @@ final class Session: Identifiable {
             tree.startIdle()
             phase = .live
             restoredFrom = restored.savedAt
-            catchingUp = true
-            lastEventId = restored.eventId
-            replay?.stop()
-            startWatching(since: restored.eventId)
+            if replayable {
+                catchingUp = true
+                lastEventId = restored.eventId
+                startWatching(since: restored.eventId)
+                // A listing that stopped early may have missed changes no
+                // replay will bring back.
+                let incomplete = tree.withLock {
+                    (0..<tree.raw.pointee.dir_count).filter { tree.dir($0).state & UInt32(SILT_DIR_INCOMPLETE) != 0 }
+                }
+                for dir in incomplete { tree.refresh(dir: dir, deep: true) }
+            } else {
+                startWatching(since: nil)
+                recheckingSince = UInt32(Date().timeIntervalSince1970)
+                startRescan(0, explicit: false)
+            }
         } else {
             tree.startScan()
             startWatching(since: nil)
@@ -364,7 +386,7 @@ final class Session: Identifiable {
         tickRescan(p, now: now)
         releaseDueRefreshes(now: now)
         if marksDirty { recomputeMarks(force: false) }
-        if phase == .live, !marksRestored, !catchingUp {
+        if phase == .live, !marksRestored, !showsSavedScan {
             marksRestored = true
             restoreMarks()
         }
@@ -389,7 +411,7 @@ final class Session: Identifiable {
         }
 
         // Keep the snapshot reasonably fresh without rewriting it constantly.
-        if phase == .live, !catchingUp, !saving, p.idle, gen != savedGeneration,
+        if phase == .live, !showsSavedScan, !saving, p.idle, gen != savedGeneration,
            now - lastSave > (lastSave == 0 ? 1 : 300), now - lastSaveAttempt > 5 {
             saveSnapshot(now: now, generation: gen)
         }
@@ -416,7 +438,7 @@ final class Session: Identifiable {
     /// At quit: save synchronously if anything changed since the last save.
     /// (A parked location's snapshot was brought up to date when it parked.)
     func saveSnapshotNow() {
-        guard isAwake, phase == .live, !catchingUp, tree.generation != savedGeneration else { return }
+        guard isAwake, phase == .live, !showsSavedScan, tree.generation != savedGeneration else { return }
         if Snapshots.save(tree, url: url, eventId: lastEventId, fullDiskAccess: fullDiskAccess) {
             savedGeneration = tree.generation
         }
@@ -506,6 +528,7 @@ final class Session: Identifiable {
             if event.id > lastEventId && event.id != UInt64(kFSEventStreamEventIdSinceNow) { lastEventId = event.id }
             if event.historyDone {
                 catchingUp = false
+                lastGeneration = .max // rows drawn as out of date should look again
                 reportLive()
             }
             if event.rootChanged { rootChanged = true }
@@ -635,6 +658,14 @@ final class Session: Identifiable {
                 let wasExplicit = rescanState?.explicit ?? false
                 rescanBase = nil
                 rescanState = nil
+                if recheckingSince != nil {
+                    // Every folder has been listed since: the saved scan is
+                    // fully replaced, and worth saving again.
+                    recheckingSince = nil
+                    lastSave = 0
+                    lastGeneration = .max
+                    reportLive()
+                }
                 if wasExplicit {
                     show(Toast(symbol: "checkmark.circle", title: "Rescan complete",
                                detail: "\(Fmt.count(stats.items)) items · \(Fmt.bytes(stats.bytes))"))
@@ -1054,7 +1085,8 @@ final class Session: Identifiable {
             return Activity(fraction: min(0.99, Double(stats.items) / Double(est)), label: "Scanning")
         case .live:
             if let r = rescanState {
-                return Activity(fraction: r.fraction, label: r.explicit ? "Rescanning" : "Checking for changes")
+                return Activity(fraction: r.fraction, label: r.explicit ? "Rescanning"
+                                : recheckingSince != nil ? "Rechecking the saved scan" : "Checking for changes")
             }
             return catchingUp ? Activity(fraction: nil, label: "Catching up on changes") : nil
         }
@@ -1611,7 +1643,7 @@ extension Session {
     }
 
     fileprivate func reportLive() {
-        guard !reportedLive, phase == .live, !catchingUp else { return }
+        guard !reportedLive, phase == .live, !showsSavedScan else { return }
         reportedLive = true
         onLive?()
     }
@@ -1696,7 +1728,7 @@ extension Session {
             if focus != exact { focus = exact }
         } else {
             if focus != nearest { focus = nearest }
-            if phase == .live && !catchingUp { pendingFocus = nil } // it isn't coming
+            if phase == .live && !showsSavedScan { pendingFocus = nil } // it isn't coming
         }
     }
 

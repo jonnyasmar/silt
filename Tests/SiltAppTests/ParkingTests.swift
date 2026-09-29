@@ -3,25 +3,6 @@ import SiltCore
 import Testing
 @testable import Silt
 
-/// Drives a real Session headlessly. Each step is its own trip to the main
-/// actor, turning the main run loop briefly (the session's timer lives there)
-/// and then returning, so work queued for the main thread (FSEvents, the end
-/// of parking) gets to run in between, as it does in the app.
-private func wait(_ condition: @escaping @MainActor () -> Bool, timeout: TimeInterval = 30) async -> Bool {
-    let end = Date().addingTimeInterval(timeout)
-    while Date() < end {
-        if await MainActor.run(body: { RunLoop.main.run(until: Date().addingTimeInterval(0.02)); return condition() }) {
-            return true
-        }
-        try? await Task.sleep(for: .milliseconds(20))
-    }
-    return await MainActor.run(body: condition)
-}
-
-private func settle(_ seconds: TimeInterval) async {
-    _ = await wait({ false }, timeout: seconds)
-}
-
 @Test func parkedSessionComesBackExactlyAndCatchesUp() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("silt-app-\(UUID().uuidString)")
         .resolvingSymlinksInPath()
@@ -40,7 +21,12 @@ private func settle(_ seconds: TimeInterval) async {
     }
     let dir = try #require(p2)
 
-    await MainActor.run { s.park() }
+    // A late event for the files written above can make it busy again, and
+    // park() declines while busy: try until it starts.
+    #expect(await wait {
+        s.park()
+        return s.residency != .awake
+    })
     #expect(await wait { s.residency == .parked })
     #expect(await MainActor.run { silt_tree_is_parked(s.tree.raw) })
 

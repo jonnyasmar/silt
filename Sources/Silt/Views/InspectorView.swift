@@ -19,6 +19,10 @@ struct InspectorView: View {
         var top: [(name: String, size: Int64, isDir: Bool)]
         var guidance: Guidance?
         var rawAlloc: Int64 = 0
+        /// When its folder (a file's, or its own) was last read; 0 if unknown.
+        var listedAt: UInt32 = 0
+        /// Possibly still what a saved scan saw.
+        var stale = false
     }
 
     var body: some View {
@@ -136,6 +140,13 @@ struct InspectorView: View {
     @ViewBuilder
     private func notes(_ s: Summary) -> some View {
         let f = s.flags
+        if s.stale, let saved = session.restoredFrom {
+            let age = Fmt.age(UInt32(saved.timeIntervalSince1970))
+            Note(symbol: "clock.arrow.circlepath", color: .secondary,
+                 text: session.catchingUp
+                     ? "From the scan saved \(age). Silt is catching up on what changed since, so this may be out of date."
+                     : "From the scan saved \(age). Silt hasn’t read this folder again yet, so it may be out of date.") { EmptyView() }
+        }
         if f & UInt8(SILT_FLAG_DENIED) != 0 {
             Note(symbol: "lock", color: .orange,
                  text: "Silt couldn’t read inside this folder, so its size is incomplete.") {
@@ -177,6 +188,12 @@ struct InspectorView: View {
                     Text(s.modified == 0 ? "—" : Date(timeIntervalSince1970: TimeInterval(s.modified))
                         .formatted(date: .abbreviated, time: .shortened))
                 }
+                if s.listedAt > 0 {
+                    GridRow {
+                        label("Scanned")
+                        Text(scanned(s))
+                    }
+                }
                 GridRow {
                     label("Where")
                     Text(displayPath(s.path))
@@ -187,6 +204,14 @@ struct InspectorView: View {
             }
             .font(.system(size: 12))
         }
+    }
+
+    /// When Silt last read the item's folder, and whether it can vouch for it since.
+    private func scanned(_ s: Summary) -> String {
+        let age = Fmt.age(s.listedAt)
+        if s.stale { return "\(age) · not checked again yet" }
+        let quiet = Date().timeIntervalSince1970 - TimeInterval(s.listedAt) >= 60
+        return quiet && s.flags & UInt8(SILT_FLAG_DENIED) == 0 ? "\(age) · no changes since" : age
     }
 
     private func label(_ s: String) -> some View {
@@ -238,6 +263,11 @@ struct InspectorView: View {
             var s = Summary(ref: ref, name: i == 0 ? session.title : tree.name(of: e), path: tree.path(of: i),
                             isDir: e.isDir, size: e.size, items: 0, modified: e.aux, flags: e.flags,
                             parentName: "", parentSize: 0, top: [])
+            if e.isDir || e.parent != NONE {
+                let d = tree.dir(e.isDir ? e.aux : e.parent)
+                s.listedAt = d.listed_at
+                s.stale = session.isStale(d)
+            }
             if e.isDir {
                 let d = tree.dir(e.aux)
                 s.items = Int(d.items)

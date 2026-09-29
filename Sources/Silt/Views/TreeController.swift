@@ -459,6 +459,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             v.size = e.size
             v.modified = e.aux
             v.flags = e.flags
+            v.growing = session.showsSavedScan && e.parent != NONE && session.isStale(tree.dir(e.parent))
         case .dir:
             let d = tree.dir(n.dir)
             let e = tree.entry(d.entry)
@@ -466,10 +467,11 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             v.items = Int(d.items)
             v.modified = d.newest
             v.flags = e.flags
-            // Hatched only while a scan or rescan is working through the tree:
-            // on a busy disk some folder is always being re-listed, and routine
+            // Hatched only while a scan or rescan is working through the tree,
+            // or while it may still show a saved scan's out-of-date sizes: on
+            // a busy disk some folder is always being re-listed, and routine
             // updates shouldn't make everything look unfinished.
-            v.growing = d.pending > 0 && showsProgress
+            v.growing = d.pending > 0 && showsProgress || session.isStale(d)
             v.isDir = true
             v.hasItems = true
             v.growth = session.growth(of: n.dir, now: e.size)

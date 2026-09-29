@@ -202,7 +202,7 @@ uint32_t tree_new_dir(silt_tree *t, uint32_t entry, uint64_t file_id,
       .pending = pending,
       .state = state,
       .version = 0,
-      .reserved = 0,
+      .listed_at = 0,
   };
   t->dir_count = id + 1;
   return id;

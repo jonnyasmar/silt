@@ -252,6 +252,7 @@ final class Fixture {
     defer { unlink(file) }
     try Data("not a snapshot at all".utf8).write(to: URL(fileURLWithPath: file))
     #expect(silt_tree_load(file, nil) == nil)
+    #expect(!silt_snapshot_peek(file, nil))
 }
 
 private func allocated(_ path: String) -> Int64 {
@@ -690,4 +691,87 @@ extension Fixture {
     #expect(!silt_tree_unpark(f.tree, file))
     #expect(silt_tree_is_parked(f.tree))
     #expect(!silt_tree_unpark(f.tree, file + ".missing"))
+}
+
+/// A folder that opens but can't be searched (read without execute, like
+/// some of macOS's own) is locked, not half-read, so the tree still saves.
+@Test func unsearchableFolderIsLockedAndTheTreeStillSaves() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("silt-test-\(UUID().uuidString)")
+        .resolvingSymlinksInPath()
+    let locked = root.appendingPathComponent("locked")
+    try Fixture.write(locked.appendingPathComponent("inside.bin"), size: 1_000)
+    try Fixture.write(root.appendingPathComponent("open.bin"), size: 1_000)
+    try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: locked.path)
+    defer {
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked.path)
+        try? FileManager.default.removeItem(at: root)
+    }
+    let tree = silt_tree_create(root.path)!
+    let scanner = silt_scanner_start(tree, 2)!
+    silt_scanner_wait_idle(scanner)
+    defer {
+        silt_scanner_destroy(scanner)
+        silt_tree_destroy(tree)
+    }
+
+    silt_tree_lock(tree)
+    let e = silt_entry_at(tree, silt_lookup(tree, locked.path)).pointee
+    let d = silt_dir_at(tree, e.aux).pointee
+    silt_tree_unlock(tree)
+    #expect(e.flags & UInt8(SILT_FLAG_DENIED) != 0)
+    #expect(d.state & UInt32(SILT_DIR_INCOMPLETE) == 0)
+
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("silt-\(UUID().uuidString).snap").path
+    defer { unlink(file) }
+    var meta = silt_snapshot_meta()
+    #expect(silt_tree_save(tree, file, &meta))
+}
+
+/// A listing that stopped early is saved as such, for the loader to redo,
+/// rather than keeping the whole tree from being saved.
+@Test func incompleteFolderIsSavedAndStaysFlagged() throws {
+    let f = try Fixture(["a/one.bin": 1_000, "b/two.bin": 1_000])
+    let a = try #require(f.entry("a")).aux
+    silt_tree_lock(f.tree)
+    silt_dir_at(f.tree, a).pointee.state |= UInt32(SILT_DIR_INCOMPLETE)
+    silt_tree_unlock(f.tree)
+
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("silt-\(UUID().uuidString).snap").path
+    defer { unlink(file) }
+    var meta = silt_snapshot_meta()
+    #expect(silt_tree_save(f.tree, file, &meta))
+    let t = try #require(silt_tree_load(file, nil))
+    defer { silt_tree_destroy(t) }
+    silt_tree_lock(t)
+    let la = silt_dir_at(t, silt_entry_at(t, silt_lookup(t, f.root.appendingPathComponent("a").path)).pointee.aux).pointee
+    let lb = silt_dir_at(t, silt_entry_at(t, silt_lookup(t, f.root.appendingPathComponent("b").path)).pointee.aux).pointee
+    silt_tree_unlock(t)
+    #expect(la.state & UInt32(SILT_DIR_INCOMPLETE) != 0)
+    #expect(lb.state & UInt32(SILT_DIR_INCOMPLETE) == 0)
+}
+
+/// Every folder remembers when it was last read, across a save and load.
+@Test func foldersRememberWhenTheyWereListed() throws {
+    let start = UInt32(Date().timeIntervalSince1970)
+    let f = try Fixture(["a/one.bin": 1_000, "a/deep/two.bin": 1_000])
+    let end = UInt32(Date().timeIntervalSince1970)
+    for rel in ["", "a", "a/deep"] {
+        let at = try #require(f.dir(rel)).listed_at
+        #expect(at >= start && at <= end)
+    }
+    let deep = try #require(f.dir("a/deep")).listed_at
+
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("silt-\(UUID().uuidString).snap").path
+    defer { unlink(file) }
+    var meta = silt_snapshot_meta()
+    meta.saved_at = 1_234_567
+    #expect(silt_tree_save(f.tree, file, &meta))
+    var peeked = silt_snapshot_meta()
+    #expect(silt_snapshot_peek(file, &peeked) && peeked.saved_at == 1_234_567)
+    let t = try #require(silt_tree_load(file, nil))
+    defer { silt_tree_destroy(t) }
+    silt_tree_lock(t)
+    let loaded = silt_dir_at(t, silt_entry_at(t, silt_lookup(t, f.root.appendingPathComponent("a/deep").path)).pointee.aux).pointee
+    silt_tree_unlock(t)
+    #expect(loaded.listed_at == deep)
 }

@@ -742,9 +742,11 @@ static void commit(silt_scanner *s, const work *w, batch *b, listing r) {
   const uint32_t dir_entry = d->entry;
   silt_entry *de = silt_entry_at(t, dir_entry);
   const uint32_t old_newest = d->newest;
-  const bool incomplete = r.read_error != 0;
   const bool denied = r.open_error == EACCES || r.open_error == EPERM ||
                       (b->n == 0 && (r.read_error == EACCES || r.read_error == EPERM));
+  // A folder that refuses to be read at all is locked, not half-read: the
+  // next listing will find it the same way.
+  const bool incomplete = r.read_error != 0 && !denied;
 
   tally tl = {.total = 0, .items = 0, .newest = 0, .pending = -1}; // this listing is done
 
@@ -794,6 +796,7 @@ finish:
   d->state |= SILT_DIR_LISTED;
   if (incomplete) d->state |= SILT_DIR_INCOMPLETE;
   else d->state &= ~SILT_DIR_INCOMPLETE;
+  d->listed_at = (uint32_t)time(NULL);
   de->flags = (uint8_t)((de->flags & ~SILT_FLAG_DENIED) |
                         (denied || incomplete ? SILT_FLAG_DENIED : 0));
   if (denied && !relisted) in->denied++;

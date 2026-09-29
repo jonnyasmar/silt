@@ -76,7 +76,7 @@ typedef struct silt_dir {
   uint32_t pending; // folders in this subtree (self included) not yet listed
   uint32_t state;
   uint32_t version; // changes whenever entries join or leave the run
-  uint32_t reserved;
+  uint32_t listed_at; // unix seconds this folder was last read; 0 if never
 } silt_dir;
 
 #define SILT_ENTRY_SHIFT 16
@@ -225,12 +225,17 @@ typedef struct silt_snapshot_meta {
 
 // Writes a compacted copy of the tree (live entries only) to `path`
 // atomically. Takes the lock. Returns false on I/O error, or if a scan is
-// still pending anywhere in the tree.
+// still pending anywhere in the tree. Folders whose last listing stopped
+// early keep SILT_DIR_INCOMPLETE; list them again after loading.
 bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *meta);
 
 // Loads a snapshot. Returns NULL if the file is missing, damaged, or from
 // another format version. The tree's root path is stored in the file.
 silt_tree *silt_tree_load(const char *path, silt_snapshot_meta *meta);
+
+// Reads only the header: false if the file is missing or not one this build
+// can load. Cheap enough to call while drawing.
+bool silt_snapshot_peek(const char *path, silt_snapshot_meta *meta);
 
 // MARK: Parking
 
