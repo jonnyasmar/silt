@@ -3,7 +3,7 @@ import SiltCore
 
 /// A group of things that are probably worth deleting, found from the
 /// in-memory tree (no extra disk access).
-struct Finding: Identifiable, Sendable {
+struct Finding: Identifiable, Equatable, Sendable {
     enum Safety: Sendable { case safe, review }
 
     let id: String
@@ -210,15 +210,27 @@ enum Reclaim {
         // of a cargo target dir, even one kept on another volume and reached
         // through a `target` symlink. If no project contains it or links to
         // it, it's orphaned (often left behind by a deleted worktree).
-        var links = targetLinks()
-        // Plus any `target` symlink inside the scan itself.
-        let named = tree.search("target", under: dir, limit: 20_000)
-        let linkPaths: [String] = tree.withLock {
-            named.compactMap { i in
-                let e = tree.entry(i)
-                return e.isSymlink && tree.name(of: e) == "target" ? tree.path(of: i) : nil
+        // One exact-name pass finds both the markers and any `target` symlink
+        // inside the scan (the match ignores case; these checks don't).
+        let cap = 65_536
+        let named = tree.findNamed(["target", ".rustc_info.json"], under: dir, limit: cap)
+        let (linkPaths, infos): ([String], [UInt32]) = tree.withLock {
+            var links: [String] = [], infos: [UInt32] = []
+            for m in named {
+                let e = tree.entry(m.entry)
+                if m.which == 0, e.isSymlink, tree.name(of: e) == "target" {
+                    links.append(tree.path(of: m.entry))
+                } else if m.which == 1, !e.isDir, tree.name(of: e) == ".rustc_info.json" {
+                    infos.append(m.entry)
+                }
             }
+            return (links, infos)
         }
+        // Code folders the scan doesn't reach have their links read from disk.
+        // If the search hit its cap, the smallest matches (symlinks among
+        // them) were left out: read every code folder's links from disk, so a
+        // linked target isn't taken for an orphan.
+        var links = targetLinks(outside: named.count >= cap ? nil : tree, under: dir)
         for p in linkPaths {
             if let dest = try? FileManager.default.destinationOfSymbolicLink(atPath: p) {
                 let base = (p as NSString).deletingLastPathComponent
@@ -227,11 +239,10 @@ enum Reclaim {
             }
         }
         var linkedRust: [UInt32] = [], orphanedRust: [UInt32] = []
-        let infos = tree.search(".rustc_info.json", under: dir, limit: 5000)
         tree.withLock {
             for f in infos {
                 let e = tree.entry(f)
-                guard !e.isDir, tree.name(of: e) == ".rustc_info.json", e.parent != NONE else { continue }
+                guard e.parent != NONE else { continue }
                 let root = tree.dirEntry(e.parent)
                 guard tree.isLive(root), !claimed.contains(root), !isInside(tree, root, claimed: claimed) else { continue }
                 let path = tree.path(of: root)
@@ -352,22 +363,70 @@ enum Reclaim {
         return out
     }
 
+    /// The usual places people keep code, under the home folder.
+    private static let codeFolders = ["dev", "Developer", "Projects", "projects", "code", "Code", "src", "work",
+                                      "repos", "git", "GitHub"]
+
     /// Where projects' `target` symlinks point, for the usual places people
     /// keep code. Lets a target folder on another volume be recognized as
-    /// still in use.
-    static func targetLinks() -> Set<String> {
-        let fm = FileManager.default
-        let home = fm.homeDirectoryForCurrentUser.path
+    /// still in use. Folders the scan has listed under `dir` are skipped:
+    /// the in-tree search already sees their links.
+    /// With no tree, every code folder is read.
+    static func targetLinks(outside tree: Tree?, under dir: UInt32) -> Set<String> {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let roots = codeFolders.map { home + "/" + $0 }
+        let inside: Set<String> = tree.map { tree in tree.withLock {
+            Set(roots.filter { root in
+                let i = tree.lookup(root)
+                guard i != NONE, tree.isLive(i) else { return false }
+                let e = tree.entry(i)
+                guard e.isDir, !e.isMount, tree.dir(e.aux).state & UInt32(SILT_DIR_LISTED) != 0 else { return false }
+                var d = e.aux
+                while true {
+                    if d == dir { return true }
+                    let parent = tree.entry(tree.dirEntry(d)).parent
+                    if parent == NONE { return false }
+                    d = parent
+                }
+            })
+        } } ?? []
         var out = Set<String>()
-        func check(_ project: String) {
-            let link = project + "/target"
-            guard let dest = try? fm.destinationOfSymbolicLink(atPath: link) else { return }
-            let absolute = dest.hasPrefix("/") ? dest : (project as NSString).appendingPathComponent(dest)
-            out.insert(URL(fileURLWithPath: absolute).standardizedFileURL.resolvingSymlinksInPath().path)
+        for root in roots where !inside.contains(root) { out.formUnion(linkCache.links(under: root)) }
+        return out
+    }
+
+    /// Each code folder's links, read at most every ten minutes: reading them
+    /// means a readlink per project, thousands on a big `~/dev`.
+    private static let linkCache = LinkCache()
+
+    private final class LinkCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var known: [String: (at: TimeInterval, links: Set<String>)] = [:]
+        private static let lifetime: TimeInterval = 600
+
+        func links(under root: String) -> Set<String> {
+            let now = ProcessInfo.processInfo.systemUptime
+            lock.lock()
+            let hit = known[root]
+            lock.unlock()
+            if let hit, now - hit.at < Self.lifetime { return hit.links }
+            let links = Self.read(root)
+            lock.lock()
+            known[root] = (now, links)
+            lock.unlock()
+            return links
         }
-        for root in ["dev", "Developer", "Projects", "projects", "code", "Code", "src", "work", "repos", "git", "GitHub"] {
-            let base = home + "/" + root
-            guard let kids = try? fm.contentsOfDirectory(atPath: base) else { continue }
+
+        private static func read(_ base: String) -> Set<String> {
+            let fm = FileManager.default
+            var out = Set<String>()
+            func check(_ project: String) {
+                let link = project + "/target"
+                guard let dest = try? fm.destinationOfSymbolicLink(atPath: link) else { return }
+                let absolute = dest.hasPrefix("/") ? dest : (project as NSString).appendingPathComponent(dest)
+                out.insert(URL(fileURLWithPath: absolute).standardizedFileURL.resolvingSymlinksInPath().path)
+            }
+            guard let kids = try? fm.contentsOfDirectory(atPath: base) else { return out }
             for k in kids {
                 let project = base + "/" + k
                 check(project)
@@ -376,8 +435,8 @@ enum Reclaim {
                     for i in inner { check(project + "/" + i) }
                 }
             }
+            return out
         }
-        return out
     }
 
     /// Lock held. True if folder `dir` or one above it holds a `.git` (a

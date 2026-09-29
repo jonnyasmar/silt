@@ -6,7 +6,10 @@ import Testing
 @Test func parkedSessionComesBackExactlyAndCatchesUp() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("silt-app-\(UUID().uuidString)")
         .resolvingSymlinksInPath()
-    defer { try? FileManager.default.removeItem(at: root) }
+    defer {
+        Snapshots.discard(for: root) // the scan saved one when it settled
+        try? FileManager.default.removeItem(at: root)
+    }
     for i in 0..<200 {
         let url = root.appendingPathComponent("p\(i % 5)/f\(i).bin")
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -49,7 +52,10 @@ import Testing
 @Test func wakeRequestedWhileParkingStillWakes() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("silt-app-\(UUID().uuidString)")
         .resolvingSymlinksInPath()
-    defer { try? FileManager.default.removeItem(at: root) }
+    defer {
+        Snapshots.discard(for: root) // the scan saved one when it settled
+        try? FileManager.default.removeItem(at: root)
+    }
     for i in 0..<50 {
         let url = root.appendingPathComponent("d/f\(i)")
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -69,7 +75,10 @@ import Testing
 @Test func coveringScanAnswersWithoutItsTree() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("silt-cover-\(UUID().uuidString)")
         .resolvingSymlinksInPath()
-    defer { try? FileManager.default.removeItem(at: root) }
+    defer {
+        Snapshots.discard(for: root) // the scan saved one when it settled
+        try? FileManager.default.removeItem(at: root)
+    }
     try FileManager.default.createDirectory(at: root.appendingPathComponent("a/b"), withIntermediateDirectories: true)
     let s = await MainActor.run { Session(url: root, guardPrivateFolders: true, fresh: true) }
     let answers = await MainActor.run {
@@ -83,7 +92,10 @@ import Testing
 @Test func absorbingKeepsBothScansMarks() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("silt-absorb-\(UUID().uuidString)")
         .resolvingSymlinksInPath()
-    defer { try? FileManager.default.removeItem(at: root) }
+    defer {
+        Snapshots.discard(for: root) // the scan saved one when it settled
+        try? FileManager.default.removeItem(at: root)
+    }
     for name in ["top.bin", "sub/inner.bin"] {
         let url = root.appendingPathComponent(name)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -91,6 +103,7 @@ import Testing
     }
     let sub = root.appendingPathComponent("sub")
     defer {
+        Snapshots.discard(for: sub)
         UserDefaults.standard.removeObject(forKey: "marks:" + root.path)
         UserDefaults.standard.removeObject(forKey: "marks:" + sub.path)
     }
@@ -117,8 +130,12 @@ import Testing
     let saved = UserDefaults.standard.array(forKey: "marks:" + root.path)?.count
     #expect(saved == 2)
     #expect(UserDefaults.standard.array(forKey: "marks:" + sub.path) == nil)
-    await MainActor.run {
-        child.close()
-        host.close()
+    // Closed once no save is in flight, so none lands after the cleanup.
+    for s in [child, host] {
+        _ = await wait {
+            guard s.canPark || s.closed else { return false }
+            s.close()
+            return true
+        }
     }
 }

@@ -3,6 +3,11 @@ import Foundation
 
 /// A thin FSEvents stream: directory-level change notifications for a subtree,
 /// optionally replaying history from a saved event id.
+///
+/// The stream holds a reference to its watcher for as long as it exists, so
+/// a callback already under way can't outlive the object it calls. That
+/// also means dropping the last reference doesn't end the stream: whoever
+/// owns a watcher calls `stop()` when done with it.
 final class FSWatcher {
     struct Event {
         let path: String
@@ -31,10 +36,21 @@ final class FSWatcher {
          handler: @escaping ([Event]) -> Void) {
         self.handler = handler
         startId = since ?? FSEventsGetCurrentEventId()
+        // The stream retains `info` when it's created and releases it when
+        // it's released (in `stop`).
         var context = FSEventStreamContext(
             version: 0,
             info: Unmanaged.passUnretained(self).toOpaque(),
-            retain: nil, release: nil, copyDescription: nil
+            retain: { info in
+                guard let info else { return nil }
+                _ = Unmanaged<FSWatcher>.fromOpaque(info).retain()
+                return info
+            },
+            release: { info in
+                guard let info else { return }
+                Unmanaged<FSWatcher>.fromOpaque(info).release()
+            },
+            copyDescription: nil
         )
         let callback: FSEventStreamCallback = { _, info, count, paths, flags, ids in
             guard let info else { return }
@@ -56,15 +72,20 @@ final class FSWatcher {
         }
     }
 
+    /// Ends the stream for good. Safe to call more than once.
     func stop() {
         guard let stream else { return }
+        self.stream = nil
+        running = false
         FSEventStreamStop(stream)
         FSEventStreamInvalidate(stream)
-        FSEventStreamRelease(stream)
-        self.stream = nil
+        FSEventStreamRelease(stream) // may release the last reference to self
     }
 
-    deinit { stop() }
+    /// `databaseUUID` as bytes, for comparing.
+    static func databaseID(for path: String) -> [UInt8]? {
+        databaseUUID(for: path).map { uuid in withUnsafeBytes(of: uuid) { Array($0) } }
+    }
 
     /// Identifies the FSEvents database that event ids for `path` belong to.
     static func databaseUUID(for path: String) -> uuid_t? {

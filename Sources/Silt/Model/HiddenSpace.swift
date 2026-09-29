@@ -22,7 +22,7 @@ struct HiddenSpace: Equatable {
     /// Breaks down `used − scanned` for the volume at `url`. `capacity` is the
     /// container's (APFS volumes share it); nil if the gap is too small to
     /// mention.
-    static func measure(url: URL, scanned: Int64, capacity: (total: Int64, available: Int64, free: Int64),
+    static func measure(url: URL, scanned: Int64, capacity: Capacity,
                         unreadable: Int, snapshots: [String]) -> HiddenSpace? {
         let used = capacity.total - capacity.free
         let gap = used - scanned

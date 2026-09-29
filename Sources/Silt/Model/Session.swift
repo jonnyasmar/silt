@@ -56,6 +56,12 @@ struct Toast: Identifiable, Equatable {
 
 /// One scanned location: the tree, the scan that fills it, the file-system
 /// watch that keeps it current, and the actions you can take on it.
+///
+/// Nothing here runs on a fixed beat. Each pass of `tick` works out when
+/// something next needs doing (following a scan or refresh while one runs, a
+/// paced refresh coming due, a save, a capacity check) and sets one timer
+/// for that moment; with nothing due there's no timer at all. Whatever
+/// starts work or changes what's due sets it again (`rearm`).
 @MainActor
 @Observable
 final class Session: Identifiable {
@@ -67,18 +73,35 @@ final class Session: Identifiable {
     let isVolume: Bool
     @ObservationIgnored let tree: Tree
 
-    private(set) var phase: Phase = .scanning
+    private(set) var phase: Phase = .scanning {
+        didSet { updateActivity() }
+    }
     private(set) var stats = ScanStats()
-    /// Bumps (at most ~5×/s) whenever tree contents change. Views that show
-    /// derived numbers read it to know when to recompute.
+    /// Bumps whenever tree contents change: at most about 4×/s while the
+    /// session is on screen, at the `quietVersion` pace while it isn't.
+    /// Views that show derived numbers read it to know when to recompute.
     private(set) var version = 0
     /// Like `version`, but for views that re-walk the whole tree: once live,
-    /// it moves at most every second per two million items, so a disk that
-    /// never stops changing doesn't keep them busy.
+    /// it moves at most every `quietInterval`, which follows what those
+    /// passes report costing, so a disk that never stops changing doesn't
+    /// keep them busy.
     private(set) var quietVersion = 0
     @ObservationIgnored private var quietSource = 0
     @ObservationIgnored private var lastQuietBump: TimeInterval = 0
-    private(set) var capacity: (total: Int64, available: Int64, free: Int64)?
+    @ObservationIgnored private var lastVersionBump: TimeInterval = 0
+    /// The tree changed since `version` last moved.
+    @ObservationIgnored private var versionPending = false
+    /// The tree changed while off screen, and listeners haven't heard yet.
+    @ObservationIgnored private var unshown = false
+    /// The volume's size and space. `available` counts purgeable space as
+    /// last measured exactly; see `checkCapacity`.
+    private(set) var capacity: Capacity?
+    @ObservationIgnored private var lastCapacityCheck: TimeInterval = -.infinity
+    /// Available minus free at the last exact measurement.
+    @ObservationIgnored private var purgeable: Int64?
+    @ObservationIgnored private var lastExactCapacity: TimeInterval = -.infinity
+    @ObservationIgnored private var measuringCapacity = false
+    @ObservationIgnored private var measureCapacityAgain = false
     var focus: UInt32 = 0
     var selection: [ItemRef] = []
     var toast: Toast?
@@ -94,23 +117,58 @@ final class Session: Identifiable {
     @ObservationIgnored private var lastTrashCheck: TimeInterval = 0
 
     /// Whether a visible window shows this session. The window's model keeps
-    /// it current; a session without a window counts as on screen.
-    @ObservationIgnored var isOnScreen = true
-    /// Whether the Reclaim pane is what's showing for this session.
-    @ObservationIgnored var reclaimVisible = false
+    /// it current; a session without a window counts as on screen. Off
+    /// screen, the tree is kept current, but what only a viewer needs waits
+    /// until it's back: version bumps, capacity and Reclaim, periodic saves,
+    /// paced refreshes of busy folders.
+    @ObservationIgnored var isOnScreen = true {
+        didSet {
+            guard isOnScreen != oldValue else { return }
+            if isOnScreen { cameOnScreen() } else { rearm() }
+        }
+    }
+    /// Whether the Reclaim pane is what's showing for this session: its
+    /// analysis then runs as often as it can afford, instead of once a
+    /// minute for the overview's chip.
+    @ObservationIgnored var reclaimVisible = false {
+        didSet { if reclaimVisible != oldValue { rearm() } }
+    }
     @ObservationIgnored private(set) var recentQueryCost: TimeInterval = 0
+    @ObservationIgnored private var queryCostReported = false
 
     /// Views that re-walk the tree on `quietVersion` report what a pass cost,
-    /// so the pacing can follow it.
+    /// so the pacing can follow it. The most expensive recent pass counts,
+    /// fading as cheaper ones come in.
     func noteQueryCost(_ seconds: TimeInterval) {
-        recentQueryCost = seconds
+        recentQueryCost = max(seconds, recentQueryCost * 0.7)
+        queryCostReported = true
+        rearm()
+    }
+
+    /// How long `quietVersion` waits between moves once live: ten times what
+    /// a pass costs, at least a second. Until a view has reported a cost,
+    /// a second per two million items.
+    private var quietInterval: TimeInterval {
+        queryCostReported ? max(1, recentQueryCost * 10) : max(1, Double(stats.items) / 2_000_000)
     }
 
     @ObservationIgnored private var timer: Timer?
+    /// When `timer` fires, in system uptime.
+    @ObservationIgnored private var timerFire: TimeInterval?
+    @ObservationIgnored private var lastTick: TimeInterval = -.infinity
+    @ObservationIgnored private var inTick = false
+    /// Set a turn after `init`; see `start`.
+    @ObservationIgnored private var started = false
+    /// How many times the timer has fired, for tests.
+    @ObservationIgnored private(set) var ticks = 0
     @ObservationIgnored private var lastGeneration: UInt64 = .max
-    @ObservationIgnored private var lastVersionBump: TimeInterval = 0
-    @ObservationIgnored private var lastCapacityCheck: TimeInterval = 0
-    @ObservationIgnored private var watcher: FSWatcher?
+    /// When `tick` last saw the tree change.
+    @ObservationIgnored private var lastChange: TimeInterval = -.infinity
+    /// Held while work someone waits on runs, so App Nap doesn't slow it.
+    @ObservationIgnored private var busyActivity: NSObjectProtocol?
+    /// The stream holds its watcher, so a session dropped without `close()`
+    /// would leave it running: `deinit` stops it (hence reachable from there).
+    @ObservationIgnored nonisolated(unsafe) private var watcher: FSWatcher?
     @ObservationIgnored private var heldEvents: [FSWatcher.Event] = []
     @ObservationIgnored private var listeners: [ObjectIdentifier: () -> Void] = [:]
     @ObservationIgnored private var toastTask: Task<Void, Never>?
@@ -131,15 +189,27 @@ final class Session: Identifiable {
     /// replaces this session with a fresh one.
     @ObservationIgnored var onNeedsRebuild: (() -> Void)?
     @ObservationIgnored private var askedForRebuild = false
+    /// Called when a session that's off screen (and not the one showing)
+    /// has settled enough to park, so the window can put it away without
+    /// polling.
+    @ObservationIgnored var onSettled: (() -> Void)?
+    /// Called when the session is parked, woken, or stays awake after a
+    /// failed park, so the window can plan its next park.
+    @ObservationIgnored var onResidencyChange: (() -> Void)?
 
     /// When the scan being shown was saved, if it came from a snapshot.
     private(set) var restoredFrom: Date?
-    /// Replaying file-system history since that snapshot.
-    private(set) var catchingUp = false
+    /// Replaying file-system history since that snapshot (or since the
+    /// location was parked).
+    private(set) var catchingUp = false {
+        didSet { updateActivity() }
+    }
     /// Set while a snapshot FSEvents can't bring up to date (too old, or the
     /// volume's history was reset) is checked again in place: folders not
     /// listed since this moment (unix seconds) still show what it saw.
-    private(set) var recheckingSince: UInt32?
+    private(set) var recheckingSince: UInt32? {
+        didSet { updateActivity() }
+    }
     /// What's on screen may be out of date: a restored scan that hasn't
     /// caught up yet.
     var showsSavedScan: Bool { catchingUp || recheckingSince != nil }
@@ -150,37 +220,73 @@ final class Session: Identifiable {
         catchingUp || recheckingSince.map { d.listed_at < $0 } ?? false
     }
     @ObservationIgnored private let fullDiskAccess: Bool
+    /// Whether FSEvents history for this location survives relaunches (see
+    /// `Snapshots.eligible`): it gets snapshots, and parks without a stream.
+    @ObservationIgnored private let keepsHistory: Bool
     @ObservationIgnored private var lastEventId: FSEventStreamEventId = 0
-    @ObservationIgnored private var lastSave: TimeInterval = 0
-    @ObservationIgnored private var lastSaveAttempt: TimeInterval = 0
+    /// When the snapshot was last saved (or loaded), in system uptime.
+    @ObservationIgnored private var lastSave: TimeInterval = ProcessInfo.processInfo.systemUptime
+    @ObservationIgnored private var lastSaveAttempt: TimeInterval = -.infinity
+    @ObservationIgnored private var failedSaves = 0
+    /// A scan settled (or a saved one was fully rechecked): save it soon,
+    /// whether or not it's on screen.
+    @ObservationIgnored private var saveSoon = false
     @ObservationIgnored private var savedGeneration: UInt64 = 0
     @ObservationIgnored private var saving = false
+    /// Saves started by closing sessions, which quitting waits for.
+    nonisolated static let closingSaves = DispatchGroup()
 
     /// Rescan in progress, if any. The tree stays fully usable meanwhile.
-    private(set) var rescanState: RescanState?
-    @ObservationIgnored private var rescanBase: (listed: UInt64, total: Int)?
+    private(set) var rescanState: RescanState? {
+        didSet { updateActivity() }
+    }
+    private struct RescanBase {
+        let listed: UInt64
+        let total: Int
+        /// Someone is waiting on it: it's over when the urgent work is,
+        /// whatever background refreshes are still coming in.
+        var urgent: Bool
+    }
+    @ObservationIgnored private var rescanBase: RescanBase?
     @ObservationIgnored private var deepAt: [UInt32: TimeInterval] = [:]
-    @ObservationIgnored private var deferredDeep: Set<UInt32> = []
+    /// Deep checks held back by their 30 s limit, with the first event that
+    /// asked for each.
+    @ObservationIgnored private var deferredDeep: [UInt32: FSEventStreamEventId] = [:]
     /// Big folders that change constantly (build output, browser caches) are
     /// re-listed at a pace that scales with their size rather than on every
-    /// event: when each was last listed, and when it's next due.
+    /// event: when each was last listed, and when it's next due (with the
+    /// first event it's due for).
     @ObservationIgnored private var listedAt: [UInt32: TimeInterval] = [:]
-    @ObservationIgnored private var dueAt: [UInt32: TimeInterval] = [:]
+    @ObservationIgnored private var dueAt: [UInt32: (at: TimeInterval, event: FSEventStreamEventId)] = [:]
     @ObservationIgnored private var rootInode: UInt64 = 0
     @ObservationIgnored private var rootVolume: String?
 
     /// Whether the tree is in memory; see `park()`.
     enum Residency { case awake, parking, parked, waking }
-    private(set) var residency: Residency = .awake
+    private(set) var residency: Residency = .awake {
+        didSet {
+            updateActivity()
+            if residency != oldValue { onResidencyChange?() }
+        }
+    }
     var isAwake: Bool { residency == .awake }
     /// When this location was last on screen (nil while it is).
-    @ObservationIgnored var hiddenSince: TimeInterval?
-    @ObservationIgnored fileprivate var wakeWhenParked = false
-    @ObservationIgnored fileprivate var closed = false
+    @ObservationIgnored var hiddenSince: TimeInterval? {
+        // Shown and hidden again while it was parking: it needn't wake after all.
+        didSet { if hiddenSince != nil { wakeWhenParked = false } }
+    }
+    @ObservationIgnored fileprivate var wakeWhenParked = false {
+        didSet { updateActivity() }
+    }
+    @ObservationIgnored fileprivate(set) var closed = false
     @ObservationIgnored fileprivate var parkedEvents: [String: FSWatcher.Event] = [:]
     @ObservationIgnored fileprivate var parkedOverflow = false
     @ObservationIgnored fileprivate var parkedMaxEventId: FSEventStreamEventId = 0
     @ObservationIgnored fileprivate var parkedSpecial: [FSWatcher.Event] = []
+    /// Parked without its FSEvents stream: waking replays history instead.
+    @ObservationIgnored fileprivate var streamStopped = false
+    @ObservationIgnored fileprivate var parkedAt: Date?
+    @ObservationIgnored fileprivate var parkedDatabase: [UInt8]?
 
     /// The location or folder this scan is being shown as.
     private(set) var viewPath: String = ""
@@ -196,6 +302,12 @@ final class Session: Identifiable {
     @ObservationIgnored private var marksDirty = false
     @ObservationIgnored private var lastMarksRecompute: TimeInterval = 0
     @ObservationIgnored fileprivate var marksRestored = false
+    /// Where each file mark was last found, and its folder's run then: while
+    /// that run hasn't changed, the file is still at the same index.
+    @ObservationIgnored fileprivate var markSpots: [MarkKey: MarkSpot] = [:]
+    /// Marks changed since they were last written to the defaults.
+    @ObservationIgnored fileprivate var marksUnsaved = false
+    @ObservationIgnored fileprivate var lastMarksSave: TimeInterval = -.infinity
 
     /// What the volume's used space holds beyond the scan, for whole volumes.
     private(set) var hidden: HiddenSpace?
@@ -244,7 +356,7 @@ final class Session: Identifiable {
     @ObservationIgnored private var scoped: (dir: UInt32, source: Int, findings: [Finding])?
     private(set) var analyzing = false
     @ObservationIgnored private var analyzedVersion = -1
-    @ObservationIgnored private var lastAnalysis: TimeInterval = 0
+    @ObservationIgnored private var lastAnalysis: TimeInterval = -.infinity
     @ObservationIgnored private var analysisCost: TimeInterval = 0
 
     /// Without Full Disk Access, opening another app's container pops a
@@ -257,16 +369,14 @@ final class Session: Identifiable {
         let values = try? resolved.resourceValues(forKeys: [.isVolumeKey])
         isVolume = values?.isVolume == true || resolved.path == "/"
         fullDiskAccess = !guardPrivateFolders
+        keepsHistory = Snapshots.eligible(resolved)
         let restored = fresh ? nil : Snapshots.load(for: resolved, fullDiskAccess: fullDiskAccess)
-        // Catching up is only as good as the replay behind it; without one,
-        // the saved scan is shown while everything is checked again.
-        var replayable = restored?.replayable ?? false
-        if let r = restored, replayable {
-            let replay = Session.makeWatcher(path: resolved.path, since: r.eventId, session: nil)
-            replayable = replay.running
-            replay.stop()
-        }
         tree = restored.map { Tree(restored: $0.tree, path: resolved.path) } ?? Tree(path: resolved.path)
+        // A restored tree is what's saved, until something changes it. A new
+        // scan isn't saved at all: taken after it starts, the generation
+        // could already be its last one (a small folder scans in a
+        // millisecond), and the scan would never be saved.
+        savedGeneration = restored == nil ? .max : tree.generation
         if guardPrivateFolders {
             let home = FileManager.default.homeDirectoryForCurrentUser.path
             for sub in ["Library/Containers", "Library/Group Containers", "Library/Daemon Containers"] {
@@ -282,10 +392,14 @@ final class Session: Identifiable {
             tree.startIdle()
             phase = .live
             restoredFrom = restored.savedAt
-            if replayable {
-                catchingUp = true
+            // Catching up is only as good as the replay behind it; without
+            // one, the saved scan is shown while everything is checked again.
+            if restored.replayable {
                 lastEventId = restored.eventId
                 startWatching(since: restored.eventId)
+            }
+            if restored.replayable, watcher?.running == true {
+                catchingUp = true
                 // A listing that stopped early may have missed changes no
                 // replay will bring back.
                 let incomplete = tree.withLock {
@@ -295,13 +409,12 @@ final class Session: Identifiable {
             } else {
                 startWatching(since: nil)
                 recheckingSince = UInt32(Date().timeIntervalSince1970)
-                startRescan(0, explicit: false)
+                startRescan(0, explicit: false, urgent: true)
             }
         } else {
             tree.startScan()
             startWatching(since: nil)
         }
-        savedGeneration = tree.generation
         var st = stat()
         if lstat(resolved.path, &st) == 0 { rootInode = st.st_ino }
         rootVolume = Session.volumeUUID(resolved)
@@ -313,22 +426,60 @@ final class Session: Identifiable {
             }
             scanEstimate = total > 0 ? total : nil
         }
-        capacity = Locations.volumeCapacity(for: resolved)
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 12, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick() }
+        holdBusyActivity(true) // a scan, catch-up or recheck is starting; the first tick decides
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated { self?.start() }
         }
-        RunLoop.main.add(timer!, forMode: .common)
+    }
+
+    /// The rest of starting up, a turn after `init`. SwiftUI can create a
+    /// session while it builds a view (the window's model does, in its
+    /// initializer), and every observed property read then becomes something
+    /// that view is rebuilt for: so nothing that reads them runs until now.
+    private func start() {
+        guard !started, !closed else { return }
+        started = true
+        checkCapacity(now: ProcessInfo.processInfo.systemUptime, exact: true)
+        updateActivity()
+        rearm()
+    }
+
+    deinit {
+        watcher?.stop()
     }
 
     func close() {
+        close(saving: false)
+    }
+
+    /// Ends this session. `saving` (a window closing): first bring its
+    /// snapshot up to date, off the main thread; quitting waits for that.
+    func close(saving: Bool) {
+        guard !closed else { return }
+        flushMarks()
+        let save = saving && residency == .awake && keepsHistory && phase == .live && !showsSavedScan
+            && tree.generation != savedGeneration
         closed = true
         duplicates.cancel()
-        timer?.invalidate()
-        timer = nil
+        cancelTimer()
+        holdBusyActivity(false)
         watcher?.stop()
         watcher = nil
         switch residency {
-        case .awake: tree.stop()
+        case .awake:
+            guard save else {
+                tree.stop()
+                break
+            }
+            let tree = tree, url = url, eventId = safeEventId, fda = fullDiskAccess
+            Session.closingSaves.enter()
+            // Quitting waits for this, so it runs at the priority of that wait.
+            DispatchQueue.global(qos: .userInitiated).async {
+                Snapshots.save(tree, url: url, eventId: eventId, fullDiskAccess: fda)
+                tree.stop()
+                malloc_zone_pressure_relief(nil, 0)
+                Session.closingSaves.leave()
+            }
         case .parked: try? FileManager.default.removeItem(atPath: parkFile)
         case .parking, .waking: break // the worker cleans up when it's done
         }
@@ -336,7 +487,7 @@ final class Session: Identifiable {
 
     // MARK: Live updates
 
-    /// Called on every tick where the tree changed.
+    /// Called on every tick where the tree changed, while on screen.
     func addListener(_ owner: AnyObject, _ body: @escaping () -> Void) {
         listeners[ObjectIdentifier(owner)] = body
     }
@@ -345,115 +496,319 @@ final class Session: Identifiable {
         listeners.removeValue(forKey: ObjectIdentifier(owner))
     }
 
+    /// Deadlines this close count as met: a timer never fires early, but
+    /// arithmetic on its fire date can land a hair short.
+    private static let slack: TimeInterval = 0.002
+    /// Least time between `version` bumps.
+    private static let versionInterval: TimeInterval = 0.25
+
+    /// Off screen, `version` still moves, but only at the pace of
+    /// `quietVersion`: enough for what a sidebar shows of a hidden scan (the
+    /// size of a folder shown from it), and too slow to cost much where it
+    /// isn't seen. Listeners and `quietVersion` wait until it's back.
+    private var hiddenVersionInterval: TimeInterval { max(1, quietInterval) }
+
+    /// Does whatever is due, then sets the timer for the next thing.
     private func tick() {
-        guard residency == .awake else { return } // nothing to show, nothing to update
-        let p = tree.progress
-        let gen = tree.generation
+        timer = nil
+        timerFire = nil
+        guard residency == .awake, !closed else { return }
+        ticks += 1
+        inTick = true
+        defer { inTick = false }
         let now = ProcessInfo.processInfo.systemUptime
+        lastTick = now
+        let p = tree.progress
+        let gen = tree.generation // read after the progress, so it includes every listing that's done
+        let onScreen = isOnScreen
 
         var s = ScanStats()
         s.items = Int(p.files)
         s.bytes = Int64(p.bytes)
         s.folders = Int(p.dirs)
         s.denied = Int(p.denied)
-        s.elapsed = p.elapsed
+        s.elapsed = p.elapsed.rounded(.down) // shown in whole seconds: finer would only redraw
         s.finished = p.finished
         s.queued = Int(p.queued)
         if s.items != stats.items || s.folders != stats.folders { lastGrowth = now }
-        if phase == .scanning || s != stats { stats = s }
+        if s != stats { stats = s }
         let isStalled = phase == .scanning && s.queued > 0 && now - lastGrowth > 3
         if isStalled != stalled { stalled = isStalled }
+        holdBusyActivity(p.urgent_queued > 0 || phase == .scanning)
 
         if phase == .scanning && p.idle && p.finished > 0 {
             phase = .live
             releaseHeldEvents()
-            capacity = Locations.volumeCapacity(for: url)
             version += 1
-            lastSave = 0 // save the fresh scan as soon as it settles
+            saveSoon = true // save the fresh scan as soon as it settles
             (baseline, baselineExpanded) = Session.sizes(tree, depth: 4)
             baselineDate = Date()
             malloc_zone_pressure_relief(nil, 0) // scan batches are done with
-            measureHidden(now: now)
+            if onScreen { checkCapacity(now: now, exact: true) }
             reportLive()
         }
 
         if gen != lastGeneration {
             lastGeneration = gen
+            lastChange = now
             resolvePendingFocus()
             repairFocus()
-            notifyListeners()
-            if now - lastVersionBump > 0.2 || phase == .live {
-                lastVersionBump = now
-                version += 1
-            }
             marksDirty = true
+            unshown = true
+            versionPending = true
+            if !askedForRebuild, tree.raw.pointee.entry_count > 3_500_000_000 {
+                askedForRebuild = true
+                onNeedsRebuild?()
+            }
         }
-
-        if version != quietSource,
-           phase == .scanning || now - lastQuietBump > max(1, Double(stats.items) / 2_000_000) {
-            quietSource = version
-            lastQuietBump = now
-            quietVersion += 1
+        if onScreen {
+            if unshown {
+                unshown = false
+                notifyListeners()
+            }
+            if versionPending, now - lastVersionBump >= Self.versionInterval - Self.slack { bumpVersion(now) }
+            if version != quietSource, phase == .scanning || now - lastQuietBump >= quietInterval - Self.slack {
+                bumpQuiet(now)
+            }
+        } else if versionPending, now - lastVersionBump >= hiddenVersionInterval - Self.slack {
+            bumpVersion(now)
         }
 
         tickRescan(p, now: now)
-        releaseDueRefreshes(now: now)
-        if marksDirty { recomputeMarks(force: false) }
+        if onScreen {
+            releaseDueRefreshes(now: now)
+            if marksDirty, now - lastMarksRecompute >= 0.5 - Self.slack { recomputeMarks() }
+            tickAnalysis(now: now)
+            if changesDue(p) {
+                changesVersion = quietVersion
+                computeChanges()
+            }
+            if now - lastCapacityCheck >= 3 - Self.slack { checkCapacity(now: now) }
+            if !inTrash.isEmpty, now - lastTrashCheck >= 5 - Self.slack {
+                lastTrashCheck = now
+                recountTrash()
+            }
+        }
+        if marksUnsaved, now - lastMarksSave >= 1 - Self.slack { persistMarks() }
         if phase == .live, !marksRestored, !showsSavedScan {
             marksRestored = true
             restoreMarks()
         }
-        tickAnalysis(now: now)
-        if phase == .live, !catchingUp, p.idle, version != changesVersion, !baseline.isEmpty {
-            changesVersion = version
-            computeChanges()
-        }
-
-        if !askedForRebuild, tree.raw.pointee.entry_count > 3_500_000_000 {
-            askedForRebuild = true
-            onNeedsRebuild?()
-        }
-        if now - lastCapacityCheck > 3 {
-            lastCapacityCheck = now
-            capacity = Locations.volumeCapacity(for: url)
-            measureHidden(now: now)
-        }
-        if !inTrash.isEmpty, now - lastTrashCheck > 5 {
-            lastTrashCheck = now
-            recountTrash()
-        }
-
-        // Keep the snapshot reasonably fresh without rewriting it constantly.
-        if phase == .live, !showsSavedScan, !saving, p.idle, gen != savedGeneration,
-           now - lastSave > (lastSave == 0 ? 1 : 300), now - lastSaveAttempt > 5 {
+        if let due = saveDue(p, onScreen: onScreen), due <= now + Self.slack {
             saveSnapshot(now: now, generation: gen)
         }
+        updateActivity()
+        schedule(p, now: now)
+        noteIfSettled(p)
+    }
+
+    /// Sets the timer for whatever is due next, or clears it if nothing is.
+    private func schedule(_ p: silt_progress, now: TimeInterval) {
+        guard residency == .awake, !closed else { return cancelTimer() }
+        let onScreen = isOnScreen
+        var due = TimeInterval.infinity
+        func at(_ t: TimeInterval) { due = min(due, t) }
+
+        // Work under way: followed closely while someone waits on it or
+        // watches the tree move, loosely otherwise, and never more than
+        // twice a second off screen.
+        if p.urgent_queued > 0 || phase == .scanning || catchingUp || tree.generation != lastGeneration
+            || (onScreen && now - lastChange < 0.5) {
+            at(lastTick + (onScreen ? 1.0 / 12 : 0.5))
+        } else if !p.idle || rescanBase != nil {
+            at(lastTick + (onScreen ? 0.25 : 0.5))
+        }
+
+        // Chores with deadlines.
+        if onScreen {
+            if let first = dueAt.values.lazy.map({ $0.at }).min() { at(first) }
+            if rescanBase == nil { for dir in deferredDeep.keys { at((deepAt[dir] ?? 0) + 30) } }
+            if versionPending { at(lastVersionBump + Self.versionInterval) }
+            if version != quietSource { at(phase == .scanning ? now : lastQuietBump + quietInterval) }
+            if marksDirty { at(lastMarksRecompute + 0.5) }
+            if let t = analysisDue() { at(t) }
+            if changesDue(p) { at(now) }
+            at(lastCapacityCheck + 3)
+            if !inTrash.isEmpty { at(lastTrashCheck + 5) }
+        } else if versionPending {
+            at(lastVersionBump + hiddenVersionInterval)
+        }
+        if marksUnsaved { at(lastMarksSave + 1) }
+        if phase == .live, !marksRestored, !showsSavedScan { at(now) }
+        if let t = saveDue(p, onScreen: onScreen) { at(t) }
+        arm(due, now: now)
+    }
+
+    /// One one-shot timer, at `due` (now, if that's passed). A timer already
+    /// set for no later than that stays: it'll look again when it fires.
+    private func arm(_ due: TimeInterval, now: TimeInterval) {
+        guard due < .infinity else { return cancelTimer() }
+        let fire = max(due, now)
+        if timer != nil, let armed = timerFire, armed <= fire + Self.slack { return }
+        timer?.invalidate()
+        let delay = fire - now
+        let t = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
+        }
+        t.tolerance = min(1, max(0.004, delay * 0.15))
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        timerFire = fire
+    }
+
+    private func cancelTimer() {
+        timer?.invalidate()
+        timer = nil
+        timerFire = nil
+    }
+
+    /// Sets the timer again after something started work or changed what's
+    /// due. Inside a tick, the tick does that on its way out.
+    private func rearm() {
+        guard started, !inTick, residency == .awake, !closed else { return }
+        schedule(tree.progress, now: ProcessInfo.processInfo.systemUptime)
+    }
+
+    /// When the timer next fires (system uptime), or nil if nothing is due.
+    var nextTick: TimeInterval? { timerFire }
+
+    /// How many busy folders are waiting for their paced refresh.
+    var pacedRefreshes: Int { dueAt.count }
+    /// When a paced refresh was last let through (system uptime), for tests.
+    @ObservationIgnored private(set) var lastPacedRelease: TimeInterval?
+
+    private func bumpVersion(_ now: TimeInterval) {
+        version += 1
+        lastVersionBump = now
+        versionPending = false
+    }
+
+    private func bumpQuiet(_ now: TimeInterval) {
+        quietSource = version
+        lastQuietBump = now
+        quietVersion += 1
+    }
+
+    /// After something the user did (a mark, a trash, a delete): show its
+    /// effect now instead of on the next beat, in the views that follow
+    /// `quietVersion` too. That restarts the quiet pacing, so no second
+    /// quiet bump follows right behind; user actions are too rare for this
+    /// to cost anything at rest.
+    private func showChangesNow() {
+        guard residency == .awake else { return }
+        if isOnScreen {
+            let now = ProcessInfo.processInfo.systemUptime
+            bumpVersion(now)
+            bumpQuiet(now)
+        } else {
+            versionPending = true
+        }
+        rearm()
+    }
+
+    /// Back on screen: show what changed meanwhile, and do what waited.
+    private func cameOnScreen() {
+        guard started else { return } // `start` does all this
+        guard residency == .awake, !closed else { return } // waking: `wake` does this when it's done
+        let now = ProcessInfo.processInfo.systemUptime
+        releaseDueRefreshes(now: .infinity)
+        releaseDeferredDeep(now: now)
+        if unshown || versionPending || version != quietSource {
+            unshown = false
+            notifyListeners()
+            bumpVersion(now)
+            bumpQuiet(now)
+        }
+        if marksDirty { recomputeMarks() }
+        if now - lastCapacityCheck >= 3 { checkCapacity(now: now) }
+        rearm()
+    }
+
+    /// Keeps App Nap from slowing work someone is waiting on, and lets it
+    /// back as soon as that's done.
+    private func holdBusyActivity(_ busy: Bool) {
+        if busy, busyActivity == nil {
+            busyActivity = ProcessInfo.processInfo.beginActivity(
+                options: .userInitiatedAllowingIdleSystemSleep, reason: "Scanning \(title)")
+        } else if !busy, let activity = busyActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            busyActivity = nil
+        }
+    }
+
+    /// Tells the window an off-screen session could park now.
+    private func noteIfSettled(_ p: silt_progress? = nil) {
+        guard !isOnScreen, hiddenSince != nil, let onSettled, canPark(p) else { return }
+        onSettled()
+    }
+
+    // MARK: Snapshots
+
+    /// When the snapshot should next be saved, if it should: soon after a
+    /// scan settles (on screen or not), then at most every 30 minutes while
+    /// on screen and changed (FSEvents replay covers the rest; quitting and
+    /// closing save too). A save needs the scanner idle, so while it's busy
+    /// this waits for the tick that sees it finish. Failures retry, further
+    /// apart each time.
+    private func saveDue(_ p: silt_progress, onScreen: Bool) -> TimeInterval? {
+        guard keepsHistory, phase == .live, !showsSavedScan, !saving, residency == .awake, !closed, p.idle,
+              tree.generation != savedGeneration else { return nil }
+        let retry = lastSaveAttempt + min(1800, 5 * Double(1 << min(failedSaves, 9)))
+        if saveSoon { return retry }
+        guard onScreen else { return nil }
+        return max(lastSave + 1800, retry)
     }
 
     private func saveSnapshot(now: TimeInterval, generation: UInt64) {
         saving = true
         lastSaveAttempt = now
-        let tree = tree, url = url, eventId = lastEventId, fda = fullDiskAccess
-        Task { [weak self] in
-            let ok = await Task.detached(priority: .utility) {
-                let ok = Snapshots.save(tree, url: url, eventId: eventId, fullDiskAccess: fda)
-                malloc_zone_pressure_relief(nil, 0) // the save's buffers were big and short-lived
-                return ok
-            }.value
-            self?.saving = false
-            if ok {
-                self?.savedGeneration = generation
-                self?.lastSave = ProcessInfo.processInfo.systemUptime
+        let tree = tree, url = url, eventId = safeEventId, fda = fullDiskAccess
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            // A refresh may have started since the tick saw the scanner idle.
+            // A tree with a listing pending can't be saved; that's not a
+            // failure worth backing off for, just a save for the next idle.
+            let idle = tree.progress.idle
+            let ok = idle && Snapshots.save(tree, url: url, eventId: eventId, fullDiskAccess: fda)
+            let unsettled = !ok && (!idle || tree.withLock { tree.dir(0).pending != 0 })
+            malloc_zone_pressure_relief(nil, 0) // the save's buffers were big and short-lived
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.saving = false
+                    if ok {
+                        self.savedGeneration = generation
+                        self.lastSave = ProcessInfo.processInfo.systemUptime
+                        self.saveSoon = false
+                        self.failedSaves = 0
+                    } else if !unsettled {
+                        self.failedSaves += 1
+                    }
+                    self.rearm()
+                    self.noteIfSettled()
+                }
             }
         }
     }
 
+    /// The event id a save is current as of: the newest one applied, or just
+    /// before the first change still waiting in a paced or deferred refresh,
+    /// so that a relaunch replays it.
+    private var safeEventId: FSEventStreamEventId {
+        var id = lastEventId
+        for w in dueAt.values where w.event > 0 { id = min(id, w.event - 1) }
+        for e in deferredDeep.values where e > 0 { id = min(id, e - 1) }
+        return id
+    }
+
     /// At quit: save synchronously if anything changed since the last save.
-    /// (A parked location's snapshot was brought up to date when it parked.)
+    /// (A parked location relies on its last snapshot, which FSEvents can
+    /// bring up to date; see `park`.)
     func saveSnapshotNow() {
-        guard isAwake, phase == .live, !showsSavedScan, tree.generation != savedGeneration else { return }
-        if Snapshots.save(tree, url: url, eventId: lastEventId, fullDiskAccess: fullDiskAccess) {
-            savedGeneration = tree.generation
+        guard !closed, isAwake, keepsHistory, phase == .live, !showsSavedScan else { return }
+        let generation = tree.generation
+        guard generation != savedGeneration else { return }
+        if Snapshots.save(tree, url: url, eventId: safeEventId, fullDiskAccess: fullDiskAccess) {
+            savedGeneration = generation
         }
     }
 
@@ -481,7 +836,10 @@ final class Session: Identifiable {
         (try? url.resourceValues(forKeys: [.volumeUUIDStringKey]))?.volumeUUIDString
     }
 
+    // MARK: File-system events
+
     private func startWatching(since: FSEventStreamEventId?) {
+        watcher?.stop()
         let w = Session.makeWatcher(path: url.path, since: since, session: self)
         watcher = w
         if since == nil { lastEventId = w.startId }
@@ -495,15 +853,17 @@ final class Session: Identifiable {
         }
     }
 
-    private func handle(_ events: [FSWatcher.Event]) {
+    /// Events from the stream (tests feed it directly).
+    func handle(_ events: [FSWatcher.Event]) {
+        guard !closed else { return } // one in flight when it closed
         // Parked (or on the way in or out): remember which folders changed,
         // once each, and catch up on waking.
         if residency != .awake {
             for e in events {
                 parkedMaxEventId = max(parkedMaxEventId, e.id)
-                // A remount or wrapped ids needs its own handling on waking,
-                // however many other changes pile up.
-                if e.rootChanged || e.idsWrapped { parkedSpecial.append(e) }
+                // A remount, wrapped ids or the end of a replay needs its own
+                // handling on waking, however many other changes pile up.
+                if e.rootChanged || e.idsWrapped || e.historyDone { parkedSpecial.append(e) }
                 guard !parkedOverflow else { continue }
                 if let old = parkedEvents[e.path] {
                     parkedEvents[e.path] = FSWatcher.Event(path: e.path, flags: old.flags | e.flags, id: max(old.id, e.id))
@@ -523,20 +883,23 @@ final class Session: Identifiable {
             heldEvents.append(contentsOf: events)
             return
         }
-        apply(events)
+        // Replayed history is what a catch-up waits on; live changes are
+        // background work.
+        apply(events, urgent: catchingUp)
+        rearm()
     }
 
     private func releaseHeldEvents() {
         let events = heldEvents
         heldEvents = []
-        apply(events)
+        apply(events, urgent: false)
     }
 
-    private func apply(_ events: [FSWatcher.Event]) {
+    private func apply(_ events: [FSWatcher.Event], urgent: Bool) {
         guard !events.isEmpty else { return }
-        var targets: [UInt32: Bool] = [:]
+        var targets: [UInt32: (deep: Bool, event: FSEventStreamEventId)] = [:]
         let root = url.path
-        var rootChanged = false, wrapped = false
+        var rootEvent: FSEventStreamEventId?, wrapEvent: FSEventStreamEventId?
         for event in events {
             if event.id > lastEventId && event.id != UInt64(kFSEventStreamEventIdSinceNow) { lastEventId = event.id }
             if event.historyDone {
@@ -544,79 +907,107 @@ final class Session: Identifiable {
                 lastGeneration = .max // rows drawn as out of date should look again
                 reportLive()
             }
-            if event.rootChanged { rootChanged = true }
-            if event.idsWrapped { wrapped = true }
+            if event.rootChanged, rootEvent == nil { rootEvent = event.id }
+            if event.idsWrapped, wrapEvent == nil { wrapEvent = event.id }
         }
-        if rootChanged {
+        if let rootEvent {
             // Usually a volume that unmounted and came back: same volume (by
             // UUID, since the device number can change) and same root inode.
             // Reattach and check the top level; anything else is a different
             // tree at this path, so revalidate all of it.
             var st = stat()
-            let same = lstat(root, &st) == 0 && st.st_ino == rootInode
-                && rootVolume != nil && Session.volumeUUID(url) == rootVolume
-            watcher?.stop()
+            let inode = lstat(root, &st) == 0 ? st.st_ino : 0
+            let volume = Session.volumeUUID(url)
+            let same = inode == rootInode && rootVolume != nil && volume == rootVolume
             startWatching(since: lastEventId)
-            if same { tree.refresh(dir: 0, deep: false, urgent: true) } else { requestDeep(0) }
+            if same {
+                tree.refresh(dir: 0, deep: false, urgent: urgent)
+            } else {
+                if inode != 0, volume != nil {
+                    rootInode = inode
+                    rootVolume = volume
+                }
+                requestDeep(0, event: rootEvent, urgent: urgent)
+            }
         }
-        if wrapped { requestDeep(0) }
+        if let wrapEvent { requestDeep(0, event: wrapEvent, urgent: urgent) }
         var sizes: [UInt32: UInt32] = [:]
         tree.withLock {
             for event in events {
                 if event.rootChanged || event.historyDone { continue }
                 guard let dir = nearestListedDir(for: event.path, root: root) else { continue }
-                targets[dir] = (targets[dir] ?? false) || event.mustScanSubdirs
+                let known = targets[dir]
+                targets[dir] = ((known?.deep ?? false) || event.mustScanSubdirs, min(known?.event ?? .max, event.id))
                 sizes[dir] = tree.dir(dir).count
             }
         }
         let now = ProcessInfo.processInfo.systemUptime
-        for (dir, deep) in targets {
-            if deep { requestDeep(dir) } else { refreshPaced(dir, children: sizes[dir] ?? 0, now: now) }
+        for (dir, t) in targets {
+            if t.deep {
+                requestDeep(dir, event: t.event, urgent: urgent)
+            } else {
+                refreshPaced(dir, children: sizes[dir] ?? 0, now: now, urgent: urgent, event: t.event)
+            }
         }
     }
 
     /// Re-lists `dir` now, or once its pace allows: at most every 40 µs per
     /// child (a 60,000-file build folder every 2.4 s), capped at 5 s. Small
     /// folders are never held back.
-    private func refreshPaced(_ dir: UInt32, children: UInt32, now: TimeInterval) {
+    private func refreshPaced(_ dir: UInt32, children: UInt32, now: TimeInterval, urgent: Bool,
+                              event: FSEventStreamEventId) {
         let gap = min(5, Double(children) * 40e-6)
         guard gap >= 0.1 else {
-            tree.refresh(dir: dir, deep: false, urgent: true)
+            tree.refresh(dir: dir, deep: false, urgent: urgent)
             return
         }
         if let last = listedAt[dir], now - last < gap {
-            if dueAt[dir] == nil { dueAt[dir] = last + gap }
+            if dueAt[dir] == nil { dueAt[dir] = (last + gap, event) }
             return
         }
         listedAt[dir] = now
-        tree.refresh(dir: dir, deep: false, urgent: true)
+        dueAt[dir] = nil // this listing covers whatever was waiting
+        tree.refresh(dir: dir, deep: false, urgent: urgent)
     }
 
+    /// Paced refreshes whose time has come (all of them, with `.infinity`).
     private func releaseDueRefreshes(now: TimeInterval) {
+        let clock = ProcessInfo.processInfo.systemUptime
         if !dueAt.isEmpty {
-            for (dir, due) in dueAt where due <= now {
-                dueAt.removeValue(forKey: dir)
-                listedAt[dir] = now
-                tree.refresh(dir: dir, deep: false, urgent: true)
+            for (dir, due) in dueAt where due.at <= now + Self.slack {
+                dueAt[dir] = nil
+                lastPacedRelease = clock
+                listedAt[dir] = clock
+                tree.refresh(dir: dir, deep: false, urgent: false)
             }
         }
         // Forget folders that have gone quiet.
         if listedAt.count > 256 {
-            listedAt = listedAt.filter { now - $0.value < 10 }
+            listedAt = listedAt.filter { clock - $0.value < 10 }
         }
     }
 
     /// FSEvents asks for a subtree revalidation when it coalesced or dropped
     /// events. On a busy disk that can arrive in bursts, so each folder is
     /// revalidated at most every 30 s; requests in between are deferred.
-    private func requestDeep(_ dir: UInt32) {
+    private func requestDeep(_ dir: UInt32, event: FSEventStreamEventId, urgent: Bool) {
         let now = ProcessInfo.processInfo.systemUptime
         if let last = deepAt[dir], now - last < 30 {
-            deferredDeep.insert(dir)
+            if deferredDeep[dir] == nil { deferredDeep[dir] = event }
             return
         }
         deepAt[dir] = now
-        startRescan(dir, explicit: false)
+        startRescan(dir, explicit: false, urgent: urgent)
+    }
+
+    /// Deferred deep checks whose 30 s wait is over.
+    private func releaseDeferredDeep(now: TimeInterval) {
+        guard !deferredDeep.isEmpty, rescanBase == nil else { return }
+        for dir in deferredDeep.keys where now - (deepAt[dir] ?? 0) >= 30 - Self.slack {
+            deferredDeep[dir] = nil
+            deepAt[dir] = now
+            startRescan(dir, explicit: false, urgent: false)
+        }
     }
 
     /// Lock held.
@@ -652,22 +1043,31 @@ final class Session: Identifiable {
         guard isAwake else { return }
         let dir = ref?.dir ?? 0
         guard dir != NONE else { return }
-        startRescan(dir, explicit: true)
+        startRescan(dir, explicit: true, urgent: true)
     }
 
-    private func startRescan(_ dir: UInt32, explicit: Bool) {
+    /// `urgent`: someone is waiting on it (a rescan they asked for, a saved
+    /// scan being rechecked, a catch-up on screen); otherwise it's background
+    /// work, like any other FSEvents refresh.
+    private func startRescan(_ dir: UInt32, explicit: Bool, urgent: Bool) {
         let p = tree.progress
         let total = tree.withLock { Int(tree.dir(dir).items) }
-        if rescanBase == nil || explicit {
-            rescanBase = (p.listed, max(total, 1))
+        if rescanBase == nil || explicit || (urgent && rescanBase?.urgent == false) {
+            rescanBase = RescanBase(listed: p.listed, total: max(total, 1), urgent: urgent)
             rescanState = RescanState(fraction: 0, explicit: explicit || (rescanState?.explicit ?? false))
         }
-        tree.refresh(dir: dir, deep: true, urgent: true)
+        tree.refresh(dir: dir, deep: true, urgent: urgent)
+        if urgent { holdBusyActivity(true) }
+        rearm()
     }
 
     private func tickRescan(_ p: silt_progress, now: TimeInterval) {
         if let base = rescanBase {
-            if p.idle {
+            // A rescan someone waits on ends with its urgent work (which
+            // counts everything the refresh leads to), even while background
+            // refreshes carry on.
+            let done = base.urgent ? p.urgent_queued == 0 : p.idle
+            if done {
                 let wasExplicit = rescanState?.explicit ?? false
                 rescanBase = nil
                 rescanState = nil
@@ -675,11 +1075,14 @@ final class Session: Identifiable {
                     // Every folder has been listed since: the saved scan is
                     // fully replaced, and worth saving again.
                     recheckingSince = nil
-                    lastSave = 0
+                    saveSoon = true
                     lastGeneration = .max
                     reportLive()
                 }
                 if wasExplicit {
+                    // What it corrected must reach the snapshot: parking
+                    // skips saving while the old one is still replayable.
+                    saveSoon = true
                     show(Toast(symbol: "checkmark.circle", title: "Rescan complete",
                                detail: "\(Fmt.count(stats.items)) items · \(Fmt.bytes(stats.bytes))"))
                 }
@@ -690,14 +1093,9 @@ final class Session: Identifiable {
                 }
             }
         }
-        // Deferred background checks whose quiet period has passed.
-        if !deferredDeep.isEmpty, rescanBase == nil {
-            for dir in deferredDeep where now - (deepAt[dir] ?? 0) >= 30 {
-                deferredDeep.remove(dir)
-                deepAt[dir] = now
-                startRescan(dir, explicit: false)
-            }
-        }
+        // Deferred background checks whose quiet period has passed; off
+        // screen they wait until the session is back.
+        if isOnScreen { releaseDeferredDeep(now: now) }
     }
 
     // MARK: Resolution
@@ -856,6 +1254,10 @@ final class Session: Identifiable {
         for t in done { tree.remove(entry: t.entry) }
         refreshParents(of: items)
         selection = []
+        if !done.isEmpty, isAwake {
+            showChangesNow()
+            checkCapacity(now: ProcessInfo.processInfo.systemUptime, exact: true)
+        }
         let bytes = done.reduce(Int64(0)) { $0 + $1.size }
         trashedBytes += bytes
         if done.isEmpty, let error {
@@ -889,21 +1291,25 @@ final class Session: Identifiable {
         b.hasDestructiveAction = true
         alert.addButton(withTitle: "Cancel")
         let run: (NSApplication.ModalResponse) -> Void = { [weak self] r in
-            guard r == .alertFirstButtonReturn else { return }
-            let before = self?.capacity?.available ?? 0
+            guard r == .alertFirstButtonReturn, let url = self?.url else { return }
+            let estimate = self?.capacity?.available ?? 0
             DispatchQueue.global(qos: .userInitiated).async {
+                // Exact figures on both sides (they're slow, so not on the
+                // main thread): the estimate between checks could be off.
+                let before = Locations.volumeCapacity(for: url)?.available ?? estimate
                 var error: NSDictionary?
                 NSAppleScript(source: "tell application \"Finder\" to empty trash")?.executeAndReturnError(&error)
                 let message = error?[NSAppleScript.errorMessage] as? String
+                let after = Locations.volumeCapacity(for: url)
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
                         guard let self else { return }
-                        self.capacity = Locations.volumeCapacity(for: self.url)
+                        if let after { self.adoptExactCapacity(after) }
                         self.recountTrash()
                         if let message {
                             self.show(Toast(symbol: "exclamationmark.triangle", title: "Couldn’t empty the Trash", detail: message))
                         } else {
-                            let gained = (self.capacity?.available ?? before) - before
+                            let gained = (after?.available ?? before) - before
                             self.freedBytes += max(0, gained)
                             self.show(Toast(symbol: "checkmark.circle", title: "Emptied the Trash",
                                             detail: gained > 0 ? "\(Fmt.bytes(gained)) freed" : nil))
@@ -932,7 +1338,9 @@ final class Session: Identifiable {
                 if e != NONE, tree.entry(e).isDir { dirs.insert(tree.entry(e).aux) }
             }
         }
+        // The user is waiting to see these come back.
         for d in dirs { tree.refresh(dir: d, deep: false, urgent: true) }
+        rearm()
         show(Toast(symbol: "arrow.uturn.backward", title: restored == moves.count
                        ? "Put back \(restored == 1 ? "1 item" : "\(restored) items")"
                        : "Put back \(restored) of \(moves.count) items",
@@ -977,6 +1385,7 @@ final class Session: Identifiable {
         // Optimistic: the rows disappear now; failures come back on refresh.
         for t in items { tree.remove(entry: t.entry) }
         selection = []
+        showChangesNow()
         show(Toast(symbol: "hourglass", title: "Deleting…", detail: nil))
         Task.detached(priority: .userInitiated) {
             var failures: [URL: String] = [:]
@@ -990,7 +1399,7 @@ final class Session: Identifiable {
                 let bytes = done.reduce(Int64(0)) { $0 + $1.size }
                 self.freedBytes += bytes
                 self.refreshParents(of: items)
-                self.capacity = Locations.volumeCapacity(for: self.url)
+                self.checkCapacity(now: ProcessInfo.processInfo.systemUptime, exact: true)
                 if let first = failed.first {
                     self.show(Toast(symbol: "exclamationmark.triangle",
                                     title: "Couldn’t delete \(first.key.lastPathComponent)", detail: first.value))
@@ -1030,7 +1439,9 @@ final class Session: Identifiable {
         tree.withLock {
             for t in items { dirs.insert(tree.entry(t.entry).parent) }
         }
+        // Urgent: these reconcile what the user just did.
         for d in dirs where d != NONE { tree.refresh(dir: d, deep: false, urgent: true) }
+        rearm()
     }
 
     private func refuse(_ names: [String]) {
@@ -1088,7 +1499,20 @@ final class Session: Identifiable {
         let label: String
     }
 
-    var activity: Activity? {
+    /// Stored, and only moved when its label changes or its fraction moves
+    /// by a quarter of a percent, so what draws it doesn't redraw every tick.
+    private(set) var activity: Activity?
+
+    private func updateActivity() {
+        guard started else { return } // see `start`
+        let next = currentActivity
+        guard next != activity else { return }
+        if let next, let shown = activity, next.label == shown.label, let a = next.fraction, let b = shown.fraction,
+           abs(a - b) < 0.0025 { return }
+        activity = next
+    }
+
+    private var currentActivity: Activity? {
         if residency == .waking || (residency == .parking && wakeWhenParked) {
             return Activity(fraction: nil, label: "Loading")
         }
@@ -1114,13 +1538,60 @@ final class Session: Identifiable {
         return hidden?.total ?? 0
     }
 
+    /// Refreshes `capacity`: total and free from statfs (microseconds);
+    /// the purgeable share behind `available` is measured exactly off the
+    /// main thread at most once a minute, or right away with `exact` (after
+    /// a trash, a delete or Empty Trash), and estimated in between.
+    private func checkCapacity(now: TimeInterval, exact: Bool = false) {
+        lastCapacityCheck = now
+        if let quick = Locations.quickCapacity(for: url.path) {
+            let available = min(quick.total, max(0, quick.free + (purgeable ?? 0)))
+            let next = Capacity(total: quick.total, available: available, free: quick.free)
+            if capacity.map({ $0.differsVisibly(from: next) }) ?? true { capacity = next }
+        }
+        measureHidden(now: now)
+        if exact || now - lastExactCapacity >= 60 { measureCapacity(now: now) }
+    }
+
+    private func measureCapacity(now: TimeInterval) {
+        guard !measuringCapacity else {
+            measureCapacityAgain = true // what's under way may predate the change
+            return
+        }
+        measuringCapacity = true
+        lastExactCapacity = now
+        let url = url
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let exact = Locations.volumeCapacity(for: url)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.measuringCapacity = false
+                    if let exact { self.adoptExactCapacity(exact) }
+                    if self.measureCapacityAgain, !self.closed {
+                        self.measureCapacityAgain = false
+                        self.measureCapacity(now: ProcessInfo.processInfo.systemUptime)
+                    }
+                }
+            }
+        }
+    }
+
+    private func adoptExactCapacity(_ exact: Capacity) {
+        purgeable = exact.available - exact.free
+        if exact != capacity { capacity = exact }
+        measureHidden(now: ProcessInfo.processInfo.systemUptime)
+    }
+
     /// Re-measures the hidden space; local snapshots are listed every few
-    /// minutes, off the main thread.
+    /// minutes, off the main thread. Only on screen: it's redone when the
+    /// session comes back.
     fileprivate func measureHidden(now: TimeInterval) {
         guard isVolume, phase == .live, let capacity else {
             if hidden != nil { hidden = nil }
             return
         }
+        guard isOnScreen, residency == .awake else { return }
         if now - lastSnapshotCheck > 180 {
             lastSnapshotCheck = now
             let path = url.path
@@ -1174,6 +1645,33 @@ extension Session {
         }
     }
 
+    /// Where a file mark was found, and its folder's run at the time.
+    struct MarkSpot {
+        let entry: UInt32 // NONE: it wasn't there
+        let first: UInt32
+        let count: UInt32
+        let version: UInt32
+    }
+
+    /// Lock held. `resolve`, remembering where file marks were found: a
+    /// folder whose run hasn't changed (same place, size and version) still
+    /// has each file at the same index, so it needn't be searched again.
+    fileprivate func resolveCached(_ key: MarkKey) -> UInt32? {
+        guard case .file(let parent, _) = key else { return resolve(key) }
+        guard parent < tree.raw.pointee.dir_count, tree.isLive(tree.dirEntry(parent)) else {
+            markSpots[key] = nil
+            return nil
+        }
+        let d = tree.dir(parent)
+        if let spot = markSpots[key], spot.first == d.first, spot.count == d.count, spot.version == d.version {
+            guard spot.entry != NONE, !tree.entry(spot.entry).isRemoved else { return nil }
+            return spot.entry
+        }
+        let found = resolve(key)
+        markSpots[key] = MarkSpot(entry: found ?? NONE, first: d.first, count: d.count, version: d.version)
+        return found
+    }
+
     /// The live item at `path`, if the scan has it.
     func liveRef(path: String) -> ItemRef? {
         tree.withLock {
@@ -1195,7 +1693,7 @@ extension Session {
     /// Paths of everything marked, for views that check many rows at once.
     func markedPaths() -> Set<String> {
         guard !marks.isEmpty else { return [] }
-        return tree.withLock { Set(marks.keys.compactMap { resolve($0).map { tree.path(of: $0) } }) }
+        return tree.withLock { Set(marks.keys.compactMap { resolveCached($0).map { tree.path(of: $0) } }) }
     }
 
     func isMarked(_ ref: ItemRef) -> Bool {
@@ -1254,6 +1752,23 @@ extension Session {
         mark(tree.withLock { entries.filter { tree.isLive($0) }.map { ref(forEntry: $0) } }, reason: reason)
     }
 
+    /// Marks duplicate copies by the identity they were checked against
+    /// (`DuplicateFinder.extraCopies`), without looking each up on disk again.
+    func mark(copies: [DuplicateSet.Copy], reason: String) {
+        guard isAwake, !copies.isEmpty else { return }
+        let found: [(MarkKey, DuplicateSet.Copy)] = tree.withLock {
+            copies.compactMap { c in
+                let i = tree.lookup(c.path)
+                guard i != NONE, tree.isLive(i), let k = markKey(for: ref(forEntry: i)) else { return nil }
+                return (k, c)
+            }
+        }
+        for (k, c) in found where marks[k] == nil {
+            marks[k] = MarkInfo(reason: reason, dev: c.stamp.dev, ino: c.stamp.ino)
+        }
+        marksChanged()
+    }
+
     func unmark(_ keys: [MarkKey]) {
         guard isAwake else { return }
         for k in keys { marks.removeValue(forKey: k) }
@@ -1269,7 +1784,8 @@ extension Session {
     private func marksChanged() {
         recomputeMarks()
         notifyListeners()
-        persistMarks()
+        persistMarksSoon()
+        showChangesNow()
     }
 
     struct MarkedItem: Identifiable {
@@ -1288,7 +1804,7 @@ extension Session {
         var live: [(MarkKey, UInt32)] = []
         var markedDirs = Set<UInt32>()
         for key in marks.keys {
-            guard let i = resolve(key) else { continue }
+            guard let i = resolveCached(key) else { continue }
             live.append((key, i))
             if case .dir(let d) = key { markedDirs.insert(d) }
         }
@@ -1344,13 +1860,13 @@ extension Session {
         return false
     }
 
-    /// The running total. Cheap (no paths, no sorting, no disk access) and
-    /// throttled while the tree is churning.
-    func recomputeMarks(force: Bool = true) {
-        let now = ProcessInfo.processInfo.systemUptime
-        if !force && now - lastMarksRecompute < 0.5 { return }
-        lastMarksRecompute = now
+    /// The running total. Cheap (no paths, no sorting, no disk access, and
+    /// file marks found again only in folders whose run changed); while the
+    /// tree churns, `tick` runs it at most every half second.
+    func recomputeMarks() {
+        lastMarksRecompute = ProcessInfo.processInfo.systemUptime
         marksDirty = false
+        if markSpots.count > marks.count * 2 + 64 { markSpots = markSpots.filter { marks[$0.key] != nil } }
         guard !marks.isEmpty else {
             if markedCount != 0 || markedBytes != 0 {
                 markedCount = 0
@@ -1405,13 +1921,27 @@ extension Session {
     fileprivate var marksDefaultsKey: String { "marks:" + url.path }
 
     /// Marks survive a relaunch: saved by path and identity, restored when
-    /// the same objects are still there.
+    /// the same objects are still there. Written at once, unless the last
+    /// write was under a second ago: then `tick` writes them when that's up
+    /// (and parking, closing and quitting flush them).
+    fileprivate func persistMarksSoon() {
+        marksUnsaved = true
+        if ProcessInfo.processInfo.systemUptime - lastMarksSave >= 1 { persistMarks() } else { rearm() }
+    }
+
+    /// Writes marks that are waiting to be saved.
+    func flushMarks() {
+        if marksUnsaved { persistMarks() }
+    }
+
     fileprivate func persistMarks() {
         // A parked tree resolves nothing; what's saved stays as it is.
         guard isAwake else { return }
+        marksUnsaved = false
+        lastMarksSave = ProcessInfo.processInfo.systemUptime
         let entries: [[String: Any]] = tree.withLock {
             marks.compactMap { key, info in
-                guard let i = resolve(key) else { return nil }
+                guard let i = resolveCached(key) else { return nil }
                 return ["path": tree.path(of: i), "reason": info.reason, "dev": Int(info.dev), "ino": Int(info.ino)]
             }
         }
@@ -1439,12 +1969,21 @@ extension Session {
 
     // MARK: Reclaim analysis
 
-    /// Re-runs the Reclaim analysis when the tree settles and has changed.
+    /// When the Reclaim analysis should run again, if the tree changed since
+    /// the last pass. Only for a session on screen: with the Reclaim pane
+    /// showing it waits ten times as long as the last pass took (at least
+    /// 3 s), so a disk that never stops changing can't keep it running;
+    /// otherwise it only feeds the overview's chip, once a minute.
+    fileprivate func analysisDue() -> TimeInterval? {
+        guard isOnScreen, residency == .awake, phase == .live, !analyzing, version != analyzedVersion,
+              rescanBase == nil else { return nil }
+        let gap = reclaimVisible ? max(3, analysisCost * 10) : max(60, analysisCost * 10)
+        return lastAnalysis + gap
+    }
+
+    /// Re-runs the Reclaim analysis when it's due.
     fileprivate func tickAnalysis(now: TimeInterval) {
-        // A disk that never stops changing would keep this running forever,
-        // so it waits ten times as long as the last pass took.
-        guard phase == .live, !analyzing, version != analyzedVersion,
-              now - lastAnalysis > max(3, analysisCost * 10), rescanBase == nil else { return }
+        guard let due = analysisDue(), due <= now + Self.slack else { return }
         analyzing = true
         lastAnalysis = now
         let v = version
@@ -1456,9 +1995,11 @@ extension Session {
             }.value
             guard let self else { return }
             self.analysisCost = ProcessInfo.processInfo.systemUptime - start
-            self.findings = result
+            if result != self.findings { self.findings = result }
             self.analyzedVersion = v
             self.analyzing = false
+            self.rearm()
+            self.noteIfSettled()
         }
     }
 }
@@ -1499,6 +2040,12 @@ extension Session {
         let delta = size - before
         guard abs(delta) >= 100_000_000, abs(delta) * 20 >= max(before, 1) else { return nil }
         return delta
+    }
+
+    /// Whether the changes since the baseline should be worked out again:
+    /// on screen, settled, and `quietVersion` moved since the last time.
+    fileprivate func changesDue(_ p: silt_progress) -> Bool {
+        isOnScreen && phase == .live && !catchingUp && p.idle && quietVersion != changesVersion && !baseline.isEmpty
     }
 
     fileprivate func computeChanges() {
@@ -1557,32 +2104,46 @@ extension Session {
         Session.parkDirectory.appendingPathComponent(id.uuidString + ".park").path
     }
 
-    /// Settled enough to put away: not scanning, rescanning, catching up or
-    /// about to re-list anything, and no duplicate search running.
-    var canPark: Bool {
-        guard residency == .awake, phase == .live, !catchingUp, rescanBase == nil, dueAt.isEmpty,
-              deferredDeep.isEmpty, heldEvents.isEmpty, !saving, !analyzing else { return false }
+    /// Settled enough to put away: not scanning, rescanning or catching up,
+    /// the scanner idle, and no save, analysis or duplicate search running.
+    /// Paced refreshes and deferred deep checks don't hold it back: they
+    /// stay pending and run on waking (dir ids survive parking).
+    var canPark: Bool { canPark(nil) }
+
+    fileprivate func canPark(_ progress: silt_progress?) -> Bool {
+        guard residency == .awake, !closed, phase == .live, !catchingUp, rescanBase == nil, heldEvents.isEmpty,
+              !saving, !analyzing else { return false }
         switch duplicates.phase {
         case .collecting, .comparing: return false
         default: break
         }
-        return tree.progress.idle
+        return (progress ?? tree.progress).idle
     }
 
     /// Writes the tree to a file and frees its memory. Everything that refers
     /// into it (marks, open folders, Reclaim results, duplicates) stays valid:
-    /// it comes back exactly as it was.
+    /// it comes back exactly as it was. A parked location has no timer, and
+    /// on a volume whose FSEvents history can be trusted, no stream either:
+    /// waking replays what changed meanwhile.
     func park() {
         guard canPark else { return }
+        flushMarks() // saving them needs the tree
         residency = .parking
-        let tree = tree, url = url, eventId = lastEventId, fda = fullDiskAccess, file = parkFile
+        cancelTimer()
+        holdBusyActivity(false)
+        let tree = tree, url = url, eventId = safeEventId, fda = fullDiskAccess, file = parkFile
         let generation = tree.generation
-        let refreshSnapshot = Snapshots.eligible(url) && generation != savedGeneration
+        let history = keepsHistory
+        let stale = history && generation != savedGeneration
         try? FileManager.default.createDirectory(at: Session.parkDirectory, withIntermediateDirectories: true)
         DispatchQueue.global(qos: .utility).async { [weak self] in
             tree.stopScanner()
-            // A relaunch should still open this instantly.
-            let saved = refreshSnapshot && Snapshots.save(tree, url: url, eventId: eventId, fullDiskAccess: fda)
+            // A relaunch should still open this instantly. A saved scan that
+            // FSEvents can bring up to date does that as well as a new one
+            // (and will for at least another day), so only save without one.
+            let saved = stale && !Snapshots.replayable(for: url, fullDiskAccess: fda, margin: 86400)
+                && Snapshots.save(tree, url: url, eventId: eventId, fullDiskAccess: fda)
+            let database = history ? FSWatcher.databaseID(for: url.path) : nil
             let parked = tree.park(to: file)
             if !parked { tree.resumeIdle() }
             malloc_zone_pressure_relief(nil, 0)
@@ -1594,13 +2155,49 @@ extension Session {
                     }
                     if saved { self.savedGeneration = generation }
                     self.residency = parked ? .parked : .awake
-                    if !parked { self.releaseParkedEvents() } // it stayed; catch up now
+                    if parked {
+                        self.duplicates.dropCache()
+                        if let database { self.stopWatchingWhileParked(database: database) }
+                    } else {
+                        self.releaseParkedEvents(urgent: false) // it stayed; catch up now
+                        self.rearm()
+                    }
                     if self.wakeWhenParked {
                         self.wakeWhenParked = false
                         self.wake()
                     }
                 }
             }
+        }
+    }
+
+    /// Parked on a volume whose history FSEvents keeps: the stream can go,
+    /// since waking replays everything after `lastEventId`.
+    private func stopWatchingWhileParked(database: [UInt8]) {
+        watcher?.stop()
+        watcher = nil
+        streamStopped = true
+        parkedAt = Date()
+        parkedDatabase = database
+        // The replay brings back whatever arrived while parking.
+        parkedEvents = [:]
+        parkedSpecial = []
+        parkedOverflow = false
+        parkedMaxEventId = 0
+    }
+
+    /// What a location's root is right now: which folder, on which volume,
+    /// and which FSEvents history its event ids belong to.
+    fileprivate struct RootIdentity: Sendable {
+        let inode: UInt64
+        let volume: String?
+        let database: [UInt8]?
+
+        init(_ url: URL) {
+            var st = stat()
+            inode = lstat(url.path, &st) == 0 ? st.st_ino : 0
+            volume = Session.volumeUUID(url)
+            database = FSWatcher.databaseID(for: url.path)
         }
     }
 
@@ -1613,11 +2210,12 @@ extension Session {
             wakeWhenParked = true
         case .parked:
             residency = .waking
-            let tree = tree, file = parkFile
+            let tree = tree, file = parkFile, url = url, replay = streamStopped
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let ok = tree.unpark(from: file)
                 if ok { tree.resumeIdle() }
                 try? FileManager.default.removeItem(atPath: file)
+                let root = replay ? RootIdentity(url) : nil
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
                         guard let self, !self.closed else { return }
@@ -1627,31 +2225,66 @@ extension Session {
                             self.onNeedsRebuild?()
                             return
                         }
+                        let now = ProcessInfo.processInfo.systemUptime
                         self.residency = .awake
                         self.lastGeneration = .max // everything showing it should look again
-                        self.releaseParkedEvents()
+                        if let root { self.resumeWatching(root) }
+                        // It's being woken to be shown: catching up is urgent.
+                        self.releaseParkedEvents(urgent: true)
+                        self.releaseDueRefreshes(now: .infinity)
+                        self.releaseDeferredDeep(now: now)
                         self.resolvePendingFocus()
-                        self.version += 1
-                        self.quietVersion += 1
+                        self.bumpVersion(now)
+                        self.bumpQuiet(now)
+                        self.rearm()
                     }
                 }
             }
         }
     }
 
-    private func releaseParkedEvents() {
+    /// Restarts the stream a parked location went without, replaying what
+    /// changed meanwhile. A root that was replaced (a replay may not show
+    /// it), a different FSEvents history, or longer parked than a snapshot
+    /// may be old mean no replay can be trusted: everything is checked
+    /// again instead.
+    private func resumeWatching(_ root: RootIdentity) {
+        guard streamStopped else { return }
+        streamStopped = false
+        let away = parkedAt.map { Date().timeIntervalSince($0) } ?? .infinity
+        let sameRoot = root.inode != 0 && root.inode == rootInode && rootVolume != nil && root.volume == rootVolume
+        let sameHistory = root.database != nil && root.database == parkedDatabase
+        parkedAt = nil
+        parkedDatabase = nil
+        if sameRoot, sameHistory, away < Snapshots.maxAge {
+            startWatching(since: lastEventId)
+            if watcher?.running == true {
+                catchingUp = true
+                holdBusyActivity(true)
+                return
+            }
+        }
+        if !sameRoot, root.inode != 0, root.volume != nil {
+            rootInode = root.inode
+            rootVolume = root.volume
+        }
+        startWatching(since: nil)
+        startRescan(0, explicit: false, urgent: true)
+    }
+
+    private func releaseParkedEvents(urgent: Bool) {
         let events = Array(parkedEvents.values)
         let special = parkedSpecial
         let overflow = parkedOverflow
         parkedEvents = [:]
         parkedSpecial = []
         parkedOverflow = false
-        if !special.isEmpty { apply(special) } // remounts: reattach the stream first
+        if !special.isEmpty { apply(special, urgent: urgent) } // remounts: reattach the stream first
         if overflow {
             lastEventId = max(lastEventId, parkedMaxEventId)
-            startRescan(0, explicit: false)
+            startRescan(0, explicit: false, urgent: urgent)
         } else if !events.isEmpty {
-            apply(events)
+            apply(events, urgent: urgent)
         }
     }
 

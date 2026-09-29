@@ -83,12 +83,18 @@ enum Pane: String, CaseIterable, Identifiable {
 enum ItemAction { case reveal, open, up, quickLook, copyPath, trash, delete, mark }
 
 /// Per-window state: which locations have been scanned and what is showing.
+///
+/// It also tells each scan whether it's on screen (the one showing, in a
+/// window that isn't covered, minimized or hidden with the app): scans off
+/// screen do only the work that keeps their tree current.
 @MainActor
 @Observable
 final class WindowModel {
     /// Scans held by this window. A location or folder inside one of them is
     /// shown from it rather than scanned again.
-    private(set) var sessions: [Session] = []
+    private(set) var sessions: [Session] = [] {
+        didSet { setNeedsSync() }
+    }
     /// The scan being shown. Whatever stops being shown starts its clock
     /// toward parking; whatever is shown wakes up.
     private(set) var current: Session? {
@@ -97,6 +103,7 @@ final class WindowModel {
             oldValue?.hiddenSince = ProcessInfo.processInfo.systemUptime
             current?.hiddenSince = nil
             current?.wake()
+            setNeedsSync()
         }
     }
     /// The location or folder on screen: `current`'s root, or a folder inside it.
@@ -106,13 +113,34 @@ final class WindowModel {
     private(set) var pending: String?
     /// Folders opened with Scan Folder… (sidebar locations aside), in order.
     private(set) var folders: [String] = []
-    var pane: Pane = .files
+    var pane: Pane = .files {
+        didSet { if pane != oldValue { setNeedsSync() } }
+    }
     var search = ""
     var showInspector = true
     var reviewingCleanup = false
     private(set) var locations: [Location] = Locations.all()
+    /// What purgeable space added to each volume's free space when last
+    /// measured, so a refresh can show an estimate instead of dropping to
+    /// plain free space until the next measurement lands.
+    @ObservationIgnored private var purgeable: [String: Int64] = [:]
     private(set) var hasFullDiskAccess = FullDiskAccess.isGranted
-    @ObservationIgnored weak var window: NSWindow?
+    /// Set by the view hierarchy once it's in a window.
+    @ObservationIgnored weak var window: NSWindow? {
+        didSet {
+            guard window !== oldValue else { return }
+            if window != nil { attach() }
+            observeWindow()
+            updateVisibility()
+        }
+    }
+    @ObservationIgnored private var windowObservers: [NSObjectProtocol] = []
+    @ObservationIgnored private var appObservers: [NSObjectProtocol] = []
+    @ObservationIgnored private var workspaceObservers: [NSObjectProtocol] = []
+    /// The window closed, and its scans with it.
+    @ObservationIgnored private var windowClosed = false
+    @ObservationIgnored private var attached = false
+    @ObservationIgnored private var syncQueued = false
 
     private static var active: [WeakModel] = []
     private static var pendingOpen: [URL] = []
@@ -136,14 +164,25 @@ final class WindowModel {
         if let i = CommandLine.arguments.firstIndex(of: "--search"), i + 1 < CommandLine.arguments.count {
             search = CommandLine.arguments[i + 1]
         }
-        let center = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
-            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.refreshLocations() }
-            }
+    }
+
+    /// Work only a model with a window does. SwiftUI builds this model in a
+    /// view's initializer, and builds (and throws away) another each time
+    /// that view is rebuilt: `init` stays cheap, and whatever it read would
+    /// become something the whole window is rebuilt for.
+    private func attach() {
+        guard !attached, !windowClosed else { return }
+        attached = true
+        for name in [NSApplication.didHideNotification, NSApplication.didUnhideNotification] {
+            appObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.updateVisibility() }
+            })
         }
-        parkTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.parkHidden(after: Self.parkAfter) }
+        let workspace = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
+            workspaceObservers.append(workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshLocations() }
+            })
         }
         let pressure = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
         pressure.setEventHandler { [weak self] in
@@ -151,29 +190,137 @@ final class WindowModel {
         }
         pressure.resume()
         memoryPressure = pressure
+        refineLocations()
+    }
+
+    /// Visibility and the park timer follow changes to what's shown, a turn
+    /// later (and once for several changes): changes can happen while
+    /// SwiftUI builds a view, where reading the scans' state would tie the
+    /// view to it.
+    private func setNeedsSync() {
+        guard !syncQueued else { return }
+        syncQueued = true
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.syncQueued = false
+                self.updateVisibility()
+                self.scheduleParking()
+            }
+        }
     }
 
     /// How long a location stays in memory after it's no longer on screen.
     private static let parkAfter: TimeInterval = 120
+    /// How often a scan that's due to park but busy is tried again (it's also
+    /// tried the moment it settles).
+    private static let parkRetry: TimeInterval = 15
     @ObservationIgnored private var parkTimer: Timer?
     @ObservationIgnored private var memoryPressure: DispatchSourceMemoryPressure?
 
     /// Puts away scans that have been out of sight for `after` seconds (all of
     /// them, right away, when macOS runs short of memory).
     private func parkHidden(after: TimeInterval) {
+        guard !windowClosed else { return }
         let now = ProcessInfo.processInfo.systemUptime
         for s in sessions where s !== current {
             guard let hidden = s.hiddenSince, now - hidden >= after, s.canPark else { continue }
             s.park()
         }
+        scheduleParking()
     }
 
-    /// Snapshots every live scan in every window (at quit), and clears away
-    /// parked trees.
+    /// Sets one timer for when the next hidden scan is due to park, or none
+    /// if every hidden one is parked already. One that's due but busy (or
+    /// still waking, or parking) is tried again now and then; it also parks
+    /// as soon as it settles (`onSettled`), and a wake finishing or a park
+    /// failing plans again (`onResidencyChange`).
+    private func scheduleParking() {
+        parkTimer?.invalidate()
+        parkTimer = nil
+        guard !windowClosed else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        var due = TimeInterval.infinity
+        for s in sessions where s !== current && s.residency != .parked && !s.closed {
+            guard let hidden = s.hiddenSince else { continue }
+            let at = hidden + Self.parkAfter
+            due = min(due, at > now && s.isAwake ? at : max(at, now + Self.parkRetry))
+        }
+        guard due < .infinity else { return }
+        let delay = due - now
+        let t = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.parkHidden(after: Self.parkAfter) }
+        }
+        t.tolerance = max(1, delay * 0.1)
+        RunLoop.main.add(t, forMode: .common)
+        parkTimer = t
+    }
+
+    /// Whether the window can be seen at all: the app isn't hidden, and the
+    /// window isn't minimized, fully covered or on another Space. With no
+    /// window yet (or none at all, in tests) it counts as seen.
+    private var windowShown: Bool {
+        if NSApp?.isHidden == true { return false }
+        guard let window else { return true }
+        return window.occlusionState.contains(.visible)
+    }
+
+    /// Tells each scan whether it's on screen, and whether its Reclaim pane is.
+    private func updateVisibility() {
+        guard !windowClosed else { return }
+        let shown = windowShown
+        for s in sessions {
+            let onScreen = shown && s === current
+            if s.isOnScreen != onScreen { s.isOnScreen = onScreen }
+            let reclaim = onScreen && pane == .reclaim
+            if s.reclaimVisible != reclaim { s.reclaimVisible = reclaim }
+        }
+    }
+
+    private func observeWindow() {
+        let center = NotificationCenter.default
+        for o in windowObservers { center.removeObserver(o) }
+        windowObservers = []
+        guard let window, !windowClosed else { return }
+        windowObservers.append(center.addObserver(forName: NSWindow.didChangeOcclusionStateNotification,
+                                                  object: window, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateVisibility() }
+        })
+        windowObservers.append(center.addObserver(forName: NSWindow.willCloseNotification,
+                                                  object: window, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.windowWillClose() }
+        })
+    }
+
+    /// The window's scans go with it. Each brings its snapshot up to date off
+    /// the main thread first; quitting waits for that.
+    private func windowWillClose() {
+        guard !windowClosed else { return }
+        windowClosed = true
+        parkTimer?.invalidate()
+        parkTimer = nil
+        let center = NotificationCenter.default
+        for o in windowObservers + appObservers { center.removeObserver(o) }
+        for o in workspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(o) }
+        windowObservers = []
+        appObservers = []
+        workspaceObservers = []
+        memoryPressure?.cancel()
+        memoryPressure = nil
+        // What's on screen is left as it is while the window animates away.
+        for s in sessions { s.close(saving: true) }
+    }
+
+    /// At quit: snapshots every live scan in every window, saves marks, waits
+    /// for saves that closing windows started, and clears away parked trees.
     static func saveAll() {
         for m in active.compactMap(\.model) {
-            for s in m.sessions { s.saveSnapshotNow() }
+            for s in m.sessions {
+                s.flushMarks()
+                s.saveSnapshotNow()
+            }
         }
+        _ = Session.closingSaves.wait(timeout: .now() + 60)
         try? FileManager.default.removeItem(at: Session.parkDirectory)
     }
 
@@ -218,9 +365,36 @@ final class WindowModel {
     }
 
     func refreshLocations() {
-        locations = Locations.all()
+        locations = Locations.all().map { l in
+            guard let extra = purgeable[l.id], let available = l.available else { return l }
+            return l.with(available: min(l.total ?? .max, available + extra))
+        }
         hasFullDiskAccess = FullDiskAccess.isGranted
         if let p = pending, !FileManager.default.fileExists(atPath: p) { pending = nil } // ejected
+        refineLocations()
+    }
+
+    /// Fills in each volume's available space counting what macOS can purge,
+    /// which is too slow to ask for on the main thread. Starts a turn later
+    /// (see `setNeedsSync`), and only for a model with a window.
+    private func refineLocations() {
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.attached, !self.windowClosed else { return }
+                let quick = self.locations
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    let refined = Locations.withImportantUsage(quick)
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated {
+                            guard let self else { return }
+                            self.purgeable.merge(refined.purgeable) { $1 }
+                            guard self.locations == quick, refined.locations != quick else { return }
+                            self.locations = refined.locations
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Picks a place in the sidebar or on the start screen. One that's
@@ -310,6 +484,16 @@ final class WindowModel {
         session.onNeedsRebuild = { [weak self, weak session] in
             guard let self, let session else { return }
             self.rebuild(session)
+        }
+        // A hidden scan that was busy when it was due to park parks as soon
+        // as it settles.
+        session.onResidencyChange = { [weak self] in self?.setNeedsSync() }
+        session.onSettled = { [weak self, weak session] in
+            guard let self, let session, !self.windowClosed, session !== self.current,
+                  let hidden = session.hiddenSince,
+                  ProcessInfo.processInfo.systemUptime - hidden >= Self.parkAfter else { return }
+            session.park()
+            self.scheduleParking()
         }
         session.onLive = { [weak self, weak session] in
             guard let self, let session else { return }

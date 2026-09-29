@@ -39,9 +39,9 @@ struct FileStamp: Hashable, Sendable {
         h.combine(size)
         h.combine(mtime.tv_sec)
         h.combine(mtime.tv_nsec)
+        h.combine(ctime.tv_sec)
+        h.combine(ctime.tv_nsec)
     }
-
-    var key: String { "\(dev):\(ino):\(size):\(mtime.tv_sec).\(mtime.tv_nsec):\(ctime.tv_sec).\(ctime.tv_nsec)" }
 }
 
 /// Files that share blocks on disk (APFS clones of each other, or one file
@@ -53,8 +53,8 @@ struct StorageFamily: Hashable, Sendable {
 }
 
 /// Files with identical contents in more than one place.
-struct DuplicateSet: Identifiable {
-    struct Copy: Identifiable {
+struct DuplicateSet: Identifiable, Equatable, Sendable {
+    struct Copy: Identifiable, Equatable, Sendable {
         let entry: UInt32
         let path: String
         let stamp: FileStamp
@@ -67,19 +67,28 @@ struct DuplicateSet: Identifiable {
         }
     }
 
+    /// The device and inode of one of the copies, fixed when the set is
+    /// found: every file is in at most one set, and unlike a path or an
+    /// entry index it doesn't change when a folder is relisted.
     let id: String
     let size: Int64 // bytes in one copy
-    var copies: [Copy]
-
-    /// Separately stored copies beyond the first.
-    var families: Int { Set(copies.map(\.family)).count }
+    let copies: [Copy]
+    /// How many separately stored copies there are (clones and hard links
+    /// of each other count once).
+    let families: Int
     /// Disk space the extra copies take: one allocation per storage family,
     /// minus the one that stays.
-    var extraBytes: Int64 {
+    let extraBytes: Int64
+
+    init(size: Int64, copies: [Copy], id: String? = nil) {
+        self.size = size
+        self.copies = copies
         var byFamily: [StorageFamily: Int64] = [:]
         for c in copies where byFamily[c.family] == nil { byFamily[c.family] = c.stamp.alloc }
+        families = byFamily.count
         let all = byFamily.values
-        return all.reduce(0, +) - (all.max() ?? 0)
+        extraBytes = all.reduce(0, +) - (all.max() ?? 0)
+        self.id = id ?? copies.map { ($0.stamp.dev, $0.stamp.ino) }.min { $0 < $1 }.map { "\($0.0):\($0.1)" } ?? ""
     }
 }
 
@@ -116,14 +125,18 @@ final class DuplicateFinder {
     }
 
     private(set) var phase: Phase = .idle
-    private(set) var sets: [DuplicateSet] = []
+    /// Largest extra space first.
+    private(set) var sets: [DuplicateSet] = [] {
+        didSet { extraBytes = sets.reduce(0) { $0 + $1.extraBytes } }
+    }
     /// The candidate list hit its cap, so some files weren't compared.
     private(set) var truncated = false
     var minSize: Int64 = 1_000_000
     var includeManaged = false
     var keepRule: KeepRule = .oldest
 
-    var extraBytes: Int64 { sets.reduce(0) { $0 + $1.extraBytes } }
+    /// Everything the extra copies take, across all sets.
+    private(set) var extraBytes: Int64 = 0
     var running: Bool {
         if case .comparing = phase { return true }
         return phase == .collecting
@@ -133,7 +146,12 @@ final class DuplicateFinder {
     @ObservationIgnored private var run = 0
     @ObservationIgnored private var stop: CancelFlag?
     @ObservationIgnored private let cache = HashCache()
+    /// Sets found but not yet shown: they're handed over in batches, so a
+    /// search that finds thousands doesn't re-render the list for each one.
+    @ObservationIgnored private let inbox = Inbox()
     nonisolated private static let candidateCap = 1_000_000
+    /// How long found sets wait to be shown together.
+    nonisolated private static let batchDelay: TimeInterval = 0.15
 
     /// Folders whose files are managed by a tool (duplicates there are normal,
     /// and deleting one breaks the tool's view of the world).
@@ -169,29 +187,68 @@ final class DuplicateFinder {
                 self.phase = .comparing(files: files, readBytes: read, totalBytes: total)
             }
         }
-        let found: @Sendable (DuplicateSet) async -> Void = { [weak self] set in
-            guard let finder = self else { return }
-            await finder.deliver(set, token: token)
+        let inbox = inbox
+        inbox.reset(token: token)
+        let found: @Sendable (DuplicateSet) -> Void = { [weak self] set in
+            // The first set of a batch schedules its delivery.
+            guard inbox.add(set, token: token) else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.batchDelay) {
+                MainActor.assumeIsolated { self?.deliver(token: token) }
+            }
         }
         let capped: @Sendable () async -> Void = { [weak self] in
             guard let finder = self else { return }
             await finder.markTruncated(token: token)
         }
         // The search is this task's own async work, so cancelling it reaches
-        // the reads; the flag reaches the parallel stat phase.
-        task = Task { [weak self] in
+        // the reads; the flag reaches the parallel stat phase. Hashing is
+        // background work: it runs at utility priority.
+        task = Task(priority: .utility) { [weak self] in
             await Self.find(tree: tree, minSize: min, includeManaged: managed, cache: cache, stop: flag,
                             progress: report, found: found, capped: capped)
-            // Results were awaited as they were found, so all have landed.
             guard let self, self.run == token, !Task.isCancelled else { return }
+            self.deliver(token: token) // whatever is still waiting
             self.phase = .done
         }
     }
 
-    private func deliver(_ set: DuplicateSet, token: Int) {
+    /// Shows the sets found since the last delivery.
+    private func deliver(token: Int) {
+        let batch = inbox.take(token: token)
         guard run == token else { return }
-        let at = sets.firstIndex { $0.extraBytes < set.extraBytes } ?? sets.count
-        sets.insert(set, at: at)
+        receive(batch)
+    }
+
+    /// Adds found sets to what's shown, in order (see `merge`).
+    func receive(_ batch: [DuplicateSet]) {
+        guard !batch.isEmpty else { return }
+        sets = Self.merge(sets, batch)
+    }
+
+    /// `sets` (largest extra space first) with `batch` merged in. Each new
+    /// set goes after every set already there with at least as much extra
+    /// space, and sets that tie keep the order they arrived in: the same
+    /// order as inserting them one by one, without the quadratic cost.
+    nonisolated static func merge(_ sets: [DuplicateSet], _ batch: [DuplicateSet]) -> [DuplicateSet] {
+        guard !batch.isEmpty else { return sets }
+        let incoming = batch.enumerated().sorted { a, b in
+            a.element.extraBytes != b.element.extraBytes ? a.element.extraBytes > b.element.extraBytes : a.offset < b.offset
+        }.map(\.element)
+        var out: [DuplicateSet] = []
+        out.reserveCapacity(sets.count + incoming.count)
+        var i = 0, j = 0
+        while i < sets.count, j < incoming.count {
+            if incoming[j].extraBytes > sets[i].extraBytes {
+                out.append(incoming[j])
+                j += 1
+            } else {
+                out.append(sets[i])
+                i += 1
+            }
+        }
+        out += sets[i...]
+        out += incoming[j...]
+        return out
     }
 
     private func markTruncated(token: Int) {
@@ -203,26 +260,46 @@ final class DuplicateFinder {
         task?.cancel()
         task = nil
         run += 1
+        inbox.reset(token: run) // a stopped run's stragglers are dropped
         phase = sets.isEmpty ? .idle : .done
+    }
+
+    /// Forgets remembered hashes (when the location is put away).
+    func dropCache() {
+        cache.removeAll()
     }
 
     /// Re-points copies at their current entries (entries move when a folder
     /// is relisted) and drops copies that are gone, and sets that are no
-    /// longer duplicates.
-    func prune(tree: Tree) {
-        guard !sets.isEmpty, !running else { return }
+    /// longer duplicates. `sets` is only reassigned when that changed
+    /// something; returns whether it did.
+    @discardableResult
+    func prune(tree: Tree) -> Bool {
+        guard !sets.isEmpty, !running else { return false }
+        var changed = false
         let next: [DuplicateSet] = tree.withLock {
             sets.compactMap { s in
-                var s = s
-                s.copies = s.copies.compactMap { c in
+                var copies: [DuplicateSet.Copy] = []
+                copies.reserveCapacity(s.copies.count)
+                var moved = false
+                for c in s.copies {
                     let i = tree.isLive(c.entry) ? c.entry : tree.lookup(c.path)
-                    guard i != NONE, tree.isLive(i) else { return nil }
-                    return DuplicateSet.Copy(entry: i, path: c.path, stamp: c.stamp, family: c.family)
+                    guard i != NONE, tree.isLive(i) else { continue }
+                    if i == c.entry {
+                        copies.append(c)
+                    } else {
+                        copies.append(DuplicateSet.Copy(entry: i, path: c.path, stamp: c.stamp, family: c.family))
+                        moved = true
+                    }
                 }
-                return s.copies.count > 1 && s.families > 1 ? s : nil
+                guard copies.count != s.copies.count || moved else { return s }
+                changed = true
+                let set = DuplicateSet(size: s.size, copies: copies, id: s.id)
+                return set.copies.count > 1 && set.families > 1 ? set : nil
             }
         }
-        sets = next
+        if changed { sets = next }
+        return changed
     }
 
     /// The copy `keepRule` would keep in `set`.
@@ -241,7 +318,16 @@ final class DuplicateFinder {
     /// compared (the kept copy too). Returns the paths, and how many were
     /// skipped because something changed since.
     nonisolated static func extras(of sets: [DuplicateSet], rule: KeepRule) -> (paths: [String], changed: Int) {
-        var paths: [String] = []
+        let found = extraCopies(of: sets, rule: rule)
+        return (found.copies.map(\.path), found.changed)
+    }
+
+    /// `extras`, as the copies themselves. Each was just checked on disk
+    /// against its stamp, so `Session.mark(copies:reason:)` can take the
+    /// identity from it instead of looking again. Reads the disk: call it
+    /// off the main thread.
+    nonisolated static func extraCopies(of sets: [DuplicateSet], rule: KeepRule) -> (copies: [DuplicateSet.Copy], changed: Int) {
+        var copies: [DuplicateSet.Copy] = []
         var changed = 0
         for s in sets {
             guard let keep = keeper(of: s, rule: rule) else { continue }
@@ -250,10 +336,10 @@ final class DuplicateFinder {
                 continue
             }
             for c in s.copies where c.path != keep.path && c.family != keep.family {
-                if FileStamp(path: c.path) == c.stamp { paths.append(c.path) } else { changed += 1 }
+                if FileStamp(path: c.path) == c.stamp { copies.append(c) } else { changed += 1 }
             }
         }
-        return (paths, changed)
+        return (copies, changed)
     }
 
     // MARK: Pipeline (off the main thread)
@@ -268,7 +354,7 @@ final class DuplicateFinder {
     nonisolated private static func find(
         tree: Tree, minSize: Int64, includeManaged: Bool, cache: HashCache, stop: CancelFlag,
         progress: @escaping @Sendable (Int, Int64, Int64) -> Void,
-        found: @escaping @Sendable (DuplicateSet) async -> Void,
+        found: @escaping @Sendable (DuplicateSet) -> Void,
         capped: @escaping @Sendable () async -> Void
     ) async {
         // 1. Everything big enough, straight from the scan.
@@ -337,8 +423,8 @@ final class DuplicateFinder {
             for s in sampled {
                 let full = await split(s) { cache.hash($0.path, stamp: $0.stamp, full: true, meter: meter) }
                 for set in full where Set(set.map(\.family)).count > 1 {
-                    await found(DuplicateSet(
-                        id: set.map(\.path).sorted().joined(separator: "|"), size: set[0].stamp.size,
+                    found(DuplicateSet(
+                        size: set[0].stamp.size,
                         copies: set.map { DuplicateSet.Copy(entry: $0.entry, path: $0.path, stamp: $0.stamp, family: $0.family) }))
                 }
             }
@@ -348,9 +434,9 @@ final class DuplicateFinder {
     /// Groups `items` by `key`, hashing a few files at a time; singletons and
     /// unreadable files drop out.
     nonisolated private static func split(_ items: [Candidate],
-                                          by key: @escaping @Sendable (Candidate) -> String?) async -> [[Candidate]] {
-        var results = [String?](repeating: nil, count: items.count)
-        await withTaskGroup(of: (Int, String?).self) { group in
+                                          by key: @escaping @Sendable (Candidate) -> HashCache.Digest?) async -> [[Candidate]] {
+        var results = [HashCache.Digest?](repeating: nil, count: items.count)
+        await withTaskGroup(of: (Int, HashCache.Digest?).self) { group in
             var next = 0
             func add() {
                 guard next < items.count, !Task.isCancelled else { return }
@@ -365,7 +451,7 @@ final class DuplicateFinder {
                 add()
             }
         }
-        var buckets: [String: [Candidate]] = [:]
+        var buckets: [HashCache.Digest: [Candidate]] = [:]
         for (c, k) in zip(items, results) { if let k { buckets[k, default: []].append(c) } }
         return buckets.values.filter { $0.count > 1 }
     }
@@ -427,28 +513,76 @@ final class ReadMeter: @unchecked Sendable {
 }
 
 /// Content hashes keyed by exact file identity (device, inode, size and
-/// nanosecond times), so a second run only reads files that changed.
+/// nanosecond times: all of `FileStamp`), so a second run only reads files
+/// that changed. Bounded: past `capacity` entries the oldest go first.
 final class HashCache: @unchecked Sendable {
-    private let lock = NSLock()
-    private var sampled: [String: String] = [:]
-    private var full: [String: String] = [:]
+    /// A SHA-256 digest, as four words.
+    struct Digest: Hashable, Sendable {
+        let a: UInt64, b: UInt64, c: UInt64, d: UInt64
+    }
 
-    func hash(_ path: String, stamp: FileStamp, full wantFull: Bool, meter: ReadMeter) -> String? {
-        let key = stamp.key
+    private struct Key: Hashable {
+        let stamp: FileStamp
+        let full: Bool
+    }
+
+    private let lock = NSLock()
+    private var table: [Key: Digest] = [:]
+    /// Keys in the order they were added; `head` is the oldest still counted.
+    private var order: [Key] = []
+    private var head = 0
+    let capacity: Int
+
+    /// About 200 bytes an entry, so the default stays around 10 MB.
+    init(capacity: Int = 50_000) {
+        self.capacity = max(1, capacity)
+    }
+
+    var count: Int {
         lock.lock()
-        let hit = wantFull ? full[key] : sampled[key]
-        lock.unlock()
-        if let hit { return hit }
+        defer { lock.unlock() }
+        return table.count
+    }
+
+    func hash(_ path: String, stamp: FileStamp, full wantFull: Bool, meter: ReadMeter) -> Digest? {
+        if let hit = cached(stamp, full: wantFull) { return hit }
         guard let h = Self.read(path, stamp: stamp, full: wantFull, meter: meter) else { return nil }
-        lock.lock()
-        if wantFull { full[key] = h } else { sampled[key] = h }
-        lock.unlock()
+        store(h, for: stamp, full: wantFull)
         return h
+    }
+
+    func cached(_ stamp: FileStamp, full: Bool) -> Digest? {
+        lock.lock()
+        defer { lock.unlock() }
+        return table[Key(stamp: stamp, full: full)]
+    }
+
+    func store(_ digest: Digest, for stamp: FileStamp, full: Bool) {
+        let key = Key(stamp: stamp, full: full)
+        lock.lock()
+        defer { lock.unlock() }
+        if table.updateValue(digest, forKey: key) == nil { order.append(key) }
+        while table.count > capacity, head < order.count {
+            table.removeValue(forKey: order[head])
+            head += 1
+        }
+        if head > 4096, head * 2 > order.count {
+            order.removeFirst(head)
+            head = 0
+        }
+    }
+
+    func removeAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        table = [:]
+        order = []
+        head = 0
     }
 
     /// Hashes the file, but only if it's still the object `stamp` describes
     /// before and after reading (a file edited mid-read gives no answer).
-    private static func read(_ path: String, stamp: FileStamp, full: Bool, meter: ReadMeter) -> String? {
+    private static func read(_ path: String, stamp: FileStamp, full: Bool, meter: ReadMeter) -> Digest? {
         let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { return nil }
         defer { close(fd) }
@@ -481,7 +615,45 @@ final class HashCache: @unchecked Sendable {
             meter.add(Int64(done))
         }
         guard fstat(fd, &st) == 0, FileStamp(st) == stamp else { return nil }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return hasher.finalize().withUnsafeBytes { raw in
+            Digest(a: raw.loadUnaligned(fromByteOffset: 0, as: UInt64.self),
+                   b: raw.loadUnaligned(fromByteOffset: 8, as: UInt64.self),
+                   c: raw.loadUnaligned(fromByteOffset: 16, as: UInt64.self),
+                   d: raw.loadUnaligned(fromByteOffset: 24, as: UInt64.self))
+        }
+    }
+}
+
+/// Found duplicate sets on their way to the main thread.
+private final class Inbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var token = 0
+    private var waiting: [DuplicateSet] = []
+
+    func reset(token: Int) {
+        lock.lock()
+        self.token = token
+        waiting = []
+        lock.unlock()
+    }
+
+    /// Returns true if `set` starts a new batch (the caller schedules its
+    /// delivery). Sets from a stopped run are dropped.
+    func add(_ set: DuplicateSet, token: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard token == self.token else { return false }
+        waiting.append(set)
+        return waiting.count == 1
+    }
+
+    func take(token: Int) -> [DuplicateSet] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard token == self.token else { return [] }
+        let out = waiting
+        waiting = []
+        return out
     }
 }
 

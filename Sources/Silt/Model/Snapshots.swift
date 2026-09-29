@@ -37,7 +37,7 @@ enum Snapshots {
     }
 
     /// Older than this and the FSEvents journal may no longer reach back.
-    private static let maxAge: TimeInterval = 7 * 86400
+    static let maxAge: TimeInterval = 7 * 86400
 
     static func load(for url: URL, fullDiskAccess: Bool) -> Restored? {
         guard eligible(url) else { return nil }
@@ -82,6 +82,20 @@ enum Snapshots {
         log.notice("Discarding the saved scan of \(url.path, privacy: .public): \(why, privacy: .public)")
         try? FileManager.default.removeItem(atPath: path)
         return nil
+    }
+
+    /// Whether the saved scan of `url` would still catch up by FSEvents replay
+    /// if it were loaded now: young enough, same file-system history, same
+    /// Full Disk Access. Reads only the header. `margin`: how much longer it
+    /// must stay young enough.
+    static func replayable(for url: URL, fullDiskAccess: Bool, margin: TimeInterval = 0) -> Bool {
+        guard eligible(url) else { return false }
+        var meta = silt_snapshot_meta()
+        guard silt_snapshot_peek(file(for: url.path).path, &meta),
+              (meta.flags & flagFullDiskAccess != 0) == fullDiskAccess,
+              Date().timeIntervalSince1970 - meta.saved_at + margin < maxAge,
+              let uuid = FSWatcher.databaseUUID(for: url.path) else { return false }
+        return withUnsafeBytes(of: uuid) { a in withUnsafeBytes(of: meta.volume_uuid) { b in a.elementsEqual(b) } }
     }
 
     /// When the saved scan of `path` was last brought up to date, if there's
