@@ -966,6 +966,9 @@ void silt_scanner_progress(silt_scanner *s, silt_progress *out) {
 
   pthread_mutex_lock(&s->qlock);
   out->queued = s->qcount + s->active;
+  out->urgent_queued = out->queued;
+  out->limit = (uint32_t)s->nthreads;
+  out->threads = (uint32_t)s->nthreads;
   out->active = s->active;
   out->idle = s->qcount == 0 && s->active == 0;
   uint64_t end = s->scan_end ? s->scan_end : now_ns();
@@ -1045,4 +1048,8 @@ void silt_scanner_refresh(silt_scanner *s, uint32_t dir, bool deep) {
   enqueue_locked(s, (work){.path = strdup(path), .dir = dir, .deep = deep});
   pthread_cond_signal(&s->qcond);
   pthread_mutex_unlock(&s->qlock);
+}
+
+void silt_scanner_refresh_ex(silt_scanner *s, uint32_t dir, uint32_t flags) {
+  silt_scanner_refresh(s, dir, (flags & SILT_REFRESH_DEEP) != 0);
 }

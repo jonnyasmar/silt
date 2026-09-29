@@ -80,8 +80,11 @@ final class Tree: @unchecked Sendable {
         return p
     }
 
-    func refresh(dir: UInt32, deep: Bool) {
-        withScanner { if let s = $0 { silt_scanner_refresh(s, dir, deep) } }
+    /// `urgent` for work someone is waiting on (a rescan they asked for, a
+    /// catch-up on screen); everything else runs as background work.
+    func refresh(dir: UInt32, deep: Bool, urgent: Bool) {
+        let flags = (deep ? SILT_REFRESH_DEEP : 0) | (urgent ? SILT_REFRESH_URGENT : 0)
+        withScanner { if let s = $0 { silt_scanner_refresh_ex(s, dir, flags) } }
     }
 
     func remove(entry: UInt32) { silt_tree_remove(raw, entry) }
@@ -115,6 +118,9 @@ final class Tree: @unchecked Sendable {
 
     func isLive(_ entry: UInt32) -> Bool { silt_is_live(raw, entry) }
 
+    /// Changes whenever anything under `dir` changes. Lock held.
+    func stamp(of dir: UInt32) -> UInt32 { silt_dir_stamp(raw, dir) }
+
     func lookup(_ path: String) -> UInt32 { silt_lookup(raw, path) }
 
     /// Live children of `dir`, sorted. Lock held.
@@ -123,6 +129,20 @@ final class Tree: @unchecked Sendable {
         if count == 0 { return [] }
         return [UInt32](unsafeUninitializedCapacity: count) { buf, initialized in
             initialized = Int(silt_children_sorted(raw, dir, key.rawValue, buf.baseAddress!, UInt32(count)))
+        }
+    }
+
+    /// Live children of `dir`, sorted, WITHOUT holding the lock (it's taken
+    /// only to copy the sort keys). Never call it inside `withLock`: the lock
+    /// isn't recursive. The tree must be awake (not parking).
+    func childrenUnlocked(of dir: UInt32, key: SortKey) -> [UInt32] {
+        var cap = withLock { Int(silt_dir_at(raw, dir).pointee.count) } + 64
+        while true {
+            let out = [UInt32](unsafeUninitializedCapacity: cap) { buf, initialized in
+                initialized = Int(silt_children_sorted_unlocked(raw, dir, key.rawValue, buf.baseAddress!, UInt32(cap)))
+            }
+            if out.count < cap { return out }
+            cap *= 2 // it grew meanwhile
         }
     }
 
@@ -151,6 +171,16 @@ final class Tree: @unchecked Sendable {
             var out = [UInt32](repeating: 0, count: limit)
             var which = [UInt32](repeating: 0, count: limit)
             let n = Int(silt_find_dirs(raw, dir, ptrs, UInt32(names.count), &out, &which, UInt32(limit)))
+            return (0..<n).map { (out[$0], Int(which[$0])) }
+        }
+    }
+
+    /// Files or folders named exactly one of `names` (ASCII case aside).
+    func findNamed(_ names: [String], under dir: UInt32, limit: Int) -> [(entry: UInt32, which: Int)] {
+        withCStrings(names) { ptrs in
+            var out = [UInt32](repeating: 0, count: limit)
+            var which = [UInt32](repeating: 0, count: limit)
+            let n = Int(silt_find_named(raw, dir, ptrs, UInt32(names.count), &out, &which, UInt32(limit)))
             return (0..<n).map { (out[$0], Int(which[$0])) }
         }
     }

@@ -225,6 +225,29 @@ uint32_t silt_find_dirs(silt_tree *t, uint32_t dir, const char *const *names,
   return n;
 }
 
+uint32_t silt_find_named(silt_tree *t, uint32_t dir, const char *const *names,
+                         uint32_t count, uint32_t *out, uint32_t *which,
+                         uint32_t cap) {
+  uint32_t lens[64];
+  if (count > 64) count = 64;
+  for (uint32_t k = 0; k < count; k++) lens[k] = (uint32_t)strlen(names[k]);
+
+  heap h = {.t = t, .idx = out, .tag = which, .n = 0, .cap = cap};
+  silt_tree_lock(t);
+  WALK(t, dir, e, i, {
+    const uint8_t *nm = silt_name_ptr(t, e->name);
+    for (uint32_t k = 0; k < count; k++) {
+      if (lens[k] == e->name_len && strncasecmp((const char *)nm, names[k], lens[k]) == 0) {
+        heap_offer(&h, i, k);
+        break;
+      }
+    }
+  });
+  uint32_t n = heap_finish(&h);
+  silt_tree_unlock(t);
+  return n;
+}
+
 static bool is_package_name(const uint8_t *nm, uint32_t len) {
   static const char *const exts[] = {".app", ".framework", ".bundle", ".photoslibrary", ".musiclibrary",
                                      ".xcarchive", ".appex", ".plugin", ".kext", ".tvlibrary",

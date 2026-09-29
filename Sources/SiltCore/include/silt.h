@@ -131,6 +131,11 @@ void silt_tree_unlock(silt_tree *t);
 // Mutation counter, safe to read without the tree lock.
 uint64_t silt_tree_generation(const silt_tree *t);
 
+// Lock held. A value that changes whenever anything in `dir`'s subtree
+// changes: its run, or any descendant's size, items, newest, pending, or
+// flags. Equal stamps mean nothing under `dir` changed. Not persisted.
+uint32_t silt_dir_stamp(const silt_tree *t, uint32_t dir);
+
 typedef struct silt_memory {
   uint64_t entry_slots;  // entry indices handed out so far (never reused)
   uint64_t live_slots;   // slots held by current runs, spare room included
@@ -154,6 +159,12 @@ size_t silt_path(const silt_tree *t, uint32_t entry, char *buf, size_t cap);
 // 2 items desc, 3 modified desc.
 uint32_t silt_children_sorted(const silt_tree *t, uint32_t dir, int key,
                               uint32_t *out, uint32_t cap);
+
+// The same, but called WITHOUT the lock: it takes the lock only to copy what
+// it sorts by, and sorts after releasing it. The caller guarantees the tree
+// isn't being parked meanwhile (names must stay mapped).
+uint32_t silt_children_sorted_unlocked(silt_tree *t, uint32_t dir, int key,
+                                       uint32_t *out, uint32_t cap);
 
 // Resolves an absolute path to an entry index, or SILT_NONE. Only walks
 // directories that have been listed.
@@ -180,6 +191,9 @@ typedef struct silt_progress {
   bool idle;        // nothing queued or running
   double elapsed;   // seconds since the most recent full scan began
   double finished;  // seconds the most recent full scan took (0 while running)
+  uint32_t urgent_queued; // urgent listings waiting or running
+  uint32_t limit;         // listings allowed to run at once right now
+  uint32_t threads;       // worker threads alive
 } silt_progress;
 
 // Starts a pool of `threads` workers bound to `t` and queues a full scan of the
@@ -204,6 +218,13 @@ void silt_scanner_destroy(silt_scanner *s);
 // empties the tree. Duplicate requests coalesce; a deep request upgrades a
 // pending shallow one.
 void silt_scanner_refresh(silt_scanner *s, uint32_t dir, bool deep);
+
+#define SILT_REFRESH_DEEP 1u
+#define SILT_REFRESH_URGENT 2u // someone is waiting on it: scan-class priority
+
+// Like silt_scanner_refresh, with flags. Without SILT_REFRESH_URGENT the
+// listing (and everything it queues beneath it) runs as background work.
+void silt_scanner_refresh_ex(silt_scanner *s, uint32_t dir, uint32_t flags);
 
 // Marks `entry` removed and subtracts it from every ancestor immediately, so
 // the UI reflects a deletion before the file system reports it. The next
@@ -264,6 +285,13 @@ uint32_t silt_top_children(silt_tree *t, uint32_t dir, uint32_t *out,
 // largest first. Returns the count.
 uint32_t silt_search(silt_tree *t, uint32_t dir, const char *needle,
                      uint32_t *out, uint32_t cap);
+
+// Entries (files or folders) under `dir` whose name equals one of `names`
+// exactly, ignoring ASCII case. `which[i]` receives the index into `names`.
+// Largest first. Takes the lock itself. Returns the count.
+uint32_t silt_find_named(silt_tree *t, uint32_t dir, const char *const *names,
+                         uint32_t count, uint32_t *out, uint32_t *which,
+                         uint32_t cap);
 
 // Folders under `dir` whose name matches one of `names`; matched folders are
 // not descended into. `which[i]` receives the index into `names`. Largest

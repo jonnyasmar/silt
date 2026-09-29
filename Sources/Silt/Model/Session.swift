@@ -93,6 +93,19 @@ final class Session: Identifiable {
     private(set) var waitingInTrash: Int64 = 0
     @ObservationIgnored private var lastTrashCheck: TimeInterval = 0
 
+    /// Whether a visible window shows this session. The window's model keeps
+    /// it current; a session without a window counts as on screen.
+    @ObservationIgnored var isOnScreen = true
+    /// Whether the Reclaim pane is what's showing for this session.
+    @ObservationIgnored var reclaimVisible = false
+    @ObservationIgnored private(set) var recentQueryCost: TimeInterval = 0
+
+    /// Views that re-walk the tree on `quietVersion` report what a pass cost,
+    /// so the pacing can follow it.
+    func noteQueryCost(_ seconds: TimeInterval) {
+        recentQueryCost = seconds
+    }
+
     @ObservationIgnored private var timer: Timer?
     @ObservationIgnored private var lastGeneration: UInt64 = .max
     @ObservationIgnored private var lastVersionBump: TimeInterval = 0
@@ -278,7 +291,7 @@ final class Session: Identifiable {
                 let incomplete = tree.withLock {
                     (0..<tree.raw.pointee.dir_count).filter { tree.dir($0).state & UInt32(SILT_DIR_INCOMPLETE) != 0 }
                 }
-                for dir in incomplete { tree.refresh(dir: dir, deep: true) }
+                for dir in incomplete { tree.refresh(dir: dir, deep: true, urgent: true) }
             } else {
                 startWatching(since: nil)
                 recheckingSince = UInt32(Date().timeIntervalSince1970)
@@ -544,7 +557,7 @@ final class Session: Identifiable {
                 && rootVolume != nil && Session.volumeUUID(url) == rootVolume
             watcher?.stop()
             startWatching(since: lastEventId)
-            if same { tree.refresh(dir: 0, deep: false) } else { requestDeep(0) }
+            if same { tree.refresh(dir: 0, deep: false, urgent: true) } else { requestDeep(0) }
         }
         if wrapped { requestDeep(0) }
         var sizes: [UInt32: UInt32] = [:]
@@ -568,7 +581,7 @@ final class Session: Identifiable {
     private func refreshPaced(_ dir: UInt32, children: UInt32, now: TimeInterval) {
         let gap = min(5, Double(children) * 40e-6)
         guard gap >= 0.1 else {
-            tree.refresh(dir: dir, deep: false)
+            tree.refresh(dir: dir, deep: false, urgent: true)
             return
         }
         if let last = listedAt[dir], now - last < gap {
@@ -576,7 +589,7 @@ final class Session: Identifiable {
             return
         }
         listedAt[dir] = now
-        tree.refresh(dir: dir, deep: false)
+        tree.refresh(dir: dir, deep: false, urgent: true)
     }
 
     private func releaseDueRefreshes(now: TimeInterval) {
@@ -584,7 +597,7 @@ final class Session: Identifiable {
             for (dir, due) in dueAt where due <= now {
                 dueAt.removeValue(forKey: dir)
                 listedAt[dir] = now
-                tree.refresh(dir: dir, deep: false)
+                tree.refresh(dir: dir, deep: false, urgent: true)
             }
         }
         // Forget folders that have gone quiet.
@@ -649,7 +662,7 @@ final class Session: Identifiable {
             rescanBase = (p.listed, max(total, 1))
             rescanState = RescanState(fraction: 0, explicit: explicit || (rescanState?.explicit ?? false))
         }
-        tree.refresh(dir: dir, deep: true)
+        tree.refresh(dir: dir, deep: true, urgent: true)
     }
 
     private func tickRescan(_ p: silt_progress, now: TimeInterval) {
@@ -919,7 +932,7 @@ final class Session: Identifiable {
                 if e != NONE, tree.entry(e).isDir { dirs.insert(tree.entry(e).aux) }
             }
         }
-        for d in dirs { tree.refresh(dir: d, deep: false) }
+        for d in dirs { tree.refresh(dir: d, deep: false, urgent: true) }
         show(Toast(symbol: "arrow.uturn.backward", title: restored == moves.count
                        ? "Put back \(restored == 1 ? "1 item" : "\(restored) items")"
                        : "Put back \(restored) of \(moves.count) items",
@@ -1017,7 +1030,7 @@ final class Session: Identifiable {
         tree.withLock {
             for t in items { dirs.insert(tree.entry(t.entry).parent) }
         }
-        for d in dirs where d != NONE { tree.refresh(dir: d, deep: false) }
+        for d in dirs where d != NONE { tree.refresh(dir: d, deep: false, urgent: true) }
     }
 
     private func refuse(_ names: [String]) {

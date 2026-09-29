@@ -174,6 +174,19 @@ uint64_t silt_tree_generation(const silt_tree *t) {
   return __atomic_load_n(&t->generation, __ATOMIC_ACQUIRE);
 }
 
+uint32_t silt_children_sorted_unlocked(silt_tree *t, uint32_t dir, int key,
+                                       uint32_t *out, uint32_t cap) {
+  silt_tree_lock(t);
+  uint32_t n = silt_children_sorted(t, dir, key, out, cap);
+  silt_tree_unlock(t);
+  return n;
+}
+
+uint32_t silt_dir_stamp(const silt_tree *t, uint32_t dir) {
+  (void)dir;
+  return (uint32_t)silt_tree_generation(t);
+}
+
 // MARK: Internal mutation
 
 void tree_reserve_entries(silt_tree *t, uint32_t n) {
