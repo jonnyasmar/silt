@@ -17,7 +17,7 @@ struct RootView: View {
                     }
                 }
         }
-        .navigationTitle(model.current?.title ?? "Silt")
+        .navigationTitle(model.current?.title ?? model.pending.map { Locations.displayName(for: URL(fileURLWithPath: $0)) } ?? "Silt")
         .navigationSubtitle(subtitle)
         .toolbar { toolbar }
         .modifier(SearchWhenScanned(model: model))
@@ -143,10 +143,10 @@ struct Sidebar: View {
 
     private var selection: Binding<String?> {
         Binding(
-            get: { model.viewing },
+            get: { model.viewing ?? model.pending },
             set: { path in
-                guard let path, path != model.viewing else { return }
-                model.scan(URL(fileURLWithPath: path))
+                guard let path, path != model.viewing, path != model.pending else { return }
+                model.select(path)
             }
         )
     }
@@ -165,6 +165,13 @@ private struct LocationRow: View {
                 .font(.system(size: 11).monospacedDigit())
                 .foregroundStyle(.secondary)
         }
+        .help(help)
+    }
+
+    private var help: String {
+        if session != nil { return "" }
+        guard let saved = Snapshots.savedAt(for: location.url.path) else { return "Not scanned yet" }
+        return "Last scanned \(Fmt.age(UInt32(saved.timeIntervalSince1970)))"
     }
 
     @ViewBuilder
@@ -394,6 +401,9 @@ struct Detail: View {
                 CleanupSheet(session: session)
             }
             .id(session.id)
+        } else if let path = model.pending {
+            ScanPrompt(model: model, path: path)
+                .id(path)
         } else {
             StartView(model: model)
         }

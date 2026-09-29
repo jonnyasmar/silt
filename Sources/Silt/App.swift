@@ -101,6 +101,9 @@ final class WindowModel {
     }
     /// The location or folder on screen: `current`'s root, or a folder inside it.
     private(set) var viewing: String?
+    /// A location picked but not scanned yet: shown with a Scan button, since
+    /// picking a place never starts a scan by itself.
+    private(set) var pending: String?
     /// Folders opened with Scan Folder… (sidebar locations aside), in order.
     private(set) var folders: [String] = []
     var pane: Pane = .files
@@ -217,6 +220,22 @@ final class WindowModel {
     func refreshLocations() {
         locations = Locations.all()
         hasFullDiskAccess = FullDiskAccess.isGranted
+        if let p = pending, !FileManager.default.fileExists(atPath: p) { pending = nil } // ejected
+    }
+
+    /// Picks a place in the sidebar or on the start screen. One that's
+    /// already scanned, or inside a scan, is shown; anything else waits for
+    /// an explicit Scan.
+    func select(_ path: String) {
+        search = ""
+        if let s = backing(path) {
+            show(s, as: path)
+            return
+        }
+        if let old = current, viewing != nil { old.leaveView() }
+        current = nil
+        viewing = nil
+        pending = path
     }
 
     func scan(_ url: URL) {
@@ -280,6 +299,7 @@ final class WindowModel {
         if let old = current, viewing != nil { old.leaveView() }
         current = session
         viewing = path
+        pending = nil
         session.enter(view: path)
         if !locations.contains(where: { $0.url.path == path }), !folders.contains(path) { folders.append(path) }
         UserDefaults.standard.set(session.url.path, forKey: "lastScan")
@@ -362,6 +382,7 @@ final class WindowModel {
             sessions.removeAll { $0 === own }
             folders.removeAll { backing($0) == nil } // views that went with it
         }
+        if pending != nil { return } // the page on screen isn't a scan; it stays
         if let v = viewing, v != path, let s = backing(v) {
             if current !== s { show(s, as: v) }
         } else if let host = backing(path) {
