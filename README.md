@@ -82,6 +82,13 @@ Other features:
   that appends the entries and pushes size deltas up the ancestor chain. So
   every folder's total is correct-so-far at every instant, and the UI shows it
   live.
+- **The pool sizes itself.** Past a point, more threads mostly buy the kernel
+  more contention, not more speed. So the pool starts small and grows only
+  while an extra pair of threads makes listing faster without making each
+  item much more expensive. Threads leave after 5 s with nothing to do, so a
+  settled scan holds none. Refreshes the app starts on its own (FSEvents) run
+  as background work, at utility priority, two at a time. Listing never
+  updates access times.
 - The tree is flat and chunked: 24 bytes per entry, 48 per folder, and names
   in a shared arena. About 1.2M entries fit in ~55 MB.
 - After the scan, an FSEvents stream re-lists only the folders that changed,
@@ -94,12 +101,13 @@ Other features:
 - Big folders that change constantly (build output, browser caches) are
   re-listed at a pace that scales with their size, a 60,000-file folder at
   most every 2.4 s; small folders update immediately. Whole-tree views
-  (Largest, Types, the inspector's breakdown) refresh at most every second
-  per two million items.
+  (Largest, Types, the inspector's breakdown) skip folders where nothing
+  changed and otherwise refresh at a pace set by what their last pass cost.
 - **Instant relaunch.** A settled scan is saved as a compacted, LZ4-compressed
   snapshot (about 26 MB for 1.2M items) in
-  `~/Library/Caches/com.jonnyasmar.silt/Snapshots`. Saving and loading stream
-  through a small buffer instead of holding extra copies of the tree. Reopening the same
+  `~/Library/Caches/com.jonnyasmar.silt/Snapshots`, when the scan settles, at
+  quit, and at most every 30 minutes. Loading streams straight into the tree.
+  Reopening the same
   location shows it immediately, then FSEvents replays everything that changed
   since, so only those folders are re-listed. Removable and network volumes
   always rescan, and ⇧⌘R forces a fresh scan.
@@ -113,18 +121,37 @@ Other features:
   `~/Library/Caches/com.jonnyasmar.silt/Parked` exactly as it is and frees
   it: Storage (7.6M items) goes from ~520 MB to ~26 MB, and comes back in
   about half a second when shown again, then catches up on what changed.
-  Marks, open folders, Reclaim results and duplicates survive.
+  While parked it doesn't even listen for changes: waking replays them from
+  FSEvents history. Marks, open folders, Reclaim results and duplicates
+  survive.
 - Tree chunks and big working buffers come straight from the kernel, so
   memory the engine frees really goes back to the system.
 - **Rescans happen in place.** Every folder keeps its size and identity while
   its fresh listing replaces it, so the tree stays usable. The status bar
   shows a percentage, and folders still being re-checked show a hatched bar.
-- The UI is an `NSOutlineView` whose rows are created lazily. A 12 Hz tick
-  refreshes only the visible cells and re-sorts expanded folders, animating
-  the moves.
+- **Nothing runs on a timer when nothing's happening.** While a scan runs, a
+  12 Hz tick refreshes the visible cells. Afterwards Silt wakes only when files
+  change or a chore is due. Locations nobody can see (hidden windows, other
+  locations) do no UI work, and Reclaim and the capacity meter update only
+  on screen.
+- The UI is an `NSOutlineView` whose rows are created lazily. Open folders
+  re-sort only when something inside them changed, and a re-listed folder's
+  rows are updated in place rather than reloaded.
 
-Measured on `~/dev` (1.23M items, 88 GB) on an M3 Max under heavy load: Silt
-scans in 5–9 s; `du -sk` took 71 s.
+Measured on `~/dev` (1.3M items) on an M3 Max, with other work loading the
+machine (load average 24–92). This is the release app, launched hidden, in
+the same session as the build before the performance round:
+
+| | Before | Now |
+|---|---|---|
+| Full scan: CPU time | 101 s | 29 s |
+| Full scan: wall time | 11.3 s | 8.9 s |
+| Settled memory | 215 MB | 172 MB |
+| Settled CPU on a changing disk | 1.9 s a minute | 0.1 s a minute |
+| Settled CPU on a quiet folder | 1.8 % of a core | ~0.03 % |
+| Threads when settled | 32–35 | 4–7 |
+
+`du -sk` took 71 s on the same folder.
 
 ## Sizes, precisely
 
