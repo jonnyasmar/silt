@@ -775,3 +775,354 @@ extension Fixture {
     silt_tree_unlock(t)
     #expect(loaded.listed_at == deep)
 }
+
+// MARK: Work classes and the worker pool
+
+/// Raw handles to hand to other threads. The engine's own locking makes the
+/// calls these tests make from several threads safe.
+private struct Handles: @unchecked Sendable {
+    let tree: UnsafeMutablePointer<silt_tree>
+    let scanner: OpaquePointer
+}
+
+private let busyStates = UInt32(SILT_DIR_QUEUED | SILT_DIR_ACTIVE | SILT_DIR_DIRTY | SILT_DIR_DEEP | SILT_DIR_URGENT)
+
+extension Fixture {
+    fileprivate var handles: Handles { Handles(tree: tree, scanner: scanner) }
+
+    var progress: silt_progress {
+        var p = silt_progress()
+        silt_scanner_progress(scanner, &p)
+        return p
+    }
+
+    /// Dir ids of every folder still reachable from the root.
+    func liveDirs() -> [UInt32] {
+        silt_tree_lock(tree)
+        defer { silt_tree_unlock(tree) }
+        return (0..<tree.pointee.dir_count).filter { d in
+            let entry = silt_dir_at(tree, d).pointee.entry
+            return silt_is_live(tree, entry) && silt_entry_at(tree, entry).pointee.aux == d
+        }
+    }
+
+    func stamp(_ rel: String) -> UInt32 {
+        guard let e = entry(rel) else { return 0 }
+        silt_tree_lock(tree)
+        defer { silt_tree_unlock(tree) }
+        return silt_dir_stamp(tree, e.aux)
+    }
+
+    /// Waits (a few seconds at most) for `condition` on the scanner's progress.
+    func waitFor(_ condition: (silt_progress) -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            if condition(progress) { return true }
+            usleep(10_000)
+        }
+        return condition(progress)
+    }
+}
+
+/// Urgent, background, deep and shallow refreshes from several threads at
+/// once, while the folders change underneath: afterwards nothing may be left
+/// queued, running or marked, and every count must add up.
+@Test func mixedRefreshClassesLeaveNothingQueued() throws {
+    var layout: [String: Int] = [:]
+    for a in 0..<6 {
+        for b in 0..<5 {
+            for c in 0..<4 { layout["d\(a)/e\(b)/f\(c)/x.bin"] = 1_000 + a * 100 + b * 10 + c }
+            layout["d\(a)/e\(b)/y.bin"] = 2_000
+        }
+    }
+    let f = try Fixture(layout)
+    let h = f.handles
+    let dirs = f.liveDirs()
+    let root = f.root
+    #expect(dirs.count > 150)
+
+    DispatchQueue.concurrentPerform(iterations: 4) { worker in
+        if worker == 3 {
+            // Churn: files and folders come and go while refreshes run.
+            for i in 0..<60 {
+                let dir = root.appendingPathComponent("d\(i % 6)/e\(i % 5)")
+                try? Fixture.write(dir.appendingPathComponent("new\(i)/z.bin"), size: 3_000)
+                if i >= 10 {
+                    try? FileManager.default.removeItem(at: root.appendingPathComponent("d\((i - 10) % 6)/e\((i - 10) % 5)/new\(i - 10)"))
+                }
+                unlink(root.appendingPathComponent("d\(i % 6)/e\(i % 5)/y.bin").path)
+                usleep(1_000)
+            }
+            return
+        }
+        var rng = SystemRandomNumberGenerator()
+        for _ in 0..<600 {
+            let dir = dirs.randomElement(using: &rng)!
+            let flags = UInt32.random(in: 0...3, using: &rng) // DEEP and URGENT in every combination
+            silt_scanner_refresh_ex(h.scanner, dir, flags)
+            if Int.random(in: 0..<20, using: &rng) == 0 { usleep(500) }
+        }
+    }
+    silt_scanner_wait_idle(f.scanner)
+
+    let p = f.progress
+    #expect(p.idle && p.queued == 0 && p.urgent_queued == 0 && p.active == 0)
+    silt_tree_lock(f.tree)
+    #expect(silt_dir_at(f.tree, 0).pointee.pending == 0)
+    var stuck: [UInt32] = []
+    for d in 0..<f.tree.pointee.dir_count where silt_dir_at(f.tree, d).pointee.state & busyStates != 0 {
+        stuck.append(d)
+    }
+    silt_tree_unlock(f.tree)
+    #expect(stuck.isEmpty, "folders left queued, active, dirty, deep or urgent: \(stuck)")
+    for d in f.liveDirs() {
+        silt_tree_lock(f.tree)
+        let pending = silt_dir_at(f.tree, d).pointee.pending
+        silt_tree_unlock(f.tree)
+        #expect(pending == 0)
+    }
+
+    // One more thorough pass settles whatever the churn left unseen; then
+    // every total matches the disk.
+    silt_scanner_refresh_ex(f.scanner, 0, UInt32(SILT_REFRESH_DEEP | SILT_REFRESH_URGENT))
+    silt_scanner_wait_idle(f.scanner)
+    #expect(f.size("") == f.expected(""))
+    #expect(f.dir("")?.pending == 0)
+}
+
+/// An urgent request counts from the moment it returns, even when it only
+/// upgrades background work already queued or running, and it stops
+/// counting only once everything it covers is listed.
+@Test func urgentWorkCountsUntilItIsDone() throws {
+    var layout: [String: Int] = [:]
+    for a in 0..<8 { for b in 0..<8 { layout["p\(a)/q\(b)/r.bin"] = 4_096 } }
+    let f = try Fixture(layout)
+    silt_scanner_refresh_ex(f.scanner, 0, UInt32(SILT_REFRESH_DEEP)) // background
+    silt_scanner_refresh_ex(f.scanner, 0, UInt32(SILT_REFRESH_DEEP | SILT_REFRESH_URGENT))
+    #expect(f.progress.urgent_queued > 0)
+    #expect(f.waitFor { $0.urgent_queued == 0 })
+    // Urgent work drained: the whole deep refresh is done, background or not.
+    #expect(f.dir("")?.pending == 0)
+    silt_scanner_wait_idle(f.scanner)
+    #expect(f.size("") == f.expected(""))
+}
+
+/// Idle workers exit, all the way down to none, and work that arrives later
+/// still gets done.
+@Test func idlePoolShrinksToZeroAndComesBack() throws {
+    let f = try Fixture(["a/one.bin": 10_000, "b/two.bin": 20_000])
+    silt_scanner_set_idle_timeout(f.scanner, 0.05)
+    #expect(f.waitFor { $0.threads == 0 })
+    try Fixture.write(f.root.appendingPathComponent("a/three.bin"), size: 300_000)
+    let a = try #require(f.entry("a")).aux
+    silt_scanner_refresh_ex(f.scanner, a, UInt32(SILT_REFRESH_URGENT))
+    silt_scanner_wait_idle(f.scanner)
+    #expect(f.size("a") == f.expected("a"))
+    #expect(f.size("") == f.expected(""))
+    try Fixture.write(f.root.appendingPathComponent("b/four.bin"), size: 40_000)
+    let b = try #require(f.entry("b")).aux
+    silt_scanner_refresh(f.scanner, b, false) // background, from an empty pool
+    silt_scanner_wait_idle(f.scanner)
+    #expect(f.size("b") == f.expected("b"))
+    #expect(f.waitFor { $0.threads == 0 })
+}
+
+/// Destroying a scanner while its threads start, work and exit on their own
+/// never loses one (thread sanitizer runs cover the joins).
+@Test func destroyRacesThreadsExiting() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("silt-pool-\(UUID().uuidString)").resolvingSymlinksInPath()
+    defer { try? FileManager.default.removeItem(at: root) }
+    for i in 0..<40 { try Fixture.write(root.appendingPathComponent("d\(i % 8)/f\(i).bin"), size: 1_000) }
+    for round in 0..<30 {
+        let t = silt_tree_create(root.path)!
+        let s = silt_scanner_start(t, Int32(1 + round % 6))!
+        silt_scanner_set_idle_timeout(s, 0.0005 * Double(round % 4))
+        if round % 3 == 0 { silt_scanner_wait_idle(s) }
+        if round % 5 == 0 { usleep(2_000) }
+        silt_scanner_refresh_ex(s, 0, UInt32(round % 2 == 0 ? SILT_REFRESH_URGENT : 0))
+        silt_scanner_destroy(s)
+        silt_tree_destroy(t)
+    }
+}
+
+/// Reading progress never waits for the tree lock, so a long query can't
+/// stall whoever polls it.
+@Test func progressDoesNotWaitForTheTreeLock() throws {
+    let f = try Fixture(["a/one.bin": 10_000])
+    let h = f.handles
+    let locked = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), read = DispatchSemaphore(value: 0)
+    let holder = Thread {
+        silt_tree_lock(h.tree)
+        locked.signal()
+        release.wait()
+        silt_tree_unlock(h.tree)
+    }
+    holder.start()
+    locked.wait()
+    DispatchQueue.global().async {
+        var p = silt_progress()
+        silt_scanner_progress(h.scanner, &p)
+        read.signal()
+    }
+    let answered = read.wait(timeout: .now() + 3) == .success
+    release.signal()
+    if !answered { read.wait() }
+    #expect(answered)
+    #expect(f.progress.files == 2) // a and a/one.bin
+}
+
+// MARK: Stamps
+
+@Test func stampsMoveForAncestorsButNotSiblings() throws {
+    let f = try Fixture(["a/x/f.bin": 10_000, "a/y.bin": 1_000, "b/g.bin": 5_000, "b/c/h.bin": 1_000])
+    let before = ["", "a", "a/x", "b", "b/c"].map { f.stamp($0) }
+    #expect(before.allSatisfy { $0 != 0 })
+    #expect(["", "a", "a/x", "b", "b/c"].map { f.stamp($0) } == before) // reading doesn't move them
+
+    try Fixture.write(f.root.appendingPathComponent("a/x/f.bin"), size: 900_000)
+    f.refresh("a/x")
+    let after = ["", "a", "a/x", "b", "b/c"].map { f.stamp($0) }
+    #expect(after[0] != before[0] && after[1] != before[1] && after[2] != before[2])
+    #expect(after[3] == before[3] && after[4] == before[4])
+
+    // Removal moves the chain above it, too.
+    silt_tree_remove(f.tree, f.index("b/c/h.bin"))
+    let removed = ["", "a", "a/x", "b", "b/c"].map { f.stamp($0) }
+    #expect(removed[0] != after[0] && removed[3] != after[3] && removed[4] != after[4])
+    #expect(removed[1] == after[1] && removed[2] == after[2])
+
+    silt_tree_lock(f.tree)
+    #expect(silt_dir_stamp(f.tree, f.tree.pointee.dir_count) == 0)
+    silt_tree_unlock(f.tree)
+}
+
+@Test func stampsAreNewAfterLoadAndUnpark() throws {
+    let f = try Fixture(["a/one.bin": 1_000, "a/deep/two.bin": 1_000, "b/three.bin": 1_000])
+    func all(_ t: UnsafeMutablePointer<silt_tree>) -> [UInt32] {
+        silt_tree_lock(t)
+        defer { silt_tree_unlock(t) }
+        return (0..<t.pointee.dir_count).map { silt_dir_stamp(t, $0) }
+    }
+    var seen = Set(all(f.tree))
+
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("silt-\(UUID().uuidString).snap").path
+    defer { unlink(file) }
+    var meta = silt_snapshot_meta()
+    #expect(silt_tree_save(f.tree, file, &meta))
+    let loaded = try #require(silt_tree_load(file, nil))
+    defer { silt_tree_destroy(loaded) }
+    let fresh = all(loaded)
+    #expect(fresh.allSatisfy { $0 != 0 && !seen.contains($0) })
+    seen.formUnion(fresh)
+
+    // The loaded tree has no scanner, so it can park.
+    let park = FileManager.default.temporaryDirectory.appendingPathComponent("silt-\(UUID().uuidString).park").path
+    defer { unlink(park) }
+    #expect(silt_tree_park(loaded, park))
+    #expect(all(loaded).allSatisfy { $0 == 0 })
+    #expect(silt_tree_unpark(loaded, park))
+    #expect(all(loaded).allSatisfy { $0 != 0 && !seen.contains($0) })
+}
+
+// MARK: Queries and sorting
+
+@Test func findNamedMatchesWholeNamesIgnoringASCIICase() throws {
+    let f = try Fixture([
+        "proj/Target/a.bin": 5_000, "other/target/b.bin": 1_000, "targets/c.bin": 1_000,
+        "xtarget/d.bin": 1_000, "proj/.rustc_info.json": 100, "lib/TARGET": 0,
+    ])
+    let names = [strdup("target"), strdup(".rustc_info.json")]
+    defer { names.forEach { free($0) } }
+    var out = [UInt32](repeating: 0, count: 16)
+    var which = [UInt32](repeating: 0, count: 16)
+    let n = names.map { UnsafePointer($0) }.withUnsafeBufferPointer {
+        silt_find_named(f.tree, 0, $0.baseAddress!, 2, &out, &which, 16)
+    }
+    silt_tree_lock(f.tree)
+    let found = (0..<Int(n)).map { i -> (String, UInt32) in
+        var buf = [CChar](repeating: 0, count: 4096)
+        _ = silt_path(f.tree, out[i], &buf, 4096)
+        return (String(cString: buf).replacingOccurrences(of: f.root.path + "/", with: ""), which[i])
+    }
+    silt_tree_unlock(f.tree)
+    #expect(Set(found.map { $0.0 }) == ["proj/Target", "other/target", "lib/TARGET", "proj/.rustc_info.json"])
+    #expect(found.first { $0.0 == "proj/.rustc_info.json" }?.1 == 1)
+    #expect(found.filter { $0.1 == 0 }.count == 3)
+    #expect(found.first?.0 == "proj/Target") // largest first
+}
+
+/// The integer-key sort orders children exactly like a straightforward
+/// comparison would: the key, then the name ignoring ASCII case (shorter
+/// first on a tie), with or without the lock.
+@Test func childrenSortLikeTheReferenceOrder() throws {
+    var layout: [String: Int] = [:]
+    let stems = ["alpha", "Alpha", "ALPHABET", "alphabet-soup", "alphabet-Soup-2", "beta", "b", "B2",
+                 "libserde-0123456789.rlib", "libserde-0123456789.d", "libserde-0123", "LIBSERDE-99",
+                 "zeta", "Zulu", "ümlaut", "émile", "_under", "123", "1234567890123"]
+    for (i, stem) in stems.enumerated() {
+        layout["s/\(stem)"] = [0, 4_096, 4_096, 8_192, 0][i % 5]
+        layout["s/dir\(i % 4)-\(stem)/f.bin"] = 1_000 * (i % 3)
+    }
+    for i in 0..<300 { layout["s/bulk-\(i % 7)-\(i)"] = (i % 11) * 4_096 }
+    let f = try Fixture(layout)
+    let s = try #require(f.entry("s")).aux
+
+    silt_tree_lock(f.tree)
+    let d = silt_dir_at(f.tree, s).pointee
+    struct Child { let index: UInt32; let size: Int64; let items: UInt32; let newest: UInt32; let name: [UInt8] }
+    let children = (d.first..<d.first + d.count).compactMap { i -> Child? in
+        let e = silt_entry_at(f.tree, i).pointee
+        if e.flags & UInt8(SILT_FLAG_REMOVED) != 0 { return nil }
+        let isDir = e.kind == UInt8(SILT_KIND_DIR)
+        let dd = isDir ? silt_dir_at(f.tree, e.aux).pointee : nil
+        let name = Array(UnsafeBufferPointer(start: silt_name_ptr(f.tree, e.name), count: Int(e.name_len)))
+        return Child(index: i, size: e.size, items: dd?.items ?? 0, newest: dd?.newest ?? e.aux, name: name)
+    }
+    silt_tree_unlock(f.tree)
+
+    func fold(_ c: UInt8) -> UInt8 { c >= 65 && c <= 90 ? c + 32 : c }
+    func nameLess(_ a: Child, _ b: Child) -> Bool {
+        for (x, y) in zip(a.name, b.name) where fold(x) != fold(y) { return fold(x) < fold(y) }
+        if a.name.count != b.name.count { return a.name.count < b.name.count }
+        return a.index < b.index
+    }
+    let reference: [Int32: (Child, Child) -> Bool] = [
+        0: { $0.size != $1.size ? $0.size > $1.size : nameLess($0, $1) },
+        1: nameLess,
+        2: { $0.items != $1.items ? $0.items > $1.items : $0.size != $1.size ? $0.size > $1.size : nameLess($0, $1) },
+        3: { $0.newest != $1.newest ? $0.newest > $1.newest : nameLess($0, $1) },
+    ]
+    for key in Int32(0)...3 {
+        let want = children.sorted(by: reference[key]!).map(\.index)
+        var locked = [UInt32](repeating: 0, count: children.count)
+        silt_tree_lock(f.tree)
+        let n = silt_children_sorted(f.tree, s, key, &locked, UInt32(locked.count))
+        silt_tree_unlock(f.tree)
+        var unlocked = [UInt32](repeating: 0, count: children.count + 8)
+        let m = silt_children_sorted_unlocked(f.tree, s, key, &unlocked, UInt32(unlocked.count))
+        #expect(Int(n) == want.count && Array(locked.prefix(Int(n))) == want, "key \(key)")
+        #expect(Int(m) == want.count && Array(unlocked.prefix(Int(m))) == want, "key \(key), unlocked")
+        // A smaller cap keeps the first ones.
+        var top = [UInt32](repeating: 0, count: 5)
+        #expect(silt_children_sorted_unlocked(f.tree, s, key, &top, 5) == 5 && top == Array(want.prefix(5)))
+    }
+}
+
+@Test func extensionStatsGrowPastTheirFirstTable() throws {
+    var layout: [String: Int] = ["e/a.JPG": 4_096, "e/b.jpg": 4_096, "e/c.png": 8_192, "e/noext": 4_096]
+    for i in 0..<700 { layout["many/f\(i).x\(i)"] = 4_096 }
+    let f = try Fixture(layout)
+    var out = [silt_ext_stat](repeating: silt_ext_stat(), count: 1_000)
+    let n = Int(silt_ext_stats(f.tree, 0, &out, 1_000))
+    let byName = Dictionary(uniqueKeysWithValues: out.prefix(n).map { stat -> (String, silt_ext_stat) in
+        var s = stat
+        let name = withUnsafeBytes(of: &s.ext) { String(cString: $0.bindMemory(to: CChar.self).baseAddress!) }
+        return (name, stat)
+    })
+    #expect(n == 703) // jpg, png, none, and 700 distinct
+    #expect(byName["jpg"]?.count == 2)
+    #expect(byName["png"]?.count == 1)
+    #expect(byName[""]?.count == 1)
+    #expect(byName["x699"]?.count == 1)
+    #expect(zip(out.prefix(n), out.prefix(n).dropFirst()).allSatisfy { $0.bytes >= $1.bytes })
+}

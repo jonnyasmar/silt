@@ -125,6 +125,8 @@ bool silt_tree_save(silt_tree *t, const char *path, const silt_snapshot_meta *me
   silt_dir *rd = take(&dirs, sizeof *rd); // the bounds always fit the root
   *rd = *root_dir;
   rd->entry = 0;
+  // Only lasting state is saved: nothing queued, active, dirty, deep or
+  // urgent survives into a snapshot (the loader rejects any of it).
   rd->state &= SILT_DIR_LISTED | SILT_DIR_INCOMPLETE;
 
 #define PUSH(a, b)                                                             \
@@ -389,12 +391,14 @@ silt_tree *silt_tree_load(const char *path, silt_snapshot_meta *meta) {
     t->dirs = calloc(SILT_DIR_CHUNKS, sizeof *t->dirs);
     t->names = calloc(SILT_NAME_CHUNKS, sizeof *t->names);
   }
-  if (!t || !in || !t->entries || !t->dirs || !t->names) {
+  if (in) in->stamps = calloc(SILT_DIR_CHUNKS, sizeof *in->stamps);
+  if (!t || !in || !t->entries || !t->dirs || !t->names || !in->stamps) {
     if (t) {
       free(t->entries);
       free(t->dirs);
       free(t->names);
     }
+    if (in) free(in->stamps);
     free(t);
     free(in);
     fclose(f);
@@ -466,12 +470,16 @@ silt_tree *silt_tree_load(const char *path, silt_snapshot_meta *meta) {
   t->entry_count = h.entry_count;
   t->dir_count = h.dir_count;
   t->name_used = h.name_bytes;
-  TREE_BUMP(t);
   if (!ok || loaded_checksum(t, &h) != h.checksum || !validate(t)) {
     silt_tree_destroy(t);
     return NULL;
   }
   tree_reset_accounting(t);
+  // Stamps start over, with a value no one has seen: a view that remembers
+  // stamps from before the load must not mistake this tree for unchanged.
+  tree_stamp_all(t);
+  in->stamp_now = 0;
+  TREE_BUMP(t);
   if (meta) *meta = h.meta;
   return t;
 }

@@ -1,5 +1,12 @@
 // silt-bench: scans a path with SiltCore and reports throughput.
 //   silt-bench <path> [threads]
+// `threads` is the most worker threads the scanner may start (the app's
+// default, max(8, 2 x cores), if omitted). Environment knobs:
+//   SILT_MAX=<n>    the thread maximum (overrides the argument)
+//   SILT_LIMIT=<n>  pin the urgent limit at n instead of adapting (for A/B)
+//   SILT_CURVE=1    print each change of the limit during the scan
+//   SILT_SETTLE=<s> after the scan, wait for idle workers to exit (their idle
+//                   timeout is set to s seconds) and report the footprint
 // With SILT_WATCH=<seconds>, it then follows FSEvents under <path> the way
 // the app does (each changed folder re-listed) and reports memory every 10 s.
 // SILT_THROTTLE=1 applies the app's pacing for big, busy folders.
@@ -10,6 +17,7 @@
 #include <mach/mach.h>
 #include <malloc/malloc.h>
 #include <pthread.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,16 +133,56 @@ static void on_events(ConstFSEventStreamRef stream, void *info, size_t n, void *
   }
 }
 
+static double cpu_s(struct timeval tv) { return (double)tv.tv_sec + (double)tv.tv_usec / 1e6; }
+
 int main(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr, "usage: silt-bench <path> [threads]\n");
     return 2;
   }
-  int threads = argc > 2 ? atoi(argv[2]) : 16;
+  long cores = sysconf(_SC_NPROCESSORS_ONLN);
+  int threads = argc > 2 ? atoi(argv[2]) : (int)(cores * 2 > 8 ? cores * 2 : 8);
+  if (getenv("SILT_MAX")) threads = atoi(getenv("SILT_MAX"));
+  const int fixed = getenv("SILT_LIMIT") ? atoi(getenv("SILT_LIMIT")) : 0;
+  const bool curve = getenv("SILT_CURVE") != NULL;
+
+  struct rusage r0, r1;
+  getrusage(RUSAGE_SELF, &r0);
+  double w0 = now_s();
+  peak = footprint();
+  sampling = true;
+  pthread_t sampler_thread;
+  pthread_create(&sampler_thread, NULL, sampler, NULL);
+
   tree = silt_tree_create(argv[1]);
   scanner = silt_scanner_start(tree, threads);
-  silt_scanner_wait_idle(scanner);
+  if (fixed) silt_scanner_fix_limit(scanner, (uint32_t)fixed);
+  // Follow the limit (and the time-weighted mean of it) while the scan runs.
   silt_progress p;
+  double limit_sum = 0, limit_time = 0, last_t = now_s();
+  uint32_t last_limit = 0, max_limit = 0, max_threads = 0;
+  for (;;) {
+    silt_scanner_progress(scanner, &p);
+    double t = now_s();
+    if (last_limit) {
+      limit_sum += last_limit * (t - last_t);
+      limit_time += t - last_t;
+    }
+    if (curve && p.limit != last_limit) printf("  %6.2fs  limit %u  threads %u\n", t - w0, p.limit, p.threads);
+    last_limit = p.limit;
+    last_t = t;
+    if (p.limit > max_limit) max_limit = p.limit;
+    if (p.threads > max_threads) max_threads = p.threads;
+    if (p.urgent_queued == 0) break;
+    usleep(curve ? 5000 : 20000);
+  }
+  silt_scanner_wait_idle(scanner);
+  const double wall = now_s() - w0;
+  getrusage(RUSAGE_SELF, &r1);
+  sampling = false;
+  pthread_join(sampler_thread, NULL);
+  const uint64_t scan_peak = peak;
+
   silt_scanner_progress(scanner, &p);
   silt_memory m;
   silt_tree_memory_stats(tree, &m);
@@ -144,6 +192,23 @@ int main(int argc, char **argv) {
          (unsigned long long)p.dirs, (unsigned long long)p.denied,
          (double)p.bytes / 1e9, (double)p.files / p.elapsed / 1e6,
          (m.entry_bytes + m.dir_bytes + m.name_bytes) / 1e6);
+  printf("wall=%.3fs  user=%.2fs  sys=%.2fs  limit: final=%u mean=%.1f max=%u%s  threads max=%u  "
+         "peak footprint=%.0f MB\n",
+         wall, cpu_s(r1.ru_utime) - cpu_s(r0.ru_utime), cpu_s(r1.ru_stime) - cpu_s(r0.ru_stime), p.limit,
+         limit_time > 0 ? limit_sum / limit_time : (double)p.limit, max_limit, fixed ? " (fixed)" : "",
+         max_threads, scan_peak / 1e6);
+  fflush(stdout);
+  if (getenv("SILT_SETTLE")) {
+    // Idle workers exit on their own; wait for that, then see what's left.
+    silt_scanner_set_idle_timeout(scanner, atof(getenv("SILT_SETTLE")));
+    double deadline = now_s() + atof(getenv("SILT_SETTLE")) + 5;
+    do {
+      usleep(50000);
+      silt_scanner_progress(scanner, &p);
+    } while (p.threads > 0 && now_s() < deadline);
+    printf("settled: threads=%u  footprint=%.0f MB\n", p.threads, footprint() / 1e6);
+    fflush(stdout);
+  }
   if (getenv("SILT_TOP")) {
     uint32_t top[10];
     uint32_t n = silt_top_files(tree, 0, top, 10);

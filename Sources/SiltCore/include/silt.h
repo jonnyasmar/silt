@@ -50,6 +50,9 @@ enum {
   SILT_DIR_INCOMPLETE = 1 << 4, // the last listing stopped early on an error
   SILT_DIR_ACTIVE = 1 << 5,     // this directory is being listed now
   SILT_DIR_DIRTY = 1 << 6,      // list it once more after the active listing
+  // The pending listing (the queued one, or the follow-up after the active
+  // one) is urgent work. Snapshots never store it.
+  SILT_DIR_URGENT = 1 << 7,
 };
 
 typedef struct silt_entry {
@@ -133,7 +136,11 @@ uint64_t silt_tree_generation(const silt_tree *t);
 
 // Lock held. A value that changes whenever anything in `dir`'s subtree
 // changes: its run, or any descendant's size, items, newest, pending, or
-// flags. Equal stamps mean nothing under `dir` changed. Not persisted.
+// flags. Equal stamps mean nothing under `dir` changed. Values come from one
+// process-wide counter, so they're never reused, not even by another tree,
+// and after a snapshot load or an unpark every folder has a value nobody saw
+// before. Only equality means anything; don't compare with < or >. Not
+// persisted. 0 for a parked tree or a dir id past the end.
 uint32_t silt_dir_stamp(const silt_tree *t, uint32_t dir);
 
 typedef struct silt_memory {
@@ -162,7 +169,8 @@ uint32_t silt_children_sorted(const silt_tree *t, uint32_t dir, int key,
 
 // The same, but called WITHOUT the lock: it takes the lock only to copy what
 // it sorts by, and sorts after releasing it. The caller guarantees the tree
-// isn't being parked meanwhile (names must stay mapped).
+// isn't parked or being parked meanwhile (names must stay mapped). The order
+// is as of the moment the lock was held; the folder may have changed since.
 uint32_t silt_children_sorted_unlocked(silt_tree *t, uint32_t dir, int key,
                                        uint32_t *out, uint32_t cap);
 
@@ -186,23 +194,34 @@ typedef struct silt_progress {
   uint64_t bytes;
   uint64_t denied;
   uint64_t listed;  // entries listed so far, across scans and refreshes
-  uint32_t queued;  // listings waiting or running
+  uint32_t queued;  // listings waiting or running, urgent or not
   uint32_t active;  // listings running right now
   bool idle;        // nothing queued or running
   double elapsed;   // seconds since the most recent full scan began
   double finished;  // seconds the most recent full scan took (0 while running)
-  uint32_t urgent_queued; // urgent listings waiting or running
-  uint32_t limit;         // listings allowed to run at once right now
-  uint32_t threads;       // worker threads alive
+  // Urgent listings waiting or running. Once an urgent refresh returns, this
+  // counts it until the listing and every listing it leads to (new folders,
+  // a deep refresh's subfolders, follow-ups) are done, so reaching 0 means
+  // that work is finished. Background work may still be running.
+  uint32_t urgent_queued;
+  uint32_t limit;   // urgent listings allowed to run at once right now
+  uint32_t threads; // worker threads alive (0 once idle for a while)
 } silt_progress;
 
-// Starts a pool of `threads` workers bound to `t` and queues a full scan of the
-// root. The scanner stays alive afterwards to serve refreshes.
+// Starts a scanner bound to `t` and queues a full scan of the root, as
+// urgent work. The scanner stays alive afterwards to serve refreshes.
+//
+// Workers are threads started as work arrives and ended after a few idle
+// seconds, so an idle scanner has none. `threads` is the most there will
+// ever be. How many urgent listings run at once adapts between 2 and that
+// maximum, to what the storage gives back for the CPU spent; background
+// listings run at most 2 at a time, at utility priority.
 //
 // Threading: progress/refresh may be called from any thread, but never
 // concurrently with silt_scanner_destroy, and the tree must outlive the
 // scanner. Cancellation is terminal: it is meant to precede destroy.
 silt_scanner *silt_scanner_start(silt_tree *t, int threads);
+// Never takes the tree lock, so it's quick even while a query holds it.
 void silt_scanner_progress(silt_scanner *s, silt_progress *out);
 // Stops workers after their current listing; queued work is discarded.
 void silt_scanner_cancel(silt_scanner *s);
@@ -216,7 +235,7 @@ void silt_scanner_destroy(silt_scanner *s);
 // subfolder is re-listed too, recursively, but in place: sizes and identities
 // stay put until each folder's fresh listing replaces them, so a rescan never
 // empties the tree. Duplicate requests coalesce; a deep request upgrades a
-// pending shallow one.
+// pending shallow one. Runs as background work (see silt_scanner_refresh_ex).
 void silt_scanner_refresh(silt_scanner *s, uint32_t dir, bool deep);
 
 #define SILT_REFRESH_DEEP 1u
@@ -224,6 +243,9 @@ void silt_scanner_refresh(silt_scanner *s, uint32_t dir, bool deep);
 
 // Like silt_scanner_refresh, with flags. Without SILT_REFRESH_URGENT the
 // listing (and everything it queues beneath it) runs as background work.
+// An urgent request upgrades a pending background one, including one that's
+// already running: that listing finishes at background priority, but it
+// counts as urgent, and its follow-up and what it queues are urgent.
 void silt_scanner_refresh_ex(silt_scanner *s, uint32_t dir, uint32_t flags);
 
 // Marks `entry` removed and subtracts it from every ancestor immediately, so
@@ -234,6 +256,13 @@ void silt_tree_remove(silt_tree *t, uint32_t entry);
 // Like silt_scanner_start, but queues nothing: for a tree restored from a
 // snapshot, which only needs refreshes.
 silt_scanner *silt_scanner_start_idle(silt_tree *t, int threads);
+
+// Tuning, for tests and benchmarks.
+// Seconds an idle worker waits for work before it exits (5 by default).
+void silt_scanner_set_idle_timeout(silt_scanner *s, double seconds);
+// Pins the number of urgent listings allowed at once (clamped to the
+// maximum), turning the adaptive controller off; 0 turns it back on.
+void silt_scanner_fix_limit(silt_scanner *s, uint32_t limit);
 
 // MARK: Snapshots
 

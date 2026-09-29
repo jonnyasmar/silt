@@ -155,6 +155,8 @@ bool silt_tree_park(silt_tree *t, const char *path) {
       tree_chunk_free(t->names[c], NAME_CHUNK);
       t->names[c] = c < nc ? zn : NULL;
     }
+    // Stamps aren't worth keeping: unparking hands out fresh ones.
+    tree_stamp_release(t);
     in->parked = true;
   }
   silt_tree_unlock(t);
@@ -258,6 +260,9 @@ bool silt_tree_unpark(silt_tree *t, const char *path) {
     for (uint32_t c = 0; c < dc; c++) t->dirs[c] = dirs[c];
     for (uint32_t c = 0; c < nc; c++) t->names[c] = names[c];
     in->parked = false;
+    // Every folder gets a stamp nobody saw before parking, so views that
+    // remember stamps redo their work once.
+    tree_stamp_all(t);
     TREE_BUMP(t);
   } else {
     for (uint32_t c = 0; c < ec; c++)

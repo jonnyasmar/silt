@@ -3,7 +3,6 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <mach/vm_statistics.h>
 #include <sys/mman.h>
 
@@ -16,6 +15,12 @@ static void *xcalloc(size_t n, size_t size) {
   if (!p) abort();
   return p;
 }
+
+#define FOLD1(c) (uint8_t)((c) >= 'A' && (c) <= 'Z' ? (c) + 32 : (c))
+#define FOLD4(c) FOLD1(c), FOLD1((c) + 1), FOLD1((c) + 2), FOLD1((c) + 3)
+#define FOLD16(c) FOLD4(c), FOLD4((c) + 4), FOLD4((c) + 8), FOLD4((c) + 12)
+#define FOLD64(c) FOLD16(c), FOLD16((c) + 16), FOLD16((c) + 32), FOLD16((c) + 48)
+const uint8_t silt_ascii_fold[256] = {FOLD64(0), FOLD64(64), FOLD64(128), FOLD64(192)};
 
 // MARK: Freed chunks
 
@@ -107,6 +112,7 @@ silt_tree *silt_tree_create(const char *root_path) {
   silt_internal *in = xcalloc(1, sizeof *in);
   in->lock = OS_UNFAIR_LOCK_INIT;
   in->chunk_live = xcalloc(SILT_ENTRY_CHUNKS, sizeof *in->chunk_live);
+  in->stamps = xcalloc(SILT_DIR_CHUNKS, sizeof *in->stamps);
   t->internal = in;
 
   size_t len = strlen(root_path);
@@ -128,6 +134,7 @@ silt_tree *silt_tree_create(const char *root_path) {
   };
   t->entry_count = 1;
   tree_claim_run(t, 0, 1); // the root's own entry belongs to no run
+  in->stamp_now = 0;
   return t;
 }
 
@@ -157,16 +164,21 @@ void silt_tree_destroy(silt_tree *t) {
     if (t->dirs[i] != zd) tree_chunk_free(t->dirs[i], DIR_CHUNK * sizeof(silt_dir));
   for (uint32_t i = 0; i < SILT_NAME_CHUNKS && t->names[i]; i++)
     if (t->names[i] != zn) tree_chunk_free(t->names[i], NAME_CHUNK);
+  if (silt_int(t)->stamps) tree_stamp_release(t);
   free(t->entries);
   free(t->dirs);
   free(t->names);
   free(silt_int(t)->chunk_live);
+  free(silt_int(t)->stamps);
   free(t->internal);
   free(t);
 }
 
 void silt_tree_lock(silt_tree *t) { os_unfair_lock_lock(&silt_int(t)->lock); }
 void silt_tree_unlock(silt_tree *t) {
+  // Whatever changed in this hold is one batch: the next change gets a new
+  // stamp, so anyone who read a stamp meanwhile sees it move.
+  silt_int(t)->stamp_now = 0;
   os_unfair_lock_unlock(&silt_int(t)->lock);
 }
 
@@ -174,17 +186,73 @@ uint64_t silt_tree_generation(const silt_tree *t) {
   return __atomic_load_n(&t->generation, __ATOMIC_ACQUIRE);
 }
 
-uint32_t silt_children_sorted_unlocked(silt_tree *t, uint32_t dir, int key,
-                                       uint32_t *out, uint32_t cap) {
-  silt_tree_lock(t);
-  uint32_t n = silt_children_sorted(t, dir, key, out, cap);
-  silt_tree_unlock(t);
-  return n;
+void tree_publish(silt_tree *t) {
+  silt_internal *in = silt_int(t);
+  __atomic_store_n(&in->root_size, silt_entry_at(t, 0)->size, __ATOMIC_RELAXED);
+  __atomic_store_n(&in->root_items, silt_dir_at(t, 0)->items, __ATOMIC_RELAXED);
+  __atomic_add_fetch(&t->generation, 1, __ATOMIC_RELEASE);
+}
+
+// MARK: Stamps
+
+#define STAMP_CHUNK_BYTES ((size_t)DIR_CHUNK * sizeof(uint32_t))
+
+// One counter for the whole process: a value handed out once is never handed
+// out again (until it wraps, after 2^32 change batches), whichever tree asks.
+static uint32_t stamp_counter;
+
+static uint32_t stamp_fresh(void) {
+  uint32_t v;
+  do v = __atomic_add_fetch(&stamp_counter, 1, __ATOMIC_RELAXED);
+  while (v == 0); // 0 means "no stamp"
+  return v;
+}
+
+// The stamp for changes made in this lock hold.
+static uint32_t stamp_current(silt_tree *t) {
+  silt_internal *in = silt_int(t);
+  if (in->stamp_now == 0) in->stamp_now = stamp_fresh();
+  return in->stamp_now;
+}
+
+static uint32_t *stamp_slot(silt_tree *t, uint32_t dir) {
+  return &silt_int(t)->stamps[dir >> SILT_DIR_SHIFT][dir & SILT_DIR_MASK];
+}
+
+void tree_stamp_one(silt_tree *t, uint32_t dir) {
+  if (dir < t->dir_count) *stamp_slot(t, dir) = stamp_current(t);
+}
+
+void tree_touch(silt_tree *t, uint32_t dir) {
+  const uint32_t now = stamp_current(t);
+  while (dir != SILT_NONE && dir < t->dir_count) {
+    *stamp_slot(t, dir) = now;
+    dir = silt_entry_at(t, silt_dir_at(t, dir)->entry)->parent;
+  }
+}
+
+void tree_stamp_all(silt_tree *t) {
+  silt_internal *in = silt_int(t);
+  const uint32_t now = stamp_current(t);
+  const uint32_t chunks = (t->dir_count + DIR_CHUNK - 1) / DIR_CHUNK;
+  for (uint32_t c = 0; c < chunks; c++) {
+    if (!in->stamps[c]) in->stamps[c] = tree_chunk_alloc(STAMP_CHUNK_BYTES);
+    for (uint32_t i = 0; i < DIR_CHUNK; i++) in->stamps[c][i] = now;
+  }
+}
+
+void tree_stamp_release(silt_tree *t) {
+  silt_internal *in = silt_int(t);
+  for (uint32_t c = 0; c < SILT_DIR_CHUNKS && in->stamps[c]; c++) {
+    tree_chunk_free(in->stamps[c], STAMP_CHUNK_BYTES);
+    in->stamps[c] = NULL;
+  }
 }
 
 uint32_t silt_dir_stamp(const silt_tree *t, uint32_t dir) {
-  (void)dir;
-  return (uint32_t)silt_tree_generation(t);
+  const silt_internal *in = silt_int(t);
+  if (in->parked || dir >= t->dir_count) return 0;
+  return in->stamps[dir >> SILT_DIR_SHIFT][dir & SILT_DIR_MASK];
 }
 
 // MARK: Internal mutation
@@ -204,6 +272,11 @@ uint32_t tree_new_dir(silt_tree *t, uint32_t entry, uint64_t file_id,
   if (id == SILT_NONE) abort();
   uint32_t c = id >> SILT_DIR_SHIFT;
   if (!t->dirs[c]) t->dirs[c] = tree_chunk_alloc(DIR_CHUNK * sizeof(silt_dir));
+  silt_internal *in = silt_int(t);
+  if (!in->stamps[c]) in->stamps[c] = tree_chunk_alloc(STAMP_CHUNK_BYTES);
+  // A new folder's stamp differs from the 0 anyone got by asking early. Its
+  // ancestors move when the listing that found it commits.
+  in->stamps[c][id & SILT_DIR_MASK] = stamp_current(t);
   *silt_dir_at(t, id) = (silt_dir){
       .file_id = file_id,
       .entry = entry,
@@ -282,9 +355,11 @@ void tree_detach(silt_tree *t, uint32_t dir) {
   } while (0)
   DPUSH(dir);
   while (n) {
-    silt_dir *d = silt_dir_at(t, stack[--n]);
+    const uint32_t id = stack[--n];
+    silt_dir *d = silt_dir_at(t, id);
     if (d->state & SILT_DIR_DETACHED) continue;
     d->state |= SILT_DIR_DETACHED;
+    tree_stamp_one(t, id); // the caller's propagate moves the ancestors'
     // Folders beneath go too; removed ones were detached when removed.
     for (uint32_t i = d->first, end = d->first + d->count; i < end; i++) {
       const silt_entry *e = silt_entry_at(t, i);
@@ -359,8 +434,11 @@ uint32_t tree_put_names(silt_tree *t, const uint8_t *buf, uint32_t len,
   return tree_put_name(t, buf, len);
 }
 
+// Every commit ends here, even one whose deltas are all zero: its folder's
+// run changed, so the stamps up the chain move regardless.
 void tree_propagate(silt_tree *t, uint32_t dir, int64_t size, int64_t items,
                     uint32_t newest, int64_t pending) {
+  const uint32_t now = stamp_current(t);
   while (dir != SILT_NONE) {
     silt_dir *d = silt_dir_at(t, dir);
     silt_entry *e = silt_entry_at(t, d->entry);
@@ -368,13 +446,16 @@ void tree_propagate(silt_tree *t, uint32_t dir, int64_t size, int64_t items,
     d->items = (uint32_t)((int64_t)d->items + items);
     if (newest > d->newest) d->newest = newest;
     d->pending = (uint32_t)((int64_t)d->pending + pending);
+    *stamp_slot(t, dir) = now;
     dir = e->parent;
   }
 }
 
 void tree_recompute_newest(silt_tree *t, uint32_t dir) {
+  const uint32_t now = stamp_current(t);
   while (dir != SILT_NONE) {
     silt_dir *d = silt_dir_at(t, dir);
+    *stamp_slot(t, dir) = now;
     uint32_t newest = 0;
     for (uint32_t i = d->first, end = d->first + d->count; i < end; i++) {
       const silt_entry *e = silt_entry_at(t, i);
@@ -448,74 +529,216 @@ size_t silt_path(const silt_tree *t, uint32_t entry, char *buf, size_t cap) {
   return len;
 }
 
-static int name_cmp(const silt_tree *t, const silt_entry *a,
-                    const silt_entry *b) {
-  size_t n = a->name_len < b->name_len ? a->name_len : b->name_len;
-  int c = strncasecmp((const char *)silt_name_ptr(t, a->name),
-                      (const char *)silt_name_ptr(t, b->name), n);
-  if (c) return c;
-  return (int)a->name_len - (int)b->name_len;
-}
+// MARK: Sorting children
+//
+// Each child becomes a record of plain integers, compared without looking
+// anything up: the sort keys, then the first 16 bytes of the name, case
+// folded and packed big-endian so integer order is name order. Only records
+// that tie on all of that (names sharing a 16-byte prefix, which is rare
+// even in folders where most names start alike, like com.apple.*) compare
+// the rest of their names. The order is the same as a case-insensitive name
+// comparison: folded bytes first, then the shorter name first.
 
-static uint32_t sort_items(const silt_tree *t, const silt_entry *e) {
-  if (e->kind != SILT_KIND_DIR) return 0;
-  return silt_dir_at(t, e->aux)->items;
-}
+typedef struct sort_rec {
+  uint64_t k1, k2;       // sort keys, ascending (descending ones are inverted)
+  uint64_t name0, name1; // folded name bytes 0-7 and 8-15, zero-padded
+  uint32_t index;  // entry index
+  uint32_t name;   // name offset in the arena
+  uint16_t len;    // name length
+} sort_rec;
 
-static uint32_t sort_mtime(const silt_tree *t, const silt_entry *e) {
-  if (e->kind != SILT_KIND_DIR) return e->aux;
-  return silt_dir_at(t, e->aux)->newest;
-}
+// Inverts a size so that ascending order is largest first.
+static inline uint64_t size_desc(int64_t size) { return (uint64_t)INT64_MAX - (uint64_t)size; }
 
-typedef struct {
-  const silt_tree *t;
-  int key;
-} sort_ctx;
-
-static int child_cmp(void *ctx, const void *pa, const void *pb) {
-  const sort_ctx *c = ctx;
-  const silt_entry *a = silt_entry_at(c->t, *(const uint32_t *)pa);
-  const silt_entry *b = silt_entry_at(c->t, *(const uint32_t *)pb);
-  switch (c->key) {
+// Fills in a record's keys from its entry. Lock held.
+static void sort_keys(const silt_tree *t, int key, uint32_t i, sort_rec *r) {
+  const silt_entry *e = silt_entry_at(t, i);
+  const bool dir = e->kind == SILT_KIND_DIR;
+  r->index = i;
+  r->name = e->name;
+  r->len = e->name_len;
+  r->k2 = 0;
+  switch (key) {
   case 0:
-    if (a->size != b->size) return a->size > b->size ? -1 : 1;
+    r->k1 = size_desc(e->size);
     break;
-  case 2: {
-    uint32_t x = sort_items(c->t, a), y = sort_items(c->t, b);
-    if (x != y) return x > y ? -1 : 1;
-    if (a->size != b->size) return a->size > b->size ? -1 : 1;
+  case 2:
+    r->k1 = UINT32_MAX - (dir ? silt_dir_at(t, e->aux)->items : 0);
+    r->k2 = size_desc(e->size);
     break;
-  }
-  case 3: {
-    uint32_t x = sort_mtime(c->t, a), y = sort_mtime(c->t, b);
-    if (x != y) return x > y ? -1 : 1;
+  case 3:
+    r->k1 = UINT32_MAX - (dir ? silt_dir_at(t, e->aux)->newest : e->aux);
     break;
-  }
   default:
+    r->k1 = 0;
     break;
   }
-  return name_cmp(c->t, a, b);
+}
+
+// Names never move or change once written, so this is safe without the lock
+// as long as the tree isn't parked.
+static void sort_name(const silt_tree *t, sort_rec *r) {
+  const uint8_t *s = silt_name_ptr(t, r->name);
+  uint64_t v = 0, w = 0;
+  for (uint32_t k = 0; k < 8; k++) v = (v << 8) | (k < r->len ? silt_ascii_fold[s[k]] : 0);
+  for (uint32_t k = 8; k < 16; k++) w = (w << 8) | (k < r->len ? silt_ascii_fold[s[k]] : 0);
+  r->name0 = v;
+  r->name1 = w;
+}
+
+static inline int rec_cmp(const silt_tree *t, const sort_rec *a, const sort_rec *b) {
+  if (a->k1 != b->k1) return a->k1 < b->k1 ? -1 : 1;
+  if (a->k2 != b->k2) return a->k2 < b->k2 ? -1 : 1;
+  if (a->name0 != b->name0) return a->name0 < b->name0 ? -1 : 1;
+  if (a->name1 != b->name1) return a->name1 < b->name1 ? -1 : 1;
+  // Equal first 16 bytes: the rest of the names decide, then their lengths.
+  const uint32_t n = a->len < b->len ? a->len : b->len;
+  if (n > 16) {
+    const uint8_t *x = silt_name_ptr(t, a->name), *y = silt_name_ptr(t, b->name);
+    for (uint32_t k = 16; k < n; k++) {
+      uint8_t p = silt_ascii_fold[x[k]], q = silt_ascii_fold[y[k]];
+      if (p != q) return p < q ? -1 : 1;
+    }
+  }
+  if (a->len != b->len) return a->len < b->len ? -1 : 1;
+  return a->index < b->index ? -1 : a->index > b->index;
+}
+
+static inline void rec_swap(sort_rec *a, sort_rec *b) {
+  sort_rec x = *a;
+  *a = *b;
+  *b = x;
+}
+
+static void rec_sift(const silt_tree *t, sort_rec *r, size_t k, size_t n) {
+  for (;;) {
+    size_t c = 2 * k + 1;
+    if (c >= n) return;
+    if (c + 1 < n && rec_cmp(t, &r[c], &r[c + 1]) < 0) c++;
+    if (rec_cmp(t, &r[k], &r[c]) >= 0) return;
+    rec_swap(&r[k], &r[c]);
+    k = c;
+  }
+}
+
+// Introsort: quicksort with a median-of-three pivot, heapsort if it
+// degenerates, insertion sort for short ranges. In place, so a huge folder
+// needs no second buffer.
+static void rec_sort(const silt_tree *t, sort_rec *r, size_t n, int depth) {
+  while (n > 16) {
+    if (depth-- == 0) {
+      for (size_t k = n / 2; k-- > 0;) rec_sift(t, r, k, n);
+      for (size_t k = n; k-- > 1;) {
+        rec_swap(&r[0], &r[k]);
+        rec_sift(t, r, 0, k);
+      }
+      return;
+    }
+    size_t mid = n / 2;
+    if (rec_cmp(t, &r[mid], &r[0]) < 0) rec_swap(&r[mid], &r[0]);
+    if (rec_cmp(t, &r[n - 1], &r[0]) < 0) rec_swap(&r[n - 1], &r[0]);
+    if (rec_cmp(t, &r[n - 1], &r[mid]) < 0) rec_swap(&r[n - 1], &r[mid]);
+    // The pivot waits at n - 2; r[0] and r[n - 1] already bound the scans.
+    rec_swap(&r[mid], &r[n - 2]);
+    const sort_rec pivot = r[n - 2];
+    size_t i = 0, j = n - 2;
+    for (;;) {
+      while (rec_cmp(t, &r[++i], &pivot) < 0) {}
+      while (rec_cmp(t, &pivot, &r[--j]) < 0) {}
+      if (i >= j) break;
+      rec_swap(&r[i], &r[j]);
+    }
+    rec_swap(&r[i], &r[n - 2]);
+    // Recurse into the smaller side, loop on the larger.
+    if (i < n - i - 1) {
+      rec_sort(t, r, i, depth);
+      r += i + 1;
+      n -= i + 1;
+    } else {
+      rec_sort(t, r + i + 1, n - i - 1, depth);
+      n = i;
+    }
+  }
+  for (size_t k = 1; k < n; k++) {
+    sort_rec x = r[k];
+    size_t j = k;
+    while (j > 0 && rec_cmp(t, &x, &r[j - 1]) < 0) {
+      r[j] = r[j - 1];
+      j--;
+    }
+    r[j] = x;
+  }
+}
+
+// Record buffers for big folders come straight from the kernel, so they
+// really go back when the sort is done.
+#define SORT_MMAP_BYTES (256u << 10)
+
+static sort_rec *recs_alloc(size_t n) {
+  size_t bytes = n * sizeof(sort_rec);
+  sort_rec *r = bytes >= SORT_MMAP_BYTES ? tree_chunk_alloc(bytes) : malloc(bytes ? bytes : 1);
+  if (!r) abort();
+  return r;
+}
+
+static void recs_free(sort_rec *r, size_t n) {
+  size_t bytes = n * sizeof(sort_rec);
+  if (bytes >= SORT_MMAP_BYTES) tree_chunk_free(r, bytes);
+  else free(r);
+}
+
+// Copies the live children of `dir` into records (keys only). Lock held.
+// Returns the count; *out_recs must be freed with recs_free(*, *cap_out).
+static uint32_t collect_children(const silt_tree *t, uint32_t dir, int key, sort_rec **out_recs,
+                                 size_t *cap_out) {
+  const silt_dir *d = silt_dir_at(t, dir);
+  sort_rec *r = recs_alloc(d->count);
+  uint32_t n = 0;
+  for (uint32_t i = d->first, end = d->first + d->count; i < end; i++) {
+    if (silt_entry_at(t, i)->flags & SILT_FLAG_REMOVED) continue;
+    sort_keys(t, key, i, &r[n++]);
+  }
+  *out_recs = r;
+  *cap_out = d->count;
+  return n;
+}
+
+static uint32_t finish_sort(const silt_tree *t, sort_rec *r, uint32_t n, uint32_t *out, uint32_t cap) {
+  for (uint32_t k = 0; k < n; k++) sort_name(t, &r[k]);
+  int depth = 2;
+  for (uint32_t m = n; m > 1; m >>= 1) depth += 2;
+  rec_sort(t, r, n, depth);
+  if (n > cap) n = cap;
+  for (uint32_t k = 0; k < n; k++) out[k] = r[k].index;
+  return n;
 }
 
 uint32_t silt_children_sorted(const silt_tree *t, uint32_t dir, int key,
                               uint32_t *out, uint32_t cap) {
   if (dir >= t->dir_count || cap == 0) return 0;
-  const silt_dir *d = silt_dir_at(t, dir);
-  // Sort every live child, then keep the first `cap`.
-  uint32_t *all = cap >= d->count ? out : malloc(d->count * sizeof *all);
-  if (!all) abort();
-  uint32_t n = 0;
-  for (uint32_t i = d->first, end = d->first + d->count; i < end; i++) {
-    if (silt_entry_at(t, i)->flags & SILT_FLAG_REMOVED) continue;
-    all[n++] = i;
+  sort_rec *r;
+  size_t rcap;
+  uint32_t n = collect_children(t, dir, key, &r, &rcap);
+  n = finish_sort(t, r, n, out, cap);
+  recs_free(r, rcap);
+  return n;
+}
+
+uint32_t silt_children_sorted_unlocked(silt_tree *t, uint32_t dir, int key,
+                                       uint32_t *out, uint32_t cap) {
+  if (cap == 0) return 0;
+  silt_tree_lock(t);
+  if (dir >= t->dir_count) {
+    silt_tree_unlock(t);
+    return 0;
   }
-  sort_ctx ctx = {t, key};
-  qsort_r(all, n, sizeof *all, &ctx, child_cmp);
-  if (all != out) {
-    if (n > cap) n = cap;
-    memcpy(out, all, n * sizeof *out);
-    free(all);
-  }
+  sort_rec *r;
+  size_t rcap;
+  uint32_t n = collect_children(t, dir, key, &r, &rcap);
+  silt_tree_unlock(t);
+  // Everything from here reads only the records and the name arena.
+  n = finish_sort(t, r, n, out, cap);
+  recs_free(r, rcap);
   return n;
 }
 
