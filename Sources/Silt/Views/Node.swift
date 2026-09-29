@@ -22,6 +22,14 @@ final class Node: NSObject {
     /// joined or left it.
     var stamp: (first: UInt32, count: UInt32, version: UInt32) = (NONE, 0, 0)
     var order: [UInt32] = []
+    /// Folders: what `order` was last sorted against. The subtree stamp
+    /// (`Tree.stamp(of:)`) says whether anything under the folder changed
+    /// since; the key says what it was sorted by; the time and cost pace
+    /// the next re-sort.
+    var subtreeStamp: UInt32?
+    var sortedBy = -1
+    var sortedAt: CFTimeInterval = -.infinity
+    var sortCost: CFTimeInterval = 0
     var expandable = false
     /// What the outline last asked about, so changes can be pushed to it.
     var shownExpandable = false
@@ -43,6 +51,7 @@ final class Node: NSObject {
 
     private var cachedName: String?
     private var cachedIcon: NSImage?
+    private var cachedCategory: FileCategory?
 
     init(entry: UInt32, value e: silt_entry, parent: Node?) {
         self.entry = entry
@@ -78,8 +87,16 @@ final class Node: NSObject {
 
     var isDir: Bool { kind == .dir }
 
-    /// The name if it has been decoded, for coloring by type.
-    var nameForColor: String { cachedName ?? "" }
+    /// The kind of file, for coloring by type. Worked out once the name has
+    /// been decoded; until then it's `.other`, and not remembered.
+    var category: FileCategory {
+        if let cachedCategory { return cachedCategory }
+        guard let cachedName else { return .other }
+        let c = FileCategory.of(name: cachedName)
+        cachedCategory = c
+        return c
+    }
+
     var isReal: Bool { kind == .file || kind == .dir }
     var ref: ItemRef { ItemRef(entry: entry, dir: dir) }
 
@@ -164,6 +181,26 @@ enum Icons {
         let icon = NSWorkspace.shared.icon(for: type)
         icon.size = NSSize(width: 16, height: 16)
         byType[ext] = icon
+        return icon
+    }
+}
+
+/// The icons of particular files and folders, which NSWorkspace reads from
+/// disk. The inspector, Duplicates and the cleanup review redraw often, so
+/// each path is looked up once per size rather than on every redraw.
+enum IconCache {
+    private static let cache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        c.countLimit = 1_000
+        return c
+    }()
+
+    static func icon(forFile path: String, size: CGFloat) -> NSImage {
+        let key = "\(Int(size))\u{0}\(path)" as NSString
+        if let hit = cache.object(forKey: key) { return hit }
+        let icon = NSWorkspace.shared.icon(forFile: path)
+        icon.size = NSSize(width: size, height: size)
+        cache.setObject(icon, forKey: key)
         return icon
     }
 }

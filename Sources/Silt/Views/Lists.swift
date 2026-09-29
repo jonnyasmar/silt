@@ -6,10 +6,44 @@ import SwiftUI
     session.phase == .live ? "live-\(session.quietVersion)" : "scan-\(session.version / 10)"
 }
 
+/// Which folder a whole-subtree result was computed for, and its subtree
+/// stamp then. While the stamp holds, nothing under the folder changed, so
+/// the result still holds too.
+struct SubtreeResult: Equatable {
+    let dir: UInt32
+    let stamp: UInt32
+
+    @MainActor init(_ session: Session, dir: UInt32) {
+        self.dir = dir
+        let tree = session.tree
+        stamp = tree.withLock { tree.stamp(of: dir) }
+    }
+
+    /// Whether `previous` is still good. A stamp of 0 means the tree can't
+    /// say (it's parked), so the query runs.
+    func matches(_ previous: SubtreeResult?) -> Bool {
+        stamp != 0 && previous == self
+    }
+}
+
+/// Runs a whole-tree query off the main thread and tells the session what
+/// it cost, so `quietVersion` can pace these passes by what they take.
+@MainActor func measuredQuery<T: Sendable>(_ session: Session, priority: TaskPriority,
+                                           _ query: @escaping @Sendable () -> T) async -> T {
+    let (result, cost) = await Task.detached(priority: priority) {
+        let start = ProcessInfo.processInfo.systemUptime
+        let result = query()
+        return (result, ProcessInfo.processInfo.systemUptime - start)
+    }.value
+    session.noteQueryCost(cost)
+    return result
+}
+
 struct LargestFiles: View {
     let session: Session
     @State private var entries: [UInt32] = []
     @State private var stamp = 0
+    @State private var computed: SubtreeResult?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,14 +58,17 @@ struct LargestFiles: View {
             guard !Task.isCancelled else { return }
             let tree = session.tree
             let focus = session.focus
-            let result = await Task.detached(priority: .userInitiated) {
+            let now = SubtreeResult(session, dir: focus)
+            if now.matches(computed) { return } // nothing under the folder changed
+            let result = await measuredQuery(session, priority: .userInitiated) {
                 tree.topFiles(under: focus, limit: 1000)
-            }.value
+            }
             guard !Task.isCancelled else { return }
             if result != entries || stamp == 0 {
                 entries = result
                 stamp += 1
             }
+            computed = now
         }
     }
 

@@ -234,9 +234,7 @@ private struct MarkedRow: View {
     }
 
     private var icon: NSImage {
-        let i = NSWorkspace.shared.icon(forFile: item.path)
-        i.size = NSSize(width: 22, height: 22)
-        return i
+        IconCache.icon(forFile: item.path, size: 22)
     }
 }
 

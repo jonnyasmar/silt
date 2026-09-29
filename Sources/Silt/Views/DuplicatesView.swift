@@ -5,6 +5,7 @@ struct DuplicatesView: View {
     let session: Session
     @Bindable var finder: DuplicateFinder
     @State private var expanded: Set<String> = []
+    @State private var cache = ResultsCache()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -31,7 +32,13 @@ struct DuplicatesView: View {
             Divider()
             content
         }
-        .onChange(of: session.version) { finder.prune(tree: session.tree) }
+        // Copies move when their folders are relisted, and some go away.
+        // Following `quietVersion` keeps that from redrawing every card at
+        // tick rate while the disk is busy; what the user just did (marks,
+        // trashing, deleting) shows at once.
+        .onAppear { finder.prune(tree: session.tree) }
+        .onChange(of: session.quietVersion) { finder.prune(tree: session.tree) }
+        .onChange(of: UserActions(session)) { finder.prune(tree: session.tree) }
     }
 
     private var subtitle: String {
@@ -123,14 +130,14 @@ struct DuplicatesView: View {
 
     private var results: some View {
         // Sets that share a file name get their folder added to tell them apart.
-        let names = Dictionary(grouping: finder.sets, by: { $0.copies.first?.name ?? "" }).filter { $0.value.count > 1 }
+        let shared = cache.sharedNames(finder.sets)
         // One pass over the marks for every card, instead of a lookup per row.
-        let marked = session.markedPaths()
+        let marked = cache.markedPaths(session)
         return ScrollView {
             LazyVStack(spacing: 8) {
                 ForEach(finder.sets.prefix(2000)) { set in
                     SetCard(session: session, finder: finder, group: set, keeper: finder.keeper(of: set),
-                            disambiguate: names[set.copies.first?.name ?? ""] != nil, marked: marked,
+                            disambiguate: shared.contains(set.copies.first?.name ?? ""), marked: marked,
                             expanded: expandedBinding(set.id)) {
                         markExtras([set], announce: false)
                     }
@@ -158,24 +165,75 @@ struct DuplicatesView: View {
         let rule = finder.keepRule
         Task {
             // Re-checking every copy touches the disk: keep it off the main thread.
-            let (paths, changed) = await Task.detached(priority: .userInitiated) {
-                DuplicateFinder.extras(of: sets, rule: rule)
+            let (copies, changed) = await Task.detached(priority: .userInitiated) {
+                DuplicateFinder.extraCopies(of: sets, rule: rule)
             }.value
-            finishMarking(paths: paths, changed: changed, announce: announce)
+            finishMarking(copies: copies, changed: changed, announce: announce)
         }
     }
 
-    private func finishMarking(paths: [String], changed: Int, announce: Bool) {
-        let refs = session.liveRefs(paths: paths)
-        session.mark(refs, reason: "Duplicate")
+    /// Marks by the identity each copy was just checked against, so nothing
+    /// is looked up on disk again here.
+    private func finishMarking(copies: [DuplicateSet.Copy], changed: Int, announce: Bool) {
+        session.mark(copies: copies, reason: "Duplicate")
         if changed > 0 {
             session.show(Toast(symbol: "exclamationmark.triangle",
                                title: "\(changed) \(changed == 1 ? "copy" : "copies") changed since the search",
                                detail: "They weren’t marked. Search again to compare them fresh."))
         } else if announce {
-            session.show(Toast(symbol: "checklist", title: "Marked \(Fmt.count(refs.count)) extra copies",
+            session.show(Toast(symbol: "checklist", title: "Marked \(Fmt.count(copies.count)) extra copies",
                                detail: "Review them in Cleanup before anything is removed."))
         }
+    }
+}
+
+/// What the user does that can take copies away: marking, trashing,
+/// deleting.
+private struct UserActions: Equatable {
+    let marked: Int
+    let trashed: Int64
+    let freed: Int64
+
+    @MainActor init(_ session: Session) {
+        marked = session.markedCount
+        trashed = session.trashedBytes
+        freed = session.freedBytes
+    }
+}
+
+/// What the results list derives from the sets and the marks, kept until
+/// either changes: the view redraws often while a search streams in.
+@MainActor
+private final class ResultsCache {
+    /// Each set's first copy, which is what names the set.
+    private var firsts: [String] = []
+    private var shared: Set<String> = []
+    /// The marks, and how many of them still resolve (one whose item went
+    /// away drops out of the paths).
+    private var marks: (keys: Set<MarkKey>, live: Int)?
+    private var marked: Set<String> = []
+
+    /// File names more than one set goes by.
+    func sharedNames(_ sets: [DuplicateSet]) -> Set<String> {
+        let now = sets.map { $0.copies.first?.path ?? "" }
+        guard now != firsts else { return shared }
+        firsts = now
+        var seen: Set<String> = []
+        shared = []
+        for path in now {
+            let name = (path as NSString).lastPathComponent
+            if !seen.insert(name).inserted { shared.insert(name) }
+        }
+        return shared
+    }
+
+    func markedPaths(_ session: Session) -> Set<String> {
+        let keys = Set(session.marks.keys)
+        let live = session.markedCount
+        if let marks, marks.keys == keys, marks.live == live { return marked }
+        marks = (keys, live)
+        marked = session.markedPaths()
+        return marked
     }
 }
 
@@ -284,9 +342,7 @@ private struct SetCard: View {
     }
 
     private var icon: NSImage {
-        let i = NSWorkspace.shared.icon(forFile: group.copies.first?.path ?? "/")
-        i.size = NSSize(width: 30, height: 30)
-        return i
+        IconCache.icon(forFile: group.copies.first?.path ?? "/", size: 30)
     }
 }
 

@@ -5,59 +5,53 @@ import SwiftUI
 struct InspectorView: View {
     let session: Session
 
-    private struct Summary {
-        var ref: ItemRef
-        var name: String
-        var path: String
-        var isDir: Bool
-        var size: Int64
-        var items: Int
-        var modified: UInt32
-        var flags: UInt8
-        var parentName: String
-        var parentSize: Int64
-        var top: [(name: String, size: Int64, isDir: Bool)]
-        var guidance: Guidance?
-        var rawAlloc: Int64 = 0
-        /// When its folder (a file's, or its own) was last read; 0 if unknown.
-        var listedAt: UInt32 = 0
-        /// Possibly still what a saved scan saw.
-        var stale = false
-    }
-
     var body: some View {
-        let _ = session.version
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 if session.selection.isEmpty, let pick = session.hiddenSelection, let hidden = session.hidden {
                     HiddenSpaceCard(hidden: hidden, highlight: pick, volume: session.title,
                                     used: session.capacity.map { $0.total - $0.free } ?? 0)
                 } else if session.selection.count > 1 {
-                    multiple
-                } else if let s = summary(for: session.selection.first ?? ItemRef(entry: 0, dir: session.focus)) {
-                    single(s)
+                    SelectionTotal(session: session, refs: session.selection)
+                } else {
+                    ItemInspector(session: session, ref: session.selection.first ?? ItemRef(entry: 0, dir: session.focus),
+                                  isFocus: session.selection.isEmpty)
                 }
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
+}
 
-    // MARK: Single
+/// One item, or the folder being explored when nothing is selected. What it
+/// is (name, kind, icon, guidance) is worked out again only when the item or
+/// its folder's contents change; its numbers follow `version`.
+private struct ItemInspector: View {
+    let session: Session
+    let ref: ItemRef
+    let isFocus: Bool
+    @State private var cache = InspectorCache()
+
+    var body: some View {
+        let _ = session.version
+        if let item = cache.load(ref, in: session) {
+            single(item.header, item.live)
+        }
+    }
 
     @ViewBuilder
-    private func single(_ s: Summary) -> some View {
-        let isFocus = session.selection.isEmpty
+    private func single(_ h: InspectorCache.Header, _ s: InspectorCache.Live) -> some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(nsImage: bigIcon(s.path))
+            Image(nsImage: h.icon)
                 .resizable()
                 .frame(width: 44, height: 44)
             VStack(alignment: .leading, spacing: 2) {
-                Text(s.name)
+                Text(h.name)
                     .font(.system(size: 15, weight: .semibold))
                     .lineLimit(3)
                     .textSelection(.enabled)
-                Text(isFocus ? "\(kind(s)) · \(Fmt.count(s.items)) items" : kind(s))
+                Text(isFocus ? "\(h.kind) · \(Fmt.count(s.items)) items" : h.kind)
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             }
@@ -84,35 +78,35 @@ struct InspectorView: View {
             }
         }
 
-        notes(s)
+        notes(h, s)
 
         if !isFocus {
-            let marked = session.isMarked(s.ref)
+            let marked = session.isMarked(ref)
             HStack(spacing: 8) {
-                Button("Show in Finder") { session.reveal([s.ref]) }
+                Button("Show in Finder") { session.reveal([ref]) }
                 Button { session.quickLook?() } label: {
                     Image(systemName: "eye")
                 }
                 .help("Quick Look")
-                Button { session.toggleMarks([s.ref], reason: s.guidance?.title) } label: {
+                Button { session.toggleMarks([ref], reason: h.guidance?.title) } label: {
                     Image(systemName: marked ? "minus.circle" : "checklist")
                 }
                 .help(marked ? "Remove from Cleanup (M)" : "Mark for Cleanup (M)")
                 .tint(marked ? Brand.color : nil)
-                Button(role: .destructive) { session.moveToTrash([s.ref]) } label: {
+                Button(role: .destructive) { session.moveToTrash([ref]) } label: {
                     Image(systemName: "trash")
                 }
                 .help("Move to Trash")
             }
             .controlSize(.regular)
-            if let g = s.guidance {
+            if let g = h.guidance {
                 GuidanceCard(guidance: g, marked: marked)
             }
-            details(s)
+            details(h, s)
         }
 
-        if s.isDir {
-            Composition(session: session, dir: s.ref.dir)
+        if h.isDir {
+            Composition(session: session, dir: ref.dir)
             if !s.top.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
                     SectionTitle("Largest inside")
@@ -138,7 +132,7 @@ struct InspectorView: View {
     }
 
     @ViewBuilder
-    private func notes(_ s: Summary) -> some View {
+    private func notes(_ h: InspectorCache.Header, _ s: InspectorCache.Live) -> some View {
         let f = s.flags
         if s.stale, let saved = session.restoredFrom {
             let age = Fmt.age(UInt32(saved.timeIntervalSince1970))
@@ -160,7 +154,7 @@ struct InspectorView: View {
         }
         if f & UInt8(SILT_FLAG_CLONE) != 0 {
             Note(symbol: "square.on.square.dashed", color: .secondary,
-                 text: "An APFS clone: it shares \(Fmt.bytes(s.rawAlloc)) of blocks with other copies, so Silt counts only its share (\(Fmt.bytes(s.size))). Deleting it frees little unless every copy goes.") { EmptyView() }
+                 text: "An APFS clone: it shares \(Fmt.bytes(h.rawAlloc)) of blocks with other copies, so Silt counts only its share (\(Fmt.bytes(s.size))). Deleting it frees little unless every copy goes.") { EmptyView() }
         }
         if f & UInt8(SILT_FLAG_HARDLINK) != 0 {
             Note(symbol: "link", color: .secondary,
@@ -173,18 +167,18 @@ struct InspectorView: View {
     }
 
     @ViewBuilder
-    private func details(_ s: Summary) -> some View {
+    private func details(_ h: InspectorCache.Header, _ s: InspectorCache.Live) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             SectionTitle("Details")
             Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 6) {
-                if s.isDir {
+                if h.isDir {
                     GridRow {
                         label("Items")
                         Text(Fmt.count(s.items)).monospacedDigit()
                     }
                 }
                 GridRow {
-                    label(s.isDir ? "Last changed" : "Modified")
+                    label(h.isDir ? "Last changed" : "Modified")
                     Text(s.modified == 0 ? "—" : Date(timeIntervalSince1970: TimeInterval(s.modified))
                         .formatted(date: .abbreviated, time: .shortened))
                 }
@@ -196,7 +190,7 @@ struct InspectorView: View {
                 }
                 GridRow {
                     label("Where")
-                    Text(displayPath(s.path))
+                    Text(displayPath(h.path))
                         .lineLimit(4)
                         .truncationMode(.middle)
                         .textSelection(.enabled)
@@ -207,7 +201,7 @@ struct InspectorView: View {
     }
 
     /// When Silt last read the item's folder, and whether it can vouch for it since.
-    private func scanned(_ s: Summary) -> String {
+    private func scanned(_ s: InspectorCache.Live) -> String {
         let age = Fmt.age(s.listedAt)
         if s.stale { return "\(age) · not checked again yet" }
         let quiet = Date().timeIntervalSince1970 - TimeInterval(s.listedAt) >= 60
@@ -218,11 +212,18 @@ struct InspectorView: View {
         Text(s).foregroundStyle(.secondary).gridColumnAlignment(.trailing)
     }
 
-    // MARK: Multiple
+    private func displayPath(_ p: String) -> String {
+        p.replacingOccurrences(of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~")
+    }
+}
 
-    @ViewBuilder
-    private var multiple: some View {
-        let refs = session.selection
+/// Several items selected: how many, and their total.
+private struct SelectionTotal: View {
+    let session: Session
+    let refs: [ItemRef]
+
+    var body: some View {
+        let _ = session.version
         let total = session.tree.withLock {
             refs.reduce(Int64(0)) { $0 + session.tree.entry(session.entryIndex($1)).size }
         }
@@ -245,75 +246,146 @@ struct InspectorView: View {
             }
         }
     }
+}
 
-    // MARK: Data
+/// What the inspector last worked out for an item, kept across redraws: the
+/// parts that say what it is, which are costly (its guidance, icon and kind)
+/// and change only when the item's folder is relisted, and the biggest
+/// things inside, which change only when its subtree does.
+@MainActor
+private final class InspectorCache {
+    struct Header {
+        var name: String
+        var path: String
+        var isDir: Bool
+        var kind: String
+        var icon: NSImage
+        var guidance: Guidance?
+        /// A clone's blocks, shared or not.
+        var rawAlloc: Int64 = 0
+    }
 
-    private func summary(for ref: ItemRef) -> Summary? {
+    struct Live {
+        var size: Int64
+        var items = 0
+        var modified: UInt32
+        var flags: UInt8
+        var parentName = ""
+        var parentSize: Int64 = 0
+        /// When its folder (a file's, or its own) was last read; 0 if unknown.
+        var listedAt: UInt32 = 0
+        /// Possibly still what a saved scan saw.
+        var stale = false
+        var top: [(name: String, size: Int64, isDir: Bool)] = []
+    }
+
+    private struct Run: Equatable {
+        var first: UInt32 = 0, count: UInt32 = 0, version: UInt32 = 0
+    }
+
+    /// Everything the header depends on. A folder's guidance looks at what's
+    /// beside it and inside it, a file's at what's beside it, so a relist of
+    /// either redoes it; so do new flags, and a file's new size (a clone's
+    /// blocks go with it).
+    private struct HeaderKey: Equatable {
+        var ref: ItemRef
+        var entry: UInt32
+        var flags: UInt8
+        var fileSize: Int64
+        var parent = Run()
+        var own = Run()
+    }
+
+    private var headerKey: HeaderKey?
+    private var header: Header?
+    private var topKey: (dir: UInt32, stamp: UInt32)?
+    private var top: [(name: String, size: Int64, isDir: Bool)] = []
+
+    func load(_ ref: ItemRef, in session: Session) -> (header: Header, live: Live)? {
         let tree = session.tree
-        let dirForTop: UInt32? = tree.withLock {
-            let i = session.entryIndex(ref)
-            let e = tree.entry(i)
-            return tree.isLive(i) && e.isDir ? e.aux : nil
-        }
-        let topEntries = dirForTop.map { tree.topChildren(of: $0, limit: 6) } ?? []
-        return tree.withLock {
+        func run(_ d: silt_dir) -> Run { Run(first: d.first, count: d.count, version: d.version) }
+        typealias Read = (key: HeaderKey, live: Live, topDir: UInt32?, stamp: UInt32)
+        let read: Read? = tree.withLock {
             let i = session.entryIndex(ref)
             guard tree.isLive(i) else { return nil }
             let e = tree.entry(i)
-            var s = Summary(ref: ref, name: i == 0 ? session.title : tree.name(of: e), path: tree.path(of: i),
-                            isDir: e.isDir, size: e.size, items: 0, modified: e.aux, flags: e.flags,
-                            parentName: "", parentSize: 0, top: [])
+            var key = HeaderKey(ref: ref, entry: i, flags: e.flags, fileSize: e.isDir ? 0 : e.size)
+            var live = Live(size: e.size, modified: e.aux, flags: e.flags)
             if e.isDir || e.parent != NONE {
                 let d = tree.dir(e.isDir ? e.aux : e.parent)
-                s.listedAt = d.listed_at
-                s.stale = session.isStale(d)
+                live.listedAt = d.listed_at
+                live.stale = session.isStale(d)
             }
             if e.isDir {
                 let d = tree.dir(e.aux)
-                s.items = Int(d.items)
-                s.modified = d.newest
-                s.top = topEntries.filter { tree.isLive($0) }.map { c in
-                    let ce = tree.entry(c)
-                    return (tree.name(of: ce), ce.size, ce.isDir)
-                }
+                live.items = Int(d.items)
+                live.modified = d.newest
+                key.own = run(d)
             }
             if e.parent != NONE {
                 let pe = tree.entry(tree.dirEntry(e.parent))
-                s.parentName = e.parent == 0 ? session.title : tree.name(of: pe)
-                s.parentSize = pe.size
+                live.parentName = e.parent == 0 ? session.title : tree.name(of: pe)
+                live.parentSize = pe.size
+                key.parent = run(tree.dir(e.parent))
             }
-            s.guidance = Guide.classify(tree: tree, entry: i, name: s.name) { tree.path(of: i) }
-            if e.flags & UInt8(SILT_FLAG_CLONE) != 0 {
-                var st = stat()
-                if lstat(s.path, &st) == 0 { s.rawAlloc = Int64(st.st_blocks) * 512 }
-            }
-            return s
+            return (key, live, e.isDir ? e.aux : nil, e.isDir ? tree.stamp(of: e.aux) : 0)
         }
+        guard let read else { return nil }
+        let key = read.key
+        var live = read.live
+
+        if key != headerKey || header == nil {
+            let made: Header? = tree.withLock {
+                guard tree.isLive(key.entry) else { return nil }
+                let e = tree.entry(key.entry)
+                let name = key.entry == 0 ? session.title : tree.name(of: e)
+                let path = tree.path(of: key.entry)
+                let guidance = Guide.classify(tree: tree, entry: key.entry, name: name) { path }
+                return Header(name: name, path: path, isDir: e.isDir, kind: "", icon: NSImage(), guidance: guidance)
+            }
+            guard var h = made else { return nil }
+            h.kind = kind(of: ref, name: h.name, isDir: h.isDir, isVolume: session.isVolume)
+            h.icon = IconCache.icon(forFile: h.path, size: 64)
+            if key.flags & UInt8(SILT_FLAG_CLONE) != 0 {
+                var st = stat()
+                if lstat(h.path, &st) == 0 { h.rawAlloc = Int64(st.st_blocks) * 512 }
+            }
+            header = h
+            headerKey = key
+        }
+
+        if let dir = read.topDir {
+            // A stamp of 0 means the tree can't say, so look again.
+            let stamp = read.stamp
+            if topKey.map({ $0.dir != dir || $0.stamp != stamp }) ?? true || stamp == 0 {
+                let entries = tree.topChildren(of: dir, limit: 6)
+                top = tree.withLock {
+                    entries.filter { tree.isLive($0) }.map { c in
+                        let ce = tree.entry(c)
+                        return (tree.name(of: ce), ce.size, ce.isDir)
+                    }
+                }
+                topKey = (dir, stamp)
+            }
+            live.top = top
+        }
+        guard let header else { return nil }
+        return (header, live)
     }
 
-    private func kind(_ s: Summary) -> String {
-        if s.ref.entry == 0 && s.ref.dir == 0 { return session.isVolume ? "Volume" : "Folder" }
-        if s.isDir {
-            let ext = (s.name as NSString).pathExtension
+    private func kind(of ref: ItemRef, name: String, isDir: Bool, isVolume: Bool) -> String {
+        if ref.entry == 0 && ref.dir == 0 { return isVolume ? "Volume" : "Folder" }
+        if isDir {
+            let ext = (name as NSString).pathExtension
             if !ext.isEmpty, let t = UTType(filenameExtension: ext, conformingTo: .directory), t.conforms(to: .package) {
                 return t.localizedDescription ?? "Package"
             }
             return "Folder"
         }
-        let ext = (s.name as NSString).pathExtension.lowercased()
+        let ext = (name as NSString).pathExtension.lowercased()
         // A few extensions map to misleading legacy types ("MacBinary archive").
         if ["bin", "dat", "raw"].contains(ext) { return "Binary data" }
         return UTType(filenameExtension: ext)?.localizedDescription?.capitalizedFirst ?? "File"
-    }
-
-    private func displayPath(_ p: String) -> String {
-        p.replacingOccurrences(of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~")
-    }
-
-    private func bigIcon(_ path: String) -> NSImage {
-        let i = NSWorkspace.shared.icon(forFile: path)
-        i.size = NSSize(width: 64, height: 64)
-        return i
     }
 }
 
@@ -366,6 +438,9 @@ struct Composition: View {
     let dir: UInt32
     @State private var parts: [(FileCategory, Int64)] = []
     @State private var total: Int64 = 0
+    @State private var computed: SubtreeResult?
+    /// The folder on show, for passes that finish after a newer one started.
+    @State private var showing: UInt32?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -389,15 +464,22 @@ struct Composition: View {
                 Text("—").foregroundStyle(.tertiary)
             }
         }
+        .onChange(of: dir, initial: true) { showing = dir }
         .task(id: "\(dir)-\(session.phase == .live ? session.quietVersion : session.version / 40)") {
             let tree = session.tree
             let d = dir
-            let stats = await Task.detached(priority: .utility) { tree.extensionStats(under: d, limit: 2000) }.value
+            let now = SubtreeResult(session, dir: d)
+            if now.matches(computed) { return } // nothing under the folder changed
+            let stats = await measuredQuery(session, priority: .utility) { tree.extensionStats(under: d, limit: 2000) }
+            // Superseded by a newer pass for the same folder, it's still the
+            // latest result there is.
+            guard !Task.isCancelled || showing == d else { return }
             var byCat: [FileCategory: Int64] = [:]
             for s in stats { byCat[FileCategory.of(extension: s.ext), default: 0] += s.bytes }
             let sorted = byCat.sorted { $0.value > $1.value }.map { ($0.key, $0.value) }
             parts = sorted
             total = sorted.reduce(0) { $0 + $1.1 }
+            computed = now
         }
     }
 }

@@ -89,7 +89,15 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     private var dirNodes: [UInt32: Node] = [:]
     private var sortKey: SortKey = .size
     private var ascending = false
-    private var lastReorder: CFTimeInterval = 0
+    /// A re-sort held back by pacing is picked up by this one-shot timer:
+    /// the listener only fires when the tree changes again.
+    private var resortTimer: Timer?
+    private var resortDue: CFTimeInterval = .infinity
+    /// One row's values, shared by its cells while the outline builds them,
+    /// so the tree is read once per row rather than once per column. Only
+    /// good until the current main-queue turn ends.
+    private var cachedRow: (node: Node, values: RowValues)?
+    private var focusObserver: NSObjectProtocol?
     private var quickLookURLs: [URL] = []
     /// Folders that became expandable while being rebuilt; the outline must
     /// be told or it keeps showing them without a disclosure triangle.
@@ -100,6 +108,13 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     private var tree: Tree { session.tree }
     private var sharesDirNodes: Bool { !source.isList }
     private static let maxChildren = 20_000
+    /// Folders with more children than this are sorted without holding the
+    /// tree lock, so a big sort doesn't keep the scanner from committing.
+    private static let unlockedSortMin = 2_000
+    /// Rows a relist may add or remove before the folder is simply reloaded.
+    private static let maxRowChanges = 64
+    /// What an order is sorted by, to tell when a folder's is out of date.
+    private var sortTag: Int { Int(sortKey.rawValue) * 2 + (ascending ? 1 : 0) }
 
     private static let nameColumn = NSUserInterfaceItemIdentifier("name")
     private static let shareColumn = NSUserInterfaceItemIdentifier("share")
@@ -123,7 +138,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             }
         }
         if source.isList {
-            NotificationCenter.default.addObserver(forName: .siltFocusResults, object: nil, queue: .main) { [weak self] _ in
+            focusObserver = NotificationCenter.default.addObserver(forName: .siltFocusResults, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
                     guard let self, let window = self.outline.window else { return }
                     window.makeFirstResponder(self.outline)
@@ -138,6 +153,10 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     func teardown() {
         if !source.isList { session.treeStates[root.dir] = captureState() }
         session.removeListener(self)
+        resortTimer?.invalidate()
+        resortTimer = nil
+        if let focusObserver { NotificationCenter.default.removeObserver(focusObserver) }
+        focusObserver = nil
         if QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
             QLPreviewPanel.shared().orderOut(nil)
         }
@@ -252,6 +271,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             outline.tableColumns.first { $0.identifier == Self.shareColumn }?.title = shareTitle
         }
         let selected = selectedNodes()
+        cachedRow = nil
         outline.reloadData()
         if newSource.isList {
             restoreSelection(selected)
@@ -275,12 +295,58 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         return n
     }
 
+    /// The engine sorts names ascending and everything else descending.
+    private var flipsOrder: Bool { (sortKey == .name) == !ascending }
+
     /// Lock held. Returns the display order for `node`'s children.
     private func sortedOrder(_ node: Node) -> [UInt32] {
+        let start = CACurrentMediaTime()
+        let stamp = tree.stamp(of: node.dir)
         var order = tree.children(of: node.dir, key: sortKey)
-        let flip = (sortKey == .name) == !ascending
-        if flip { order.reverse() }
+        if flipsOrder { order.reverse() }
+        noteSorted(node, stamp: stamp, at: start, cost: CACurrentMediaTime() - start)
         return order
+    }
+
+    /// Remembers what `node`'s order was sorted against, and what it cost,
+    /// to decide when it next needs sorting.
+    private func noteSorted(_ node: Node, stamp: UInt32, at start: CFTimeInterval, cost: CFTimeInterval) {
+        node.subtreeStamp = stamp
+        node.sortedBy = sortTag
+        node.sortedAt = start
+        node.sortCost = cost
+    }
+
+    /// A folder whose children need sorting, and what it looked like when
+    /// that was decided (lock held).
+    private struct SortJob {
+        let node: Node
+        let run: (first: UInt32, count: UInt32, version: UInt32)
+        let stamp: UInt32
+        /// Entries joined or left the run, so its rows must be rebuilt.
+        let relisted: Bool
+    }
+
+    /// Sorts a big folder's children WITHOUT holding the tree lock, then
+    /// re-locks, checks nothing joined or left its run meanwhile, and hands
+    /// the order to `apply` under that same lock. Returns false, applying
+    /// nothing, if the run changed (or the tree isn't in memory): try again
+    /// later. Never call it inside `withLock`.
+    private func sortUnlocked(_ job: SortJob, apply: ([UInt32]) -> Void) -> Bool {
+        // Parking starts on the main thread, so a tree that's awake now
+        // stays mapped until this returns.
+        guard session.isAwake else { return false }
+        let start = CACurrentMediaTime()
+        var order = tree.childrenUnlocked(of: job.node.dir, key: sortKey)
+        if flipsOrder { order.reverse() }
+        let cost = CACurrentMediaTime() - start
+        return tree.withLock {
+            let d = tree.dir(job.node.dir)
+            guard tree.isLive(d.entry), (d.first, d.count, d.version) == job.run else { return false }
+            noteSorted(job.node, stamp: job.stamp, at: start, cost: cost)
+            apply(order)
+            return true
+        }
     }
 
     /// Lock held.
@@ -562,6 +628,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
 
     private func resortAll() {
         let selected = selectedNodes()
+        cachedRow = nil
         tree.withLock {
             for n in activeNodes() where n.isDir { n.children = buildChildren(n, order: sortedOrder(n)) }
         }
@@ -593,13 +660,56 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     // MARK: Delegate
 
     func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
-        HoverRowView()
+        if let reused = outlineView.makeView(withIdentifier: HoverRowView.id, owner: nil) as? HoverRowView {
+            return reused
+        }
+        let row = HoverRowView()
+        row.identifier = HoverRowView.id
+        return row
+    }
+
+    /// Rows that closed hold on to nothing: their children are built afresh
+    /// if they open again (they would be anyway). Folder nodes live on in
+    /// `dirNodes`, so folders left open inside keep their identity, which is
+    /// how the outline remembers they were open. Lists keep nodes only in
+    /// `children`, so a list folder with an open folder inside keeps them.
+    func outlineViewItemDidCollapse(_ notification: Notification) {
+        guard let n = notification.userInfo?["NSObject"] as? Node, n.isDir, n !== root else { return }
+        if !sharesDirNodes, holdsOpenFolder(n) { return }
+        n.children = nil
+        n.order = []
+        n.moreNode = nil
+        cachedRow = nil
+    }
+
+    /// Whether a folder somewhere below `n` is still open (the outline keeps
+    /// a closed folder's open descendants open).
+    private func holdsOpenFolder(_ n: Node) -> Bool {
+        var stack = n.children ?? []
+        while let c = stack.popLast() {
+            guard c.isDir else { continue }
+            if outline.isItemExpanded(c) { return true }
+            stack.append(contentsOf: c.children ?? [])
+        }
+        return false
+    }
+
+    /// Lock not held. A row's values, computed once for all of its cells.
+    private func rowValues(for n: Node) -> RowValues {
+        if let cached = cachedRow, cached.node === n { return cached.values }
+        let v = tree.withLock { values(for: n) }
+        if cachedRow == nil {
+            // Good for this pass only: next time the tree may have moved on.
+            DispatchQueue.main.async { [weak self] in self?.cachedRow = nil }
+        }
+        cachedRow = (n, v)
+        return v
     }
 
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         guard let id = tableColumn?.identifier else { return nil }
         let n = node(item)
-        let v = tree.withLock { values(for: n) }
+        let v = rowValues(for: n)
         switch id {
         case Self.nameColumn:
             let cell = outlineView.makeView(withIdentifier: NameCell.id, owner: nil) as? NameCell ?? NameCell()
@@ -676,16 +786,16 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
 
     private func treeChanged() {
         guard outline.window != nil else { return }
+        cachedRow = nil
         let now = CACurrentMediaTime()
-        let scanning = session.phase == .scanning
-        let reorderDue = sortKey != .name && now - lastReorder > (scanning ? 0.4 : 0)
-        if reorderDue { lastReorder = now }
-
         let active = activeNodes()
         let visible = visibleRows()
-        var structural: [(Node, [Node])] = []
+        var reloads: [(Node, [Node])] = []
+        var relisted: [(Node, [Node])] = []
         var reordered: [(Node, [Node])] = []
+        var bigSorts: [SortJob] = []
         var expandability: [Node] = []
+        var nextDue = CFTimeInterval.infinity
 
         tree.withLock {
             for n in active {
@@ -696,7 +806,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
                             ? (c.children ?? []).contains { !tree.isLive($0.entry) }
                             : c.isReal && !tree.isLive(session.entryIndex(c.ref))
                     }
-                    if dead { structural.append((n, buildList(n))) }
+                    if dead { reloads.append((n, buildList(n))) }
                     continue
                 }
                 guard n.isDir, tree.isLive(tree.dirEntry(n.dir)) else { continue }
@@ -707,16 +817,38 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
                 }
                 if let u = n.unseenNode, outline.isItemExpanded(u),
                    (u.children ?? []).map(\.partID) != (session.hidden?.parts ?? []).map(\.id) {
-                    structural.append((u, hiddenParts(u)))
+                    reloads.append((u, hiddenParts(u)))
                 }
                 let hasUnseen = n.children?.contains { $0.kind == .unseen } ?? false
                 let wantsUnseen = n.dir == 0 && !source.isList && session.isVolume && session.unseenBytes > 0
-                if n.stamp != (d.first, d.count, d.version) || hasUnseen != wantsUnseen {
-                    structural.append((n, buildChildren(n, order: sortedOrder(n))))
-                } else if reorderDue {
-                    let order = sortedOrder(n)
-                    if order != n.order { reordered.append((n, buildChildren(n, order: order))) }
+                let run = (d.first, d.count, d.version)
+                let runChanged = n.stamp != run || hasUnseen != wantsUnseen
+                let stamp = tree.stamp(of: n.dir)
+                if !runChanged && n.sortedBy == sortTag {
+                    // Only sizes, counts or dates below it can have moved, and
+                    // only if its subtree stamp did. Names don't move without
+                    // a relist. A re-sort waits max(0.4 s, 10× what the last
+                    // one cost, rows included), so a huge busy folder can't
+                    // hog the main thread.
+                    guard sortKey != .name, stamp != n.subtreeStamp else { continue }
+                    let due = n.sortedAt + max(0.4, 10 * n.sortCost)
+                    if now < due {
+                        nextDue = min(nextDue, due)
+                        continue
+                    }
                 }
+                if d.count > Self.unlockedSortMin {
+                    bigSorts.append(SortJob(node: n, run: run, stamp: stamp, relisted: runChanged))
+                    continue
+                }
+                let start = CACurrentMediaTime()
+                let order = sortedOrder(n)
+                if runChanged {
+                    relisted.append((n, buildChildren(n, order: order)))
+                } else if order != n.order {
+                    reordered.append((n, buildChildren(n, order: order)))
+                }
+                n.sortCost = CACurrentMediaTime() - start
             }
             for (_, n) in visible where n.isDir && !outline.isItemExpanded(n) {
                 let expandable = tree.dir(n.dir).count > 0
@@ -727,13 +859,40 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             }
         }
 
-        if !structural.isEmpty || !reordered.isEmpty {
+        // Big folders sort outside the lock. One whose run changed meanwhile
+        // is left for the next pass: the change that moved it brings one.
+        for job in bigSorts {
+            let n = job.node
+            let sorted = sortUnlocked(job) { order in
+                let start = CACurrentMediaTime()
+                if job.relisted {
+                    relisted.append((n, buildChildren(n, order: order)))
+                } else if order != n.order {
+                    reordered.append((n, buildChildren(n, order: order)))
+                }
+                n.sortCost += CACurrentMediaTime() - start
+            }
+            if !sorted { nextDue = min(nextDue, now + 0.4) }
+        }
+        scheduleResort(at: nextDue)
+
+        if !reloads.isEmpty || !relisted.isEmpty || !reordered.isEmpty {
             let selected = selectedNodes()
-            for (n, kids) in structural {
+            for (n, kids) in reloads {
                 n.children = kids
                 outline.reloadItem(n === root ? nil : n, reloadChildren: true)
             }
-            for (n, kids) in reordered { applyReorder(n, to: kids) }
+            // What a re-sort costs includes putting its rows on screen.
+            for (n, kids) in relisted {
+                let start = CACurrentMediaTime()
+                applyRelist(n, to: kids)
+                n.sortCost += CACurrentMediaTime() - start
+            }
+            for (n, kids) in reordered {
+                let start = CACurrentMediaTime()
+                applyReorder(n, to: kids)
+                n.sortCost += CACurrentMediaTime() - start
+            }
             restoreSelection(selected)
         }
         // Folders whose first listing landed since the outline last looked.
@@ -754,29 +913,137 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         }
     }
 
-    /// Moves rows into their new order with animation when the change is
-    /// small enough to read; otherwise just reloads.
-    private func applyReorder(_ n: Node, to kids: [Node]) {
+    /// Arms the one-shot timer for the earliest re-sort pacing held back.
+    private func scheduleResort(at due: CFTimeInterval) {
+        guard due.isFinite, resortTimer == nil || due < resortDue else { return }
+        resortTimer?.invalidate()
+        resortDue = due
+        let interval = max(0.01, due - CACurrentMediaTime())
+        let timer = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.resortDueFired() }
+        }
+        timer.tolerance = interval * 0.15
+        RunLoop.main.add(timer, forMode: .common)
+        resortTimer = timer
+    }
+
+    private func resortDueFired() {
+        resortTimer = nil
+        resortDue = .infinity
+        guard session.isAwake else { return } // waking brings a pass of its own
+        treeChanged()
+    }
+
+    /// Applies a relisted folder's new rows. Entries joined or left, but
+    /// rows still there keep their views, so a relist that changed little
+    /// doesn't reload the folder: the same rows (their values update in
+    /// place), the same rows reordered, or a few rows in or out. Anything
+    /// bigger reloads, as does a run that moved, since every file in it
+    /// then gets a new entry index and a new node.
+    private func applyRelist(_ n: Node, to kids: [Node]) {
         let item: Any? = n === root ? nil : n
-        guard var current = n.children, current.count == kids.count, kids.count <= 400,
-              Set(current.map(ObjectIdentifier.init)) == Set(kids.map(ObjectIdentifier.init))
-        else {
+        // A folder removed by a relist above it this same pass is no longer
+        // in the outline; its rows just wait for it to be shown again.
+        guard n === root || (outline.isItemExpanded(n) && outline.row(forItem: n) >= 0) else {
+            n.children = kids
+            return
+        }
+        func reload() {
             n.children = kids
             outline.reloadItem(item, reloadChildren: true)
+        }
+        // Row-by-row updates need the outline to hold exactly the old rows.
+        guard let current = n.children, outline.numberOfChildren(ofItem: item) == current.count else {
+            return reload()
+        }
+        let oldIDs = current.map(ObjectIdentifier.init)
+        let newIDs = kids.map(ObjectIdentifier.init)
+        let oldSet = Set(oldIDs), newSet = Set(newIDs)
+        // The "smaller items" row says how many it stands for, and that
+        // count may have changed even when no row on show did.
+        func refreshMore() {
+            guard let m = n.moreNode, oldSet.contains(ObjectIdentifier(m)), newSet.contains(ObjectIdentifier(m)),
+                  outline.row(forItem: m) >= 0 else { return }
+            outline.reloadItem(m)
+        }
+        if oldIDs == newIDs {
+            n.children = kids
+            refreshMore()
             return
         }
-        var moves = 0
-        var probe = current
-        for i in kids.indices where probe[i] !== kids[i] {
-            guard let j = probe[(i + 1)...].firstIndex(where: { $0 === kids[i] }) else { continue }
-            probe.insert(probe.remove(at: j), at: i)
-            moves += 1
+        let removed = IndexSet(current.indices.filter { !newSet.contains(oldIDs[$0]) })
+        let inserted = IndexSet(kids.indices.filter { !oldSet.contains(newIDs[$0]) })
+        if removed.isEmpty && inserted.isEmpty {
+            applyReorder(n, to: kids)
+            refreshMore()
+            return
+        }
+        guard removed.count + inserted.count <= Self.maxRowChanges else { return reload() }
+        // Rows that stay must also end up in their new order; a few moves
+        // are still cheaper than a reload.
+        let survivors = current.filter { newSet.contains(ObjectIdentifier($0)) }
+        let target = kids.filter { oldSet.contains(ObjectIdentifier($0)) }
+        var moves: [(from: Int, to: Int)] = []
+        if !zip(survivors, target).allSatisfy({ $0 === $1 }) {
+            let budget = Self.maxRowChanges - removed.count - inserted.count
+            guard let m = rowMoves(from: survivors, to: target, limit: budget) else { return reload() }
+            moves = m
         }
         n.children = kids
-        if moves > 12 {
-            outline.reloadItem(item, reloadChildren: true)
+        // All at once, like the reload this stands in for.
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0
+            ctx.allowsImplicitAnimation = false
+            outline.beginUpdates()
+            if !removed.isEmpty { outline.removeItems(at: removed, inParent: item, withAnimation: []) }
+            for m in moves { outline.moveItem(at: m.from, inParent: item, to: m.to, inParent: item) }
+            if !inserted.isEmpty { outline.insertItems(at: inserted, inParent: item, withAnimation: []) }
+            outline.endUpdates()
+        }
+        refreshMore()
+    }
+
+    /// Moves rows into their new order with animation when the change is
+    /// small enough to read. Otherwise the rows jump there at once, as a
+    /// reload would show it, moving only the ones that have to; if that's
+    /// too many, it reloads.
+    private func applyReorder(_ n: Node, to kids: [Node]) {
+        let item: Any? = n === root ? nil : n
+        // Gone from the outline with a relist above it this same pass.
+        guard n === root || outline.row(forItem: n) >= 0 else {
+            n.children = kids
             return
         }
+        func reload() {
+            n.children = kids
+            outline.reloadItem(item, reloadChildren: true)
+        }
+        guard var current = n.children, current.count == kids.count else { return reload() }
+        var animated = false
+        if kids.count <= 400, Set(current.map(ObjectIdentifier.init)) == Set(kids.map(ObjectIdentifier.init)) {
+            var moves = 0
+            var probe = current
+            for i in kids.indices where probe[i] !== kids[i] {
+                guard let j = probe[(i + 1)...].firstIndex(where: { $0 === kids[i] }) else { continue }
+                probe.insert(probe.remove(at: j), at: i)
+                moves += 1
+            }
+            animated = moves <= 12
+        }
+        guard animated else {
+            guard outline.numberOfChildren(ofItem: item) == current.count,
+                  let moves = rowMoves(from: current, to: kids, limit: Self.maxRowChanges) else { return reload() }
+            n.children = kids
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0
+                ctx.allowsImplicitAnimation = false
+                outline.beginUpdates()
+                for m in moves { outline.moveItem(at: m.from, inParent: item, to: m.to, inParent: item) }
+                outline.endUpdates()
+            }
+            return
+        }
+        n.children = kids
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.25
             ctx.allowsImplicitAnimation = true
@@ -1007,6 +1274,60 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
             session.deleteImmediately(refs, window: self?.outline.window)
         }
     }
+}
+
+/// The moves that turn `current` into `target` (the same rows in a new
+/// order), each as (from, to) indices at the time it's made. Only rows
+/// outside the longest run already in order move, and each goes straight
+/// to its place. Nil if the rows differ or it would take more than
+/// `limit` moves. Pure, so the tests can drive it.
+func rowMoves<Row: AnyObject>(from current: [Row], to target: [Row], limit: Int) -> [(from: Int, to: Int)]? {
+    guard current.count == target.count else { return nil }
+    var at: [ObjectIdentifier: Int] = [:]
+    at.reserveCapacity(current.count)
+    for (i, n) in current.enumerated() { at[ObjectIdentifier(n)] = i }
+    var was: [Int] = []
+    was.reserveCapacity(target.count)
+    for n in target {
+        guard let i = at.removeValue(forKey: ObjectIdentifier(n)) else { return nil }
+        was.append(i)
+    }
+    // Longest increasing run of old positions, by patience sorting: `ends`
+    // holds, for each length, the index whose value ends the lowest run.
+    var ends: [Int] = []
+    var before = [Int](repeating: -1, count: was.count)
+    for (i, v) in was.enumerated() {
+        var lo = 0, hi = ends.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if was[ends[mid]] < v { lo = mid + 1 } else { hi = mid }
+        }
+        if lo > 0 { before[i] = ends[lo - 1] }
+        if lo == ends.count { ends.append(i) } else { ends[lo] = i }
+    }
+    guard was.count - ends.count <= limit else { return nil }
+    var stays = [Bool](repeating: false, count: was.count)
+    var k = ends.last ?? -1
+    while k >= 0 {
+        stays[k] = true
+        k = before[k]
+    }
+    // Each row that moves goes right after the row that precedes it in
+    // `target`, which by then is in place: it stays, or moved earlier.
+    var work = current
+    var out: [(from: Int, to: Int)] = []
+    for i in target.indices where !stays[i] {
+        guard let j = work.firstIndex(where: { $0 === target[i] }) else { return nil }
+        let row = work.remove(at: j)
+        var to = 0
+        if i > 0 {
+            guard let p = work.firstIndex(where: { $0 === target[i - 1] }) else { return nil }
+            to = p + 1
+        }
+        work.insert(row, at: to)
+        out.append((j, to))
+    }
+    return out
 }
 
 final class ClosureMenuItem: NSMenuItem {

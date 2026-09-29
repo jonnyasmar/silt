@@ -5,6 +5,7 @@ struct TypesView: View {
     let model: WindowModel
     @State private var stats: [Tree.ExtStat] = []
     @State private var loading = true
+    @State private var computed: SubtreeResult?
 
     private var total: Int64 { stats.reduce(0) { $0 + $1.bytes } }
 
@@ -25,11 +26,17 @@ struct TypesView: View {
         .task(id: "\(session.focus)-\(session.phase == .live ? session.quietVersion : session.version / 40)") {
             let tree = session.tree
             let focus = session.focus
-            let result = await Task.detached(priority: .userInitiated) {
+            let now = SubtreeResult(session, dir: focus)
+            if now.matches(computed) { return } // nothing under the folder changed
+            let result = await measuredQuery(session, priority: .userInitiated) {
                 tree.extensionStats(under: focus, limit: 400)
-            }.value
+            }
+            // A newer pass may have started meanwhile, but this is still the
+            // latest finished result for the folder on show.
+            guard !Task.isCancelled || session.focus == focus else { return }
             stats = result
             loading = false
+            computed = now
         }
     }
 

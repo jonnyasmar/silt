@@ -34,6 +34,9 @@ protocol ValueCell: AnyObject {
 // MARK: Row view
 
 final class HoverRowView: NSTableRowView {
+    /// Row views carry this so the outline can reuse them.
+    static let id = NSUserInterfaceItemIdentifier("row")
+
     private var tracking: NSTrackingArea?
     private(set) var hovered = false {
         didSet {
@@ -44,8 +47,10 @@ final class HoverRowView: NSTableRowView {
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
-        if let tracking { removeTrackingArea(tracking) }
-        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+        // `.inVisibleRect` keeps the area matched to the row as it moves and
+        // resizes, so it's added once, not on every update.
+        guard tracking == nil else { return }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
                                   owner: self, userInfo: nil)
         addTrackingArea(area)
         tracking = area
@@ -259,7 +264,7 @@ final class ShareCell: NSTableCellView, ValueCell {
         let c: NSColor
         switch node.kind {
         case .dir: c = Brand.ochre
-        case .file, .group: c = FileCategory.of(name: node.nameForColor).nsColor
+        case .file, .group: c = node.category.nsColor
         case .more, .unseen, .hiddenPart, .list: c = .tertiaryLabelColor
         }
         let f = values.share

@@ -12,7 +12,10 @@ struct RootView: View {
             Detail(model: model)
                 .inspector(isPresented: inspectorBinding) {
                     if let s = model.current, s.isAwake {
+                        // One per session, so nothing it cached about one
+                        // tree is shown for another.
                         InspectorView(session: s)
+                            .id(s.id)
                             .inspectorColumnWidth(min: 250, ideal: 290, max: 380)
                     }
                 }
@@ -194,9 +197,20 @@ private struct FolderSessionRow: View {
     let session: Session?
     let close: () -> Void
 
+    /// Finder's name for each folder. Looking it up reads the disk, and rows
+    /// redraw as their scans move along, so it's done once per path.
+    private static var displayNames: [String: String] = [:]
+
+    private var displayName: String {
+        if let hit = Self.displayNames[path] { return hit }
+        let name = FileManager.default.displayName(atPath: path)
+        Self.displayNames[path] = name
+        return name
+    }
+
     var body: some View {
         HStack(spacing: 8) {
-            Label(FileManager.default.displayName(atPath: path), systemImage: "folder")
+            Label(displayName, systemImage: "folder")
                 .lineLimit(1)
             Spacer(minLength: 6)
             Group {
@@ -238,27 +252,10 @@ struct ActivityStrip: View {
     let activity: Session.Activity?
 
     var body: some View {
-        GeometryReader { g in
+        GeometryReader { _ in
             ZStack(alignment: .leading) {
                 if let activity {
-                    Rectangle().fill(Brand.color.opacity(0.15))
-                    if let f = activity.fraction {
-                        Rectangle()
-                            .fill(Brand.color)
-                            .frame(width: max(3, g.size.width * f))
-                            .animation(.easeOut(duration: 0.4), value: f)
-                    } else {
-                        TimelineView(.animation) { t in
-                            let cycle = 1.6
-                            let phase = t.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: cycle) / cycle
-                            let w = g.size.width * 0.3
-                            Rectangle()
-                                .fill(LinearGradient(colors: [Brand.color.opacity(0), Brand.color, Brand.color.opacity(0)],
-                                                     startPoint: .leading, endPoint: .trailing))
-                                .frame(width: w)
-                                .offset(x: -w + (g.size.width + w) * phase)
-                        }
-                    }
+                    StripLayers(fraction: activity.fraction)
                 }
             }
         }
@@ -270,6 +267,177 @@ struct ActivityStrip: View {
         .accessibilityElement()
         .accessibilityLabel(activity?.label ?? "")
         .accessibilityValue(activity?.fraction.map { Fmt.percent($0) } ?? "")
+    }
+}
+
+/// A session's strip. It reads the session's activity itself, so as a scan
+/// moves along only the strip updates, not the view it sits on.
+private struct SessionActivityStrip: View {
+    let session: Session
+
+    var body: some View {
+        ActivityStrip(activity: session.activity)
+    }
+}
+
+/// The strip's track, fill and sweep, drawn as Core Animation layers. The
+/// render server runs their animations, so a scan doesn't make the app
+/// redraw at display rate the whole time it runs.
+private struct StripLayers: NSViewRepresentable {
+    let fraction: Double?
+
+    func makeNSView(context: Context) -> StripView { StripView() }
+
+    func updateNSView(_ view: StripView, context: Context) {
+        view.show(fraction: fraction)
+    }
+}
+
+private final class StripView: NSView {
+    private let track = CALayer()
+    private let fill = CALayer()
+    private let sweep = CAGradientLayer()
+    private var fraction: Double?
+    private var shown = false
+    /// The width the running sweep was set up for.
+    private var sweepWidth: CGFloat?
+    private static let cycle = 1.6
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        layer = CALayer()
+        wantsLayer = true
+        layer?.masksToBounds = true
+        fill.anchorPoint = CGPoint(x: 0, y: 0.5)
+        sweep.anchorPoint = CGPoint(x: 0, y: 0.5)
+        sweep.startPoint = CGPoint(x: 0, y: 0.5)
+        sweep.endPoint = CGPoint(x: 1, y: 0.5)
+        for l in [track, fill, sweep] { layer?.addSublayer(l) }
+        applyColors()
+        // With Reduce Motion the sweep holds still; follow the setting live.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(motionPreferenceChanged),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    // Clicks go to whatever is underneath.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    /// Fills to `fraction` (easing there from where it was), or sweeps when
+    /// there's nothing to measure against.
+    func show(fraction new: Double?) {
+        guard !shown || new != fraction else { return }
+        let from = fill.bounds.width
+        let animate = shown && fraction != nil && new != nil
+        fraction = new
+        shown = true
+        layOut()
+        let to = fill.bounds.width
+        guard animate, from != to else { return }
+        // Additive, so a new value arriving mid-way carries on smoothly from
+        // wherever the fill is.
+        let a = CABasicAnimation(keyPath: "bounds.size.width")
+        a.fromValue = from - to
+        a.toValue = 0
+        a.isAdditive = true
+        a.duration = 0.4
+        a.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        fill.add(a, forKey: nil)
+    }
+
+    override func layout() {
+        super.layout()
+        layOut()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applyScale()
+        applyColors()
+        sweepWidth = nil
+        startSweep()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        applyScale()
+    }
+
+    @objc private func motionPreferenceChanged() {
+        sweepWidth = nil
+        layOut()
+    }
+
+    private static var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+
+    /// The layers are this view's own, so AppKit doesn't match them to the
+    /// screen: the gradient would render at 1× on a Retina display.
+    private func applyScale() {
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for l in [layer, track, fill, sweep].compactMap({ $0 }) { l.contentsScale = scale }
+        CATransaction.commit()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColors()
+    }
+
+    private func layOut() {
+        let w = bounds.width * 0.3
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        track.frame = bounds
+        fill.bounds = CGRect(x: 0, y: 0, width: max(3, bounds.width * CGFloat(fraction ?? 0)), height: bounds.height)
+        fill.position = CGPoint(x: 0, y: bounds.midY)
+        sweep.bounds = CGRect(x: 0, y: 0, width: w, height: bounds.height)
+        // Held still in the middle with Reduce Motion; otherwise it starts
+        // off the left edge and the animation carries it across.
+        sweep.position = CGPoint(x: Self.reduceMotion ? (bounds.width - w) / 2 : -w, y: bounds.midY)
+        fill.isHidden = fraction == nil
+        sweep.isHidden = fraction != nil
+        CATransaction.commit()
+        startSweep()
+    }
+
+    /// Across and around every 1.6 s. The phase follows the clock, so
+    /// strips that take over from each other (loading, then catching up)
+    /// don't jump.
+    private func startSweep() {
+        guard fraction == nil, window != nil, bounds.width > 0, !Self.reduceMotion else {
+            sweep.removeAnimation(forKey: "sweep")
+            sweepWidth = nil
+            return
+        }
+        guard sweepWidth != bounds.width || sweep.animation(forKey: "sweep") == nil else { return }
+        sweepWidth = bounds.width
+        let a = CABasicAnimation(keyPath: "position.x")
+        a.fromValue = -bounds.width * 0.3
+        a.toValue = bounds.width
+        a.duration = Self.cycle
+        a.repeatCount = .infinity
+        a.timingFunction = CAMediaTimingFunction(name: .linear)
+        a.timeOffset = Date().timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: Self.cycle)
+        sweep.add(a, forKey: "sweep")
+    }
+
+    private func applyColors() {
+        var colors: (track: CGColor, clear: CGColor, full: CGColor)?
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            colors = (Brand.ochre.withAlphaComponent(0.15).cgColor, Brand.ochre.withAlphaComponent(0).cgColor,
+                      Brand.ochre.cgColor)
+        }
+        guard let colors else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        track.backgroundColor = colors.track
+        fill.backgroundColor = colors.full
+        sweep.colors = [colors.clear, colors.full, colors.clear]
+        CATransaction.commit()
     }
 }
 
@@ -380,7 +548,7 @@ struct Detail: View {
             VStack(spacing: 0) {
                 content(session)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .overlay(alignment: .top) { ActivityStrip(activity: session.activity) }
+                    .overlay(alignment: .top) { SessionActivityStrip(session: session) }
                 if session.markedCount > 0 {
                     CleanupBar(session: session, reviewing: $model.reviewingCleanup)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
