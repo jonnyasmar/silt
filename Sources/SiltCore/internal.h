@@ -18,6 +18,11 @@ typedef struct silt_internal {
   uint32_t root_items; // mirror of dir 0's items
   char *guards[SILT_MAX_GUARDS];
   uint32_t guard_count;
+  // Folders left out of the scan (silt_tree_set_excluded), each as its
+  // parent's path and its own name. Read by workers under the lock.
+  char **exclude_parent;
+  char **exclude_name;
+  uint32_t exclude_count;
   // Per entry chunk: slots that belong to a current run (spare room
   // included). A chunk behind the append point with none left is freed.
   uint32_t *chunk_live;

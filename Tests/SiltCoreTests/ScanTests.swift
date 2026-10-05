@@ -1129,3 +1129,160 @@ extension Fixture {
     #expect(byName["x699"]?.count == 1)
     #expect(zip(out.prefix(n), out.prefix(n).dropFirst()).allSatisfy { $0.bytes >= $1.bytes })
 }
+
+// MARK: Pace
+
+private func pace(urgentQoS: silt_qos = SILT_QOS_USER_INITIATED, urgentMax: UInt32 = 0,
+                  backgroundQoS: silt_qos = SILT_QOS_UTILITY, backgroundMax: UInt32 = 2,
+                  paused: Bool = false) -> silt_pace {
+    silt_pace(urgent_qos: urgentQoS, urgent_max: urgentMax, background_qos: backgroundQoS,
+              background_max: backgroundMax, paused: paused)
+}
+
+private func progress(_ s: OpaquePointer) -> silt_progress {
+    var p = silt_progress()
+    silt_scanner_progress(s, &p)
+    return p
+}
+
+/// Paused, a scanner starts nothing: queued work waits until it resumes,
+/// then finishes as usual.
+@Test func pausedScannerStartsNothingUntilResumed() throws {
+    let f = try Fixture(["a/one.bin": 10_000, "a/b/two.bin": 20_000, "c/three.bin": 30_000])
+    let listed = progress(f.scanner).dirs
+    var p = pace(paused: true)
+    silt_scanner_set_pace(f.scanner, &p)
+    #expect(progress(f.scanner).paused)
+    let root = try #require(f.entry("")).aux
+    silt_scanner_refresh_ex(f.scanner, root, SILT_REFRESH_DEEP | SILT_REFRESH_URGENT)
+    Thread.sleep(forTimeInterval: 0.3)
+    let held = progress(f.scanner)
+    #expect(held.dirs == listed)
+    #expect(held.queued > 0 && held.active == 0 && held.urgent_queued > 0)
+
+    p = pace()
+    silt_scanner_set_pace(f.scanner, &p)
+    silt_scanner_wait_idle(f.scanner)
+    let after = progress(f.scanner)
+    #expect(!after.paused)
+    #expect(after.dirs > listed)
+    #expect(f.size("") == f.expected(""))
+    #expect(f.dir("")?.pending == 0)
+}
+
+/// The urgent limit never goes past the pace's ceiling, and urgent work at
+/// background QoS still gets done.
+@Test func paceCeilingCapsTheUrgentLimit() throws {
+    var layout: [String: Int] = [:]
+    for i in 0..<40 { layout["d\(i % 8)/e\(i)/f.bin"] = 4_096 }
+    let f = try Fixture(layout)
+    var p = pace(urgentQoS: SILT_QOS_BACKGROUND, urgentMax: 1, backgroundQoS: SILT_QOS_BACKGROUND, backgroundMax: 1)
+    silt_scanner_set_pace(f.scanner, &p)
+    #expect(progress(f.scanner).limit == 1)
+    let root = try #require(f.entry("")).aux
+    silt_scanner_refresh_ex(f.scanner, root, SILT_REFRESH_DEEP | SILT_REFRESH_URGENT)
+    var most: UInt32 = 0
+    while case let q = progress(f.scanner), !q.idle {
+        most = max(most, q.limit)
+        #expect(q.active <= 1)
+        usleep(200)
+    }
+    #expect(most <= 1)
+    #expect(f.size("") == f.expected(""))
+
+    // Lifting the ceiling lets the controller grow again from where it is.
+    p = pace()
+    silt_scanner_set_pace(f.scanner, &p)
+    #expect(progress(f.scanner).limit >= 1)
+    silt_scanner_fix_limit(f.scanner, 99)
+    #expect(progress(f.scanner).limit == 4) // the scanner's thread maximum
+}
+
+// MARK: Exclusions
+
+/// A folder the user leaves out is recorded but never opened; one that was
+/// already scanned loses its contents (and its size) when its parent is
+/// listed again, and taking it off the list scans it again.
+@Test func excludedFoldersAreRecordedNotOpened() throws {
+    let f = try Fixture(["keep/a.bin": 100_000, "big/x/y.bin": 500_000, "big/z.bin": 200_000])
+    let whole = f.size("")
+    let big = f.size("big")
+    #expect(big > 0)
+
+    let excluded = f.root.appendingPathComponent("big").path
+    excluded.withCString { p in
+        var paths: [UnsafePointer<CChar>?] = [p]
+        silt_tree_set_excluded(f.tree, &paths, 1)
+    }
+    f.refresh("")
+    let e = try #require(f.entry("big"))
+    #expect(e.flags & UInt8(SILT_FLAG_EXCLUDED) != 0)
+    #expect(f.size("big") == 0)
+    #expect(f.size("") == whole - big)
+    #expect(f.entry("big/x") == nil)
+    #expect(f.dir("")?.pending == 0)
+
+    // Refreshing it (an FSEvents change inside it) never opens it.
+    let listed = progress(f.scanner).dirs
+    f.refresh("big", deep: true)
+    #expect(progress(f.scanner).dirs == listed)
+    #expect(f.size("big") == 0)
+
+    silt_tree_set_excluded(f.tree, nil, 0)
+    f.refresh("")
+    #expect(f.entry("big")!.flags & UInt8(SILT_FLAG_EXCLUDED) == 0)
+    #expect(f.size("big") == f.expected("big"))
+    #expect(f.size("") == whole)
+    #expect(f.dir("")?.pending == 0)
+}
+
+/// Excluded before the first scan: never opened at all.
+@Test func excludedBeforeScanningIsNeverOpened() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("silt-test-\(UUID().uuidString)")
+        .resolvingSymlinksInPath()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try Fixture.write(root.appendingPathComponent("vm/disk.img"), size: 300_000)
+    try Fixture.write(root.appendingPathComponent("notes.txt"), size: 5_000)
+    let tree = silt_tree_create(root.path)!
+    defer { silt_tree_destroy(tree) }
+    root.appendingPathComponent("vm").path.withCString { p in
+        var paths: [UnsafePointer<CChar>?] = [p]
+        silt_tree_set_excluded(tree, &paths, 1)
+    }
+    let scanner = silt_scanner_start(tree, 4)!
+    silt_scanner_wait_idle(scanner)
+    defer { silt_scanner_destroy(scanner) }
+    silt_tree_lock(tree)
+    let vm = silt_lookup(tree, root.appendingPathComponent("vm").path)
+    let inside = silt_lookup(tree, root.appendingPathComponent("vm/disk.img").path)
+    let flags = silt_entry_at(tree, vm).pointee.flags
+    let total = silt_entry_at(tree, 0).pointee.size
+    let pending = silt_dir_at(tree, 0).pointee.pending
+    silt_tree_unlock(tree)
+    #expect(flags & UInt8(SILT_FLAG_EXCLUDED) != 0)
+    #expect(inside == 0xFFFF_FFFF)
+    #expect(total < 300_000)
+    #expect(pending == 0)
+}
+
+/// A background limit of 0 holds background work back (Paused upkeep) while
+/// urgent work still runs.
+@Test func zeroBackgroundLimitHoldsOnlyBackgroundWork() throws {
+    let f = try Fixture(["a/one.bin": 10_000, "b/two.bin": 20_000])
+    var p = pace(backgroundMax: 0)
+    silt_scanner_set_pace(f.scanner, &p)
+    let a = try #require(f.entry("a")).aux, b = try #require(f.entry("b")).aux
+    let listed = progress(f.scanner).dirs
+    silt_scanner_refresh_ex(f.scanner, a, 0) // background
+    Thread.sleep(forTimeInterval: 0.3)
+    #expect(progress(f.scanner).dirs == listed)
+    silt_scanner_refresh_ex(f.scanner, b, SILT_REFRESH_URGENT)
+    var spins = 0
+    while progress(f.scanner).urgent_queued > 0, spins < 3000 { usleep(1000); spins += 1 }
+    #expect(progress(f.scanner).dirs == listed + 1) // b only
+    #expect(progress(f.scanner).queued == 1)        // a still waits
+    p = pace()
+    silt_scanner_set_pace(f.scanner, &p)
+    silt_scanner_wait_idle(f.scanner)
+    #expect(progress(f.scanner).dirs == listed + 2)
+}

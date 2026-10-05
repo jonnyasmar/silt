@@ -7,6 +7,8 @@
 //   SILT_CURVE=1    print each change of the limit during the scan
 //   SILT_SETTLE=<s> after the scan, wait for idle workers to exit (their idle
 //                   timeout is set to s seconds) and report the footprint
+//   SILT_PACE=<qos>:<max>  run the scan's (urgent) listings at QoS ui, util
+//                   or bg, at most <max> at once (0: the thread maximum)
 // With SILT_WATCH=<seconds>, it then follows FSEvents under <path> the way
 // the app does (each changed folder re-listed) and reports memory every 10 s.
 // SILT_THROTTLE=1 applies the app's pacing for big, busy folders.
@@ -156,6 +158,19 @@ int main(int argc, char **argv) {
 
   tree = silt_tree_create(argv[1]);
   scanner = silt_scanner_start(tree, threads);
+  const char *pace_arg = getenv("SILT_PACE");
+  if (pace_arg) {
+    silt_pace pace = silt_pace_default();
+    char qos[8] = {0};
+    unsigned max = 0;
+    if (sscanf(pace_arg, "%7[a-z]:%u", qos, &max) == 2) {
+      pace.urgent_qos = strcmp(qos, "bg") == 0     ? SILT_QOS_BACKGROUND
+                        : strcmp(qos, "util") == 0 ? SILT_QOS_UTILITY
+                                                   : SILT_QOS_USER_INITIATED;
+      pace.urgent_max = max;
+      silt_scanner_set_pace(scanner, &pace);
+    }
+  }
   if (fixed) silt_scanner_fix_limit(scanner, (uint32_t)fixed);
   // Follow the limit (and the time-weighted mean of it) while the scan runs.
   silt_progress p;

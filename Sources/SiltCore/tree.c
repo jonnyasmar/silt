@@ -151,10 +151,62 @@ bool tree_is_guarded(const silt_tree *t, const char *path) {
   return false;
 }
 
+static void free_exclusions(silt_internal *in) {
+  for (uint32_t i = 0; i < in->exclude_count; i++) {
+    free(in->exclude_parent[i]);
+    free(in->exclude_name[i]);
+  }
+  free(in->exclude_parent);
+  free(in->exclude_name);
+  in->exclude_parent = NULL;
+  in->exclude_name = NULL;
+  in->exclude_count = 0;
+}
+
+void silt_tree_set_excluded(silt_tree *t, const char *const *paths, uint32_t count) {
+  char **parents = count ? calloc(count, sizeof *parents) : NULL;
+  char **names = count ? calloc(count, sizeof *names) : NULL;
+  if (count && (!parents || !names)) abort();
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < count; i++) {
+    const char *p = paths[i];
+    const char *slash = strrchr(p, '/');
+    // A path silt_path could produce: absolute, with a name after the last
+    // slash. The root itself can't be left out.
+    if (!slash || slash[1] == 0 || p[0] != '/') continue;
+    const size_t plen = slash == p ? 1 : (size_t)(slash - p);
+    parents[n] = strndup(p, plen);
+    names[n] = strdup(slash + 1);
+    if (!parents[n] || !names[n]) abort();
+    n++;
+  }
+  silt_tree_lock(t);
+  silt_internal *in = silt_int(t);
+  free_exclusions(in);
+  in->exclude_parent = parents;
+  in->exclude_name = names;
+  in->exclude_count = n;
+  silt_tree_unlock(t);
+}
+
+uint32_t silt_tree_excluded_dirs(const silt_tree *t, uint32_t *out, uint32_t cap) {
+  uint32_t n = 0;
+  for (uint32_t d = 0; d < t->dir_count; d++) {
+    if (!tree_dir_live(t, d)) continue;
+    const silt_dir *dir = silt_dir_at(t, d);
+    const silt_entry *e = silt_entry_at(t, dir->entry);
+    if (!(e->flags & SILT_FLAG_EXCLUDED)) continue;
+    if (n < cap) out[n] = dir->entry;
+    n++;
+  }
+  return n;
+}
+
 void silt_tree_destroy(silt_tree *t) {
   if (!t) return;
   for (uint32_t i = 0; i < silt_int(t)->guard_count; i++)
     free(silt_int(t)->guards[i]);
+  free_exclusions(silt_int(t));
   silt_entry *dead = tree_dead_chunk();
   silt_dir *zd = tree_zero_dir_chunk();
   uint8_t *zn = tree_zero_name_chunk();

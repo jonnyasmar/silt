@@ -10,7 +10,9 @@
 // Threads start as work arrives and exit after a few idle seconds, so an
 // idle scanner costs nothing. How many urgent listings run at once adapts to
 // what the storage gives back for the CPU spent (see "Controller");
-// background listings run at most two at a time, at utility priority.
+// background listings run at most two at a time, at utility priority. Both
+// classes' priority and ceilings can be changed, and the scanner paused, at
+// any time (silt_scanner_set_pace).
 //
 // Every queued folder has exactly one work item: in a stack, or in a
 // worker's hands. `pending` counts rely on it (one listing per queued
@@ -40,7 +42,7 @@
 
 #define BULK_BUFFER (256 * 1024)
 #define PATH_BUFFER 4096
-#define BACKGROUND_LIMIT 2u         // background listings running at once
+#define BACKGROUND_LIMIT 2u         // background listings running at once, by default
 #define IDLE_EXIT_NS 5000000000ull // a worker idle this long exits
 
 typedef struct work {
@@ -123,6 +125,7 @@ enum { CTL_IDLE, CTL_HOLD, CTL_PROBE };
 
 typedef struct controller {
   bool fixed;             // pinned by silt_scanner_fix_limit
+  uint32_t pinned;        // ...at this, as far as the pace's ceiling allows
   uint32_t base;          // the settled limit
   uint32_t lo, hi;        // its bounds
   int phase;
@@ -199,6 +202,11 @@ struct silt_scanner {
   uint64_t scan_start;
   uint64_t scan_end;
   controller ctl;
+  // Pace (silt_scanner_set_pace). The QoS values are read by workers without
+  // the mutex; the rest changes and is read under it.
+  silt_qos urgent_qos, background_qos;
+  uint32_t background_max; // background listings allowed at once
+  bool paused;             // start no listing
 };
 
 static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
@@ -558,8 +566,11 @@ static bool same_name(const silt_tree *t, const silt_entry *o,
   return o->name_len == len && memcmp(silt_name_ptr(t, o->name), name, len) == 0;
 }
 
+// A folder that isn't walked: unreadable, a mount point, or left out by the
+// user. A folder that becomes (or stops being) one is a different entry, so
+// its old subtree is dropped (or a new one scanned).
 static bool blocked(uint8_t flags) {
-  return (flags & (SILT_FLAG_DENIED | SILT_FLAG_MOUNT)) != 0;
+  return (flags & (SILT_FLAG_DENIED | SILT_FLAG_MOUNT | SILT_FLAG_EXCLUDED)) != 0;
 }
 
 // Room a folder gets when it outgrows its run, so the next few arrivals land
@@ -1111,12 +1122,12 @@ static void promote_locked(silt_scanner *s, uint32_t dir) {
 }
 
 static bool pop_locked(silt_scanner *s, worker *me, work *w) {
-  if (s->cancelled) return false;
+  if (s->cancelled || s->paused) return false;
   if (s->urgent.count > 0 && s->urgent_active < s->limit) {
     *w = s->urgent.items[--s->urgent.count];
     s->urgent_active++;
     me->urgent = true;
-  } else if (s->background.count > 0 && s->background_active < BACKGROUND_LIMIT) {
+  } else if (s->background.count > 0 && s->background_active < s->background_max) {
     *w = s->background.items[--s->background.count];
     map_del(&s->where, w->dir);
     s->background_active++;
@@ -1134,8 +1145,9 @@ static bool pop_locked(silt_scanner *s, worker *me, work *w) {
 
 // Listings that could start right now.
 static uint32_t runnable_locked(const silt_scanner *s) {
+  if (s->paused) return 0;
   uint32_t u = s->limit > s->urgent_active ? s->limit - s->urgent_active : 0;
-  uint32_t b = BACKGROUND_LIMIT > s->background_active ? BACKGROUND_LIMIT - s->background_active : 0;
+  uint32_t b = s->background_max > s->background_active ? s->background_max - s->background_active : 0;
   if (u > s->urgent.count) u = s->urgent.count;
   if (b > s->background.count) b = s->background.count;
   return u + b;
@@ -1336,14 +1348,42 @@ static void ctl_tick(silt_scanner *s, uint64_t now) {
 
 // MARK: Workers
 
-// Runs the thread at the class of the listing it's about to do. QoS only: a
-// thread-scoped I/O policy would take the thread out of QoS for good (macOS
-// then refuses to raise it again), and utility QoS lowers the I/O tier by
-// itself.
-static void set_class(bool *urgent_now, bool urgent) {
-  if (*urgent_now == urgent) return;
-  pthread_set_qos_class_self_np(urgent ? QOS_CLASS_USER_INITIATED : QOS_CLASS_UTILITY, 0);
-  *urgent_now = urgent;
+static qos_class_t qos_class(silt_qos q) {
+  switch (q) {
+  case SILT_QOS_BACKGROUND: return QOS_CLASS_BACKGROUND;
+  case SILT_QOS_UTILITY: return QOS_CLASS_UTILITY;
+  default: return QOS_CLASS_USER_INITIATED;
+  }
+}
+
+// Runs the thread at the QoS of the class of the listing it's about to do.
+// QoS only: a thread-scoped I/O policy would take the thread out of QoS for
+// good (macOS then refuses to raise it again), and utility and background QoS
+// lower the I/O tier by themselves.
+static void set_class(const silt_scanner *s, qos_class_t *now, bool urgent) {
+  const qos_class_t want = qos_class(urgent ? __atomic_load_n(&s->urgent_qos, __ATOMIC_RELAXED)
+                                            : __atomic_load_n(&s->background_qos, __ATOMIC_RELAXED));
+  if (*now == want) return;
+  pthread_set_qos_class_self_np(want, 0);
+  *now = want;
+}
+
+// Leaves out the folders the user excluded from the listing of `path`: they're
+// recorded, flagged, and not walked. Tree lock held.
+static void exclude(const silt_tree *t, const char *path, batch *b) {
+  const silt_internal *in = silt_int(t);
+  for (uint32_t x = 0; x < in->exclude_count; x++) {
+    if (strcmp(in->exclude_parent[x], path) != 0) continue;
+    const char *name = in->exclude_name[x];
+    const size_t len = strlen(name);
+    for (uint32_t i = 0; i < b->n; i++) {
+      silt_entry *e = &b->ents[i];
+      if (e->kind == SILT_KIND_DIR && e->name_len == len && memcmp(b->names + e->name, name, len) == 0) {
+        b->walk[i] = 0;
+        e->flags |= SILT_FLAG_EXCLUDED;
+      }
+    }
+  }
 }
 
 // Finishes an item: hands over the work the listing produced, in the same
@@ -1368,7 +1408,7 @@ static void complete(silt_scanner *s, worker *me, const work *w, batch *b) {
 }
 
 // Lists one folder and commits it.
-static void process(silt_scanner *s, worker *me, work *w, batch *b, bool *class_now) {
+static void process(silt_scanner *s, worker *me, work *w, batch *b, qos_class_t *class_now) {
   silt_tree *t = s->tree;
   char path[PATH_BUFFER];
   size_t plen = 0;
@@ -1407,7 +1447,7 @@ static void process(silt_scanner *s, worker *me, work *w, batch *b, bool *class_
   }
   silt_tree_unlock(t);
 
-  set_class(class_now, w->urgent);
+  set_class(s, class_now, w->urgent);
   meter m;
   meter_start(&m, &s->ctl, w->urgent);
   // A path too long to build is one the system couldn't open either.
@@ -1424,6 +1464,7 @@ static void process(silt_scanner *s, worker *me, work *w, batch *b, bool *class_
       }
     }
   }
+  if (plen) exclude(t, path, b);
   commit(s, w, b, r);
   m.units += UNIT_FOLDER;
   meter_credit(&m);
@@ -1436,7 +1477,7 @@ static void *worker_main(void *arg) {
   batch b;
   memset(&b, 0, sizeof b);
   b.buf = tree_chunk_alloc(BULK_BUFFER);
-  bool class_now = true; // started at user-initiated QoS
+  qos_class_t class_now = QOS_CLASS_USER_INITIATED; // what spawn_locked started it at
 
   pthread_mutex_lock(&s->qlock);
   s->starting--;
@@ -1509,17 +1550,21 @@ static void *worker_main(void *arg) {
 
 // MARK: Public API
 
-static silt_scanner *scanner_create(silt_tree *t, int threads, bool scan_root);
+static silt_scanner *scanner_create(silt_tree *t, int threads, bool scan_root, const silt_pace *pace);
 
 silt_scanner *silt_scanner_start(silt_tree *t, int threads) {
-  return scanner_create(t, threads, true);
+  return scanner_create(t, threads, true, NULL);
 }
 
 silt_scanner *silt_scanner_start_idle(silt_tree *t, int threads) {
-  return scanner_create(t, threads, false);
+  return scanner_create(t, threads, false, NULL);
 }
 
-static silt_scanner *scanner_create(silt_tree *t, int threads, bool scan_root) {
+silt_scanner *silt_scanner_start_paced(silt_tree *t, int threads, const silt_pace *pace, bool scan_root) {
+  return scanner_create(t, threads, scan_root, pace);
+}
+
+static silt_scanner *scanner_create(silt_tree *t, int threads, bool scan_root, const silt_pace *pace) {
   // Never pull iCloud placeholders down just because we looked at them.
   setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS,
                  IOPOL_MATERIALIZE_DATALESS_FILES_OFF);
@@ -1547,6 +1592,12 @@ static silt_scanner *scanner_create(silt_tree *t, int threads, bool scan_root) {
   c->base = CTL_START < s->max ? CTL_START : s->max;
   c->phase = CTL_IDLE;
   s->limit = c->base;
+  const silt_pace start = silt_pace_default();
+  s->urgent_qos = start.urgent_qos;
+  s->background_qos = start.background_qos;
+  s->background_max = start.background_max;
+  // Before anything is queued, so the first listing already runs at it.
+  if (pace) silt_scanner_set_pace(s, pace);
 
   s->scan_start = now_ns();
   if (scan_root) {
@@ -1586,6 +1637,7 @@ void silt_scanner_progress(silt_scanner *s, silt_progress *out) {
   out->urgent_queued = s->urgent.count + s->urgent_active;
   out->limit = s->limit;
   out->threads = s->alive;
+  out->paused = s->paused;
   out->idle = out->queued == 0;
   uint64_t end = s->scan_end ? s->scan_end : now_ns();
   out->elapsed = (double)(end - s->scan_start) / 1e9;
@@ -1669,7 +1721,7 @@ void silt_scanner_refresh_ex(silt_scanner *s, uint32_t dir, uint32_t flags) {
       promote = true;
     }
   } else {
-    if ((e->flags & SILT_FLAG_MOUNT) || silt_path(t, d->entry, path, sizeof path) == 0) {
+    if ((e->flags & (SILT_FLAG_MOUNT | SILT_FLAG_EXCLUDED)) || silt_path(t, d->entry, path, sizeof path) == 0) {
       silt_tree_unlock(t);
       return;
     }
@@ -1708,11 +1760,50 @@ void silt_scanner_fix_limit(silt_scanner *s, uint32_t limit) {
   controller *c = &s->ctl;
   if (limit > 0) {
     c->fixed = true;
+    c->pinned = limit;
     c->phase = CTL_IDLE;
     __atomic_store_n(&c->measuring, false, __ATOMIC_RELAXED);
-    s->limit = limit < s->max ? limit : s->max;
+    s->limit = limit < c->hi ? limit : c->hi;
   } else {
     c->fixed = false;
+    if (urgent_busy(s)) ctl_probe(s, false, now_ns());
+    else ctl_idle(s);
+  }
+  dispatch_locked(s, false);
+  pthread_mutex_unlock(&s->qlock);
+}
+
+silt_pace silt_pace_default(void) {
+  return (silt_pace){.urgent_qos = SILT_QOS_USER_INITIATED,
+                     .urgent_max = 0,
+                     .background_qos = SILT_QOS_UTILITY,
+                     .background_max = BACKGROUND_LIMIT,
+                     .paused = false};
+}
+
+void silt_scanner_set_pace(silt_scanner *s, const silt_pace *pace) {
+  pthread_mutex_lock(&s->qlock);
+  __atomic_store_n(&s->urgent_qos, pace->urgent_qos, __ATOMIC_RELAXED);
+  __atomic_store_n(&s->background_qos, pace->background_qos, __ATOMIC_RELAXED);
+  s->background_max = pace->background_max;
+  const bool resumed = s->paused && !pace->paused;
+  s->paused = pace->paused;
+
+  controller *c = &s->ctl;
+  const uint32_t hi = pace->urgent_max && pace->urgent_max < s->max ? pace->urgent_max : s->max;
+  const bool ceiling = hi != c->hi;
+  if (ceiling) {
+    c->hi = hi;
+    c->lo = CTL_FLOOR < hi ? CTL_FLOOR : hi;
+    if (c->base > c->hi) c->base = c->hi;
+    if (c->base < c->lo) c->base = c->lo;
+  }
+  if (c->fixed) {
+    s->limit = c->pinned < c->hi ? c->pinned : c->hi;
+  } else if (s->paused) {
+    // Nothing to measure while nothing runs; resuming probes afresh.
+    ctl_idle(s);
+  } else if (ceiling || resumed) {
     if (urgent_busy(s)) ctl_probe(s, false, now_ns());
     else ctl_idle(s);
   }

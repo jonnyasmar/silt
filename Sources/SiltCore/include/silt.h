@@ -40,6 +40,7 @@ enum {
   SILT_FLAG_HIDDEN = 1 << 4,   // dot-file or UF_HIDDEN
   SILT_FLAG_REMOVED = 1 << 5,  // deleted by the user; awaiting refresh
   SILT_FLAG_CLONE = 1 << 6,    // APFS clone: shares blocks with other files
+  SILT_FLAG_EXCLUDED = 1 << 7, // a folder the user left out: never opened
 };
 
 enum {
@@ -128,6 +129,17 @@ void silt_tree_destroy(silt_tree *t);
 // containers) when the app lacks Full Disk Access. Call before scanning.
 void silt_tree_guard(silt_tree *t, const char *parent_path);
 
+// The folders the user left out of the scan, as absolute paths (replacing any
+// earlier list). A folder on the list is recorded when its parent is listed,
+// flagged EXCLUDED and never opened; one that was already scanned loses its
+// contents the next time its parent is listed, and a folder taken off the
+// list is scanned the next time its parent is. Takes the lock; may be called
+// while a scan runs.
+void silt_tree_set_excluded(silt_tree *t, const char *const *paths, uint32_t count);
+// Up to `cap` live folders flagged EXCLUDED, as entry indices; returns how
+// many there are. Lock held.
+uint32_t silt_tree_excluded_dirs(const silt_tree *t, uint32_t *out, uint32_t cap);
+
 void silt_tree_lock(silt_tree *t);
 void silt_tree_unlock(silt_tree *t);
 
@@ -206,6 +218,7 @@ typedef struct silt_progress {
   uint32_t urgent_queued;
   uint32_t limit;   // urgent listings allowed to run at once right now
   uint32_t threads; // worker threads alive (0 once idle for a while)
+  bool paused;      // silt_scanner_set_pace paused it: nothing new starts
 } silt_progress;
 
 // Starts a scanner bound to `t` and queues a full scan of the root, as
@@ -215,7 +228,8 @@ typedef struct silt_progress {
 // seconds, so an idle scanner has none. `threads` is the most there will
 // ever be. How many urgent listings run at once adapts between 2 and that
 // maximum, to what the storage gives back for the CPU spent; background
-// listings run at most 2 at a time, at utility priority.
+// listings run at most 2 at a time, at utility priority (both adjustable:
+// see "Pace").
 //
 // Threading: progress/refresh may be called from any thread, but never
 // concurrently with silt_scanner_destroy, and the tree must outlive the
@@ -225,7 +239,8 @@ silt_scanner *silt_scanner_start(silt_tree *t, int threads);
 void silt_scanner_progress(silt_scanner *s, silt_progress *out);
 // Stops workers after their current listing; queued work is discarded.
 void silt_scanner_cancel(silt_scanner *s);
-// Blocks until the queue drains (or the scanner is cancelled).
+// Blocks until the queue drains (or the scanner is cancelled). Work held back
+// by the pace (paused, or background work with a limit of 0) keeps it waiting.
 void silt_scanner_wait_idle(silt_scanner *s);
 // Cancels, joins workers, and frees the scanner. The tree remains valid.
 void silt_scanner_destroy(silt_scanner *s);
@@ -263,6 +278,41 @@ void silt_scanner_set_idle_timeout(silt_scanner *s, double seconds);
 // Pins the number of urgent listings allowed at once (clamped to the
 // maximum), turning the adaptive controller off; 0 turns it back on.
 void silt_scanner_fix_limit(silt_scanner *s, uint32_t limit);
+
+// MARK: Pace
+//
+// How hard the scanner works, per class of listing. Urgent listings (a scan,
+// a refresh someone waits on) run at `urgent_qos`, as many at once as the
+// adaptive controller finds worthwhile, but never more than `urgent_max`.
+// Background listings run at `background_qos`, at most `background_max` at
+// once (0: none, so background work waits). Background QoS lowers the disk
+// I/O tier and, on Apple silicon, keeps the work on the efficiency cores.
+// While `paused`, no listing starts at all: queued work waits (and keeps
+// coalescing), and listings already running finish. Takes effect at once;
+// each listing runs at the QoS its class had when it started.
+// silt_scanner_wait_idle doesn't return while work waits on a pause.
+
+typedef enum silt_qos {
+  SILT_QOS_USER_INITIATED = 0,
+  SILT_QOS_UTILITY = 1,
+  SILT_QOS_BACKGROUND = 2,
+} silt_qos;
+
+typedef struct silt_pace {
+  silt_qos urgent_qos;
+  uint32_t urgent_max;     // 0: the scanner's thread maximum
+  silt_qos background_qos;
+  uint32_t background_max; // 0: background work waits
+  bool paused;
+} silt_pace;
+
+// What a scanner starts with: urgent work at user-initiated QoS up to the
+// thread maximum, background work at utility QoS two at a time.
+silt_pace silt_pace_default(void);
+void silt_scanner_set_pace(silt_scanner *s, const silt_pace *pace);
+// silt_scanner_start (or, with !scan_root, silt_scanner_start_idle) already
+// at `pace`: a paused scanner queues the scan but starts nothing.
+silt_scanner *silt_scanner_start_paced(silt_tree *t, int threads, const silt_pace *pace, bool scan_root);
 
 // MARK: Snapshots
 
