@@ -118,7 +118,9 @@ enum Reclaim {
 
     /// Runs off the main thread; everything goes through the tree's locking
     /// queries.
-    static func analyze(tree: Tree, under dir: UInt32) -> [Finding] {
+    /// `excluded`: folders left out of the scan, whose `target` links the
+    /// tree can't show.
+    static func analyze(tree: Tree, under dir: UInt32, excluded: Set<String> = []) -> [Finding] {
         var findings: [Finding] = []
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         var claimed = Set<UInt32>()
@@ -239,7 +241,7 @@ enum Reclaim {
         // If the search hit its cap, the smallest matches (symlinks among
         // them) were left out: read every code folder's links from disk, so a
         // linked target isn't taken for an orphan.
-        var links = targetLinks(outside: named.count >= cap ? nil : tree, under: dir)
+        var links = targetLinks(outside: named.count >= cap ? nil : tree, under: dir, excluded: excluded)
         for p in linkPaths {
             if let dest = try? FileManager.default.destinationOfSymbolicLink(atPath: p) {
                 let base = (p as NSString).deletingLastPathComponent
@@ -381,11 +383,15 @@ enum Reclaim {
     /// still in use. Folders the scan has listed under `dir` are skipped:
     /// the in-tree search already sees their links.
     /// With no tree, every code folder is read.
-    static func targetLinks(outside tree: Tree?, under dir: UInt32) -> Set<String> {
+    /// A code folder with an excluded folder inside is read from disk too:
+    /// the excluded project's link isn't in the tree, and its target would
+    /// look orphaned.
+    static func targetLinks(outside tree: Tree?, under dir: UInt32, excluded: Set<String> = []) -> Set<String> {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let roots = codeFolders.map { home + "/" + $0 }
         let inside: Set<String> = tree.map { tree in tree.withLock {
             Set(roots.filter { root in
+                if excluded.contains(where: { $0.hasPrefix(root + "/") }) { return false }
                 let i = tree.lookup(root)
                 guard i != NONE, tree.isLive(i) else { return false }
                 let e = tree.entry(i)

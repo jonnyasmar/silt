@@ -130,6 +130,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         super.init()
         root = makeRoot(for: source)
         configureOutline()
+        reportShown()
         session.addListener(self) { [weak self] in self?.treeChanged() }
         if !source.isList {
             session.captureTreeState = { [weak self] in
@@ -150,7 +151,15 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         }
     }
 
+    /// Folders this view has expanded, for `Session.setShown`.
+    private var openDirs: Set<UInt32> = []
+
+    private func reportShown() {
+        session.setShown(source.isList ? [] : openDirs.union([root.dir]), by: ObjectIdentifier(self))
+    }
+
     func teardown() {
+        session.setShown([], by: ObjectIdentifier(self))
         if !source.isList { session.treeStates[root.dir] = captureState() }
         // What this tree selected goes with it, so ⌘⌫ can't act on rows nobody
         // can see (the Files tree brings its selection back when it returns).
@@ -270,6 +279,8 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         let previous = source.isList ? root.children ?? [] : []
         source = newSource
         root = makeRoot(for: newSource)
+        openDirs = []
+        reportShown()
         if newSource.isList {
             root.children = previous // lets buildList reuse row objects
             tree.withLock { root.children = buildList(root) }
@@ -609,7 +620,12 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     func outlineView(_ outlineView: NSOutlineView, shouldExpandItem item: Any) -> Bool {
         // Always open onto fresh contents.
         let n = node(item)
-        if n.isDir { tree.withLock { loadChildren(n) } }
+        if n.isDir {
+            tree.withLock { loadChildren(n) }
+            session.lookedAt(dir: n.dir)
+            openDirs.insert(n.dir)
+            reportShown()
+        }
         return true
     }
 
@@ -680,6 +696,8 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     /// `children`, so a list folder with an open folder inside keeps them.
     func outlineViewItemDidCollapse(_ notification: Notification) {
         guard let n = notification.userInfo?["NSObject"] as? Node, n.isDir, n !== root else { return }
+        openDirs.remove(n.dir)
+        reportShown()
         if !sharesDirNodes, holdsOpenFolder(n) { return }
         n.children = nil
         n.order = []

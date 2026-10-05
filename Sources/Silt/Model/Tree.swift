@@ -26,13 +26,41 @@ final class Tree: @unchecked Sendable {
     init(path: String) {
         rootPath = path
         raw = silt_tree_create(path)
+        Self.register(self)
     }
 
     /// Adopts a tree loaded from a snapshot.
     init(restored: UnsafeMutablePointer<silt_tree>, path: String) {
         rootPath = path
         raw = restored
+        Self.register(self)
     }
+
+    // MARK: Pace
+
+    private struct WeakTree { weak var tree: Tree? }
+    /// The pace every scanner runs at (see `SpeedController`), and the trees
+    /// to tell when it changes.
+    private static let paceState = OSAllocatedUnfairLock(initialState: (pace: silt_pace_default(), trees: [WeakTree]()))
+
+    private static func register(_ tree: Tree) {
+        paceState.withLock { s in
+            s.trees.removeAll { $0.tree == nil }
+            s.trees.append(WeakTree(tree: tree))
+        }
+    }
+
+    /// Sets the pace for every scanner, running or yet to start.
+    static func setPace(_ pace: silt_pace) {
+        let trees = paceState.withLock { s in
+            s.pace = pace
+            s.trees.removeAll { $0.tree == nil }
+            return s.trees.compactMap(\.tree)
+        }
+        for t in trees { t.withScanner { if let s = $0 { var p = pace; silt_scanner_set_pace(s, &p) } } }
+    }
+
+    private static var pace: silt_pace { paceState.withLock { $0.pace } }
 
     deinit {
         if let _scanner { silt_scanner_destroy(_scanner) }
@@ -45,14 +73,18 @@ final class Tree: @unchecked Sendable {
 
     func startScan() {
         scannerLock.lock()
-        _scanner = silt_scanner_start(raw, Self.threads)
+        // Read under the scanner lock: a pace set meanwhile reaches this
+        // scanner once the lock is free (`setPace`).
+        var pace = Self.pace
+        _scanner = silt_scanner_start_paced(raw, Self.threads, &pace, true)
         scannerLock.unlock()
     }
 
     /// For a restored tree: workers only, waiting for refreshes.
     func startIdle() {
         scannerLock.lock()
-        if _scanner == nil { _scanner = silt_scanner_start_idle(raw, Self.threads) }
+        var pace = Self.pace
+        if _scanner == nil { _scanner = silt_scanner_start_paced(raw, Self.threads, &pace, false) }
         scannerLock.unlock()
     }
 

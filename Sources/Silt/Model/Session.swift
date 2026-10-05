@@ -102,7 +102,9 @@ final class Session: Identifiable {
     @ObservationIgnored private var lastExactCapacity: TimeInterval = -.infinity
     @ObservationIgnored private var measuringCapacity = false
     @ObservationIgnored private var measureCapacityAgain = false
-    var focus: UInt32 = 0
+    var focus: UInt32 = 0 {
+        didSet { if focus != oldValue { lookedAt(dir: focus) } }
+    }
     var selection: [ItemRef] = []
     var toast: Toast?
     private(set) var freedBytes: Int64 = 0
@@ -170,6 +172,36 @@ final class Session: Identifiable {
     /// The stream holds its watcher, so a session dropped without `close()`
     /// would leave it running: `deinit` stops it (hence reachable from there).
     @ObservationIgnored nonisolated(unsafe) private var watcher: FSWatcher?
+    @ObservationIgnored nonisolated(unsafe) private var paceObserver: NSObjectProtocol?
+    @ObservationIgnored nonisolated(unsafe) private var rulesObserver: NSObjectProtocol?
+    /// Per folder: how hot it runs. Each time it changes again soon after
+    /// being listed, the wait before its next listing doubles (`paceGap`).
+    @ObservationIgnored private var heat: [UInt32: Int] = [:]
+    /// The replay of what changed while Silt wasn't watching has all been
+    /// delivered; catching up ends once what it asked for is listed.
+    @ObservationIgnored private var historyDelivered = false
+    /// The pace factor `dueAt` deadlines were set under.
+    @ObservationIgnored private var dueFactor: Double = 1
+    /// Folders open on screen, per tree view (see `setShown`).
+    @ObservationIgnored private var shown: [ObjectIdentifier: Set<UInt32>] = [:]
+    @ObservationIgnored private var shownDirs: Set<UInt32> = []
+    /// Folders under a Paused rule with changes waiting, and whether a deep
+    /// check is among them.
+    @ObservationIgnored private var pausedPending: [UInt32: Bool] = [:]
+    /// The exclusions this tree was last given (absolute paths).
+    @ObservationIgnored private var appliedExclusions: Set<String> = []
+    /// Folders Silt updates less often because they change constantly, by
+    /// folder: how often they're updated now.
+    @ObservationIgnored private var busyEvery: [UInt32: TimeInterval] = [:]
+    /// The same, for views.
+    private(set) var busyFolders: [BusyFolder] = []
+
+    struct BusyFolder: Identifiable, Equatable {
+        let dir: UInt32
+        let path: String
+        let every: TimeInterval
+        var id: UInt32 { dir }
+    }
     @ObservationIgnored private var heldEvents: [FSWatcher.Event] = []
     @ObservationIgnored private var listeners: [ObjectIdentifier: () -> Void] = [:]
     @ObservationIgnored private var toastTask: Task<Void, Never>?
@@ -389,6 +421,8 @@ final class Session: Identifiable {
                 silt_tree_guard(tree.raw, home + "/" + sub)
             }
         }
+        // Before the first listing: an excluded folder must never be opened.
+        applyExclusions(refresh: false)
         if let restored {
             // Show the saved scan now; FSEvents replays everything since.
             (baseline, baselineExpanded) = Session.sizes(tree, depth: 4)
@@ -396,6 +430,10 @@ final class Session: Identifiable {
             // Loading used large temporary buffers; give those pages back.
             malloc_zone_pressure_relief(nil, 0)
             tree.startIdle()
+            // The saved scan predates the current rules: drop what's now
+            // excluded, scan what no longer is.
+            applyExclusions(refresh: true, also: Set(staleExclusions()))
+            restorePaused()
             phase = .live
             restoredFrom = restored.savedAt
             // Catching up is only as good as the replay behind it; without
@@ -406,16 +444,17 @@ final class Session: Identifiable {
             }
             if restored.replayable, watcher?.running == true {
                 catchingUp = true
+                historyDelivered = false
                 // A listing that stopped early may have missed changes no
                 // replay will bring back.
                 let incomplete = tree.withLock {
                     (0..<tree.raw.pointee.dir_count).filter { tree.dir($0).state & UInt32(SILT_DIR_INCOMPLETE) != 0 }
                 }
-                for dir in incomplete { tree.refresh(dir: dir, deep: true, urgent: true) }
+                for dir in incomplete { tree.refresh(dir: dir, deep: true, urgent: catchUpUrgent) }
             } else {
                 startWatching(since: nil)
                 recheckingSince = UInt32(Date().timeIntervalSince1970)
-                startRescan(0, explicit: false, urgent: true)
+                startRescan(0, explicit: false, urgent: catchUpUrgent)
             }
         } else {
             tree.startScan()
@@ -446,12 +485,61 @@ final class Session: Identifiable {
         guard !started, !closed else { return }
         started = true
         checkCapacity(now: ProcessInfo.processInfo.systemUptime, exact: true)
+        paceObserver = NotificationCenter.default.addObserver(forName: .siltPaceChanged, object: nil, queue: .main) {
+            [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, !self.closed else { return }
+                self.rescaleDue()
+                self.updateActivity()
+                self.rearm()
+            }
+        }
+        rulesObserver = NotificationCenter.default.addObserver(forName: .siltFolderRulesChanged, object: nil,
+                                                               queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, !self.closed else { return }
+                self.rulesChanged()
+            }
+        }
         updateActivity()
         rearm()
     }
 
     deinit {
         watcher?.stop()
+        if let paceObserver { NotificationCenter.default.removeObserver(paceObserver) }
+        if let rulesObserver { NotificationCenter.default.removeObserver(rulesObserver) }
+    }
+
+    /// Everything on screen jumps the queue: the focused folder and the
+    /// folders open under it (those a tree view reports, and those it will
+    /// reopen when it's shown again).
+    private func lookedAtShown() {
+        var dirs = shownDirs
+        dirs.insert(focus)
+        if let open = treeStates[focus]?.expanded { dirs.formUnion(open) }
+        for d in dirs { lookedAt(dir: d) }
+    }
+
+    /// Whether catching up counts as work someone waits on (the speed
+    /// setting decides; only Fast says yes).
+    private var catchUpUrgent: Bool { SpeedController.shared.pace.catchUpUrgent }
+
+    /// The user opened `dir` (expanded it, or focused on it). While Silt
+    /// catches up in the background, a listing it still has coming jumps the
+    /// queue, so what's on screen is current first.
+    func lookedAt(dir: UInt32) {
+        guard isAwake, phase == .live else { return }
+        releasePaused(under: dir)
+        let due: Bool = tree.withLock {
+            guard dir < tree.raw.pointee.dir_count, tree.isLive(tree.dirEntry(dir)) else { return false }
+            let d = tree.dir(dir)
+            if d.state & UInt32(SILT_DIR_QUEUED) != 0 { return true }
+            return catchingUp || recheckingSince.map { d.listed_at < $0 } ?? false
+        }
+        guard due else { return }
+        tree.refresh(dir: dir, deep: false, urgent: true)
+        rearm()
     }
 
     func close() {
@@ -466,6 +554,10 @@ final class Session: Identifiable {
         let save = saving && residency == .awake && keepsHistory && phase == .live && !showsSavedScan
             && tree.generation != savedGeneration
         closed = true
+        if let paceObserver { NotificationCenter.default.removeObserver(paceObserver) }
+        if let rulesObserver { NotificationCenter.default.removeObserver(rulesObserver) }
+        paceObserver = nil
+        rulesObserver = nil
         duplicates.cancel()
         cancelTimer()
         holdBusyActivity(false)
@@ -581,6 +673,7 @@ final class Session: Identifiable {
         }
 
         tickRescan(p, now: now)
+        tickCatchUp(p)
         if onScreen {
             releaseDueRefreshes(now: now)
             if marksDirty, now - lastMarksRecompute >= 0.5 - Self.slack { recomputeMarks() }
@@ -618,16 +711,19 @@ final class Session: Identifiable {
         // Work under way: followed closely while someone waits on it or
         // watches the tree move, loosely otherwise, and never more than
         // twice a second off screen.
-        if p.urgent_queued > 0 || phase == .scanning || catchingUp || tree.generation != lastGeneration
-            || (onScreen && now - lastChange < 0.5) {
+        // Upkeep held back (Paused): nothing of it moves, so it isn't followed.
+        let held = p.paused || SpeedController.shared.pace.upkeepPaused && p.urgent_queued == 0
+        if tree.generation != lastGeneration || (onScreen && now - lastChange < 0.5)
+            || (!p.paused && (p.urgent_queued > 0 || phase == .scanning)) || (catchingUp && !held) {
             at(lastTick + (onScreen ? 1.0 / 12 : 0.5))
-        } else if !p.idle || rescanBase != nil {
+        } else if !held && (!p.idle || rescanBase != nil || recheckingSince != nil) {
             at(lastTick + (onScreen ? 0.25 : 0.5))
         }
 
         // Chores with deadlines.
         if onScreen {
             if let first = dueAt.values.lazy.map({ $0.at }).min() { at(first) }
+            if let t = nextCooling { at(t) }
             if rescanBase == nil { for dir in deferredDeep.keys { at(deepDue(dir)) } }
             if versionPending { at(lastVersionBump + Self.versionInterval) }
             if version != quietSource { at(phase == .scanning ? now : lastQuietBump + quietInterval) }
@@ -889,9 +985,9 @@ final class Session: Identifiable {
             heldEvents.append(contentsOf: events)
             return
         }
-        // Replayed history is what a catch-up waits on; live changes are
-        // background work.
-        apply(events, urgent: catchingUp)
+        // Live changes are background work. Replayed history is too, unless
+        // the speed setting says catching up comes first (Fast).
+        apply(events, urgent: catchingUp && !historyDelivered && catchUpUrgent)
         rearm()
     }
 
@@ -908,11 +1004,7 @@ final class Session: Identifiable {
         var rootEvent: FSEventStreamEventId?, wrapEvent: FSEventStreamEventId?
         for event in events {
             if event.id > lastEventId && event.id != UInt64(kFSEventStreamEventIdSinceNow) { lastEventId = event.id }
-            if event.historyDone {
-                catchingUp = false
-                lastGeneration = .max // rows drawn as out of date should look again
-                reportLive()
-            }
+            if event.historyDone { historyDelivered = true } // `tickCatchUp` ends it
             if event.rootChanged, rootEvent == nil { rootEvent = event.id }
             if event.idsWrapped, wrapEvent == nil { wrapEvent = event.id }
         }
@@ -938,6 +1030,10 @@ final class Session: Identifiable {
         }
         if let wrapEvent { requestDeep(0, event: wrapEvent, urgent: urgent) }
         var sizes: [UInt32: UInt32] = [:]
+        var ruled: [UInt32: FolderRule] = [:]
+        var pausedChanged = false
+        defer { if pausedChanged { persistPaused() } }
+        let rules = FolderRules.shared
         tree.withLock {
             for event in events {
                 if event.rootChanged || event.historyDone { continue }
@@ -945,35 +1041,306 @@ final class Session: Identifiable {
                 let known = targets[dir]
                 targets[dir] = ((known?.deep ?? false) || event.mustScanSubdirs, min(known?.event ?? .max, event.id))
                 sizes[dir] = tree.dir(dir).count
+                if let r = rules.rule(for: event.path)?.rule { ruled[dir] = r }
             }
         }
         let now = ProcessInfo.processInfo.systemUptime
         for (dir, t) in targets {
+            switch ruled[dir] {
+            case .excluded:
+                continue // never opened (the engine refuses too)
+            case .paused:
+                let known = pausedPending[dir]
+                pausedPending[dir] = (known ?? false) || t.deep
+                if known != pausedPending[dir] { pausedChanged = true }
+                continue
+            default:
+                break
+            }
             if t.deep {
                 requestDeep(dir, event: t.event, urgent: urgent)
             } else {
-                refreshPaced(dir, children: sizes[dir] ?? 0, now: now, urgent: urgent, event: t.event)
+                refreshPaced(dir, children: sizes[dir] ?? 0, now: now, urgent: urgent, event: t.event, rule: ruled[dir])
             }
         }
     }
 
-    /// Re-lists `dir` now, or once its pace allows: at most every 40 µs per
-    /// child (a 60,000-file build folder every 2.4 s), capped at 5 s. Small
-    /// folders are never held back.
+    /// How long `dir` waits between listings: by its size (40 µs a child,
+    /// at most 5 s), and while it runs hot, 0.25 s doubled for each step of
+    /// heat, at most 30 s (2 s while it's open on screen). Both stretch with
+    /// the speed setting. A Slowly rule waits a minute.
+    private func paceGap(_ dir: UInt32, children: UInt32, heat h: Int, rule: FolderRule?) -> TimeInterval {
+        let factor = SpeedController.shared.pace.paceFactor
+        if rule == .slow { return 60 * factor }
+        let size = min(5, Double(children) * 40e-6)
+        return max(size, hotGap(dir, heat: h)) * factor
+    }
+
+    /// The part of the wait that comes from running hot, before the speed
+    /// setting stretches it.
+    private func hotGap(_ dir: UInt32, heat h: Int) -> TimeInterval {
+        guard h > 0 else { return 0 }
+        let gap = min(30, 0.25 * pow(2, Double(h - 1)))
+        return isOnScreen && shownDirs.contains(dir) ? min(gap, 2) : gap
+    }
+
+    /// The folders a tree view has open (its root included), so busy ones
+    /// on screen keep updating every couple of seconds.
+    func setShown(_ dirs: Set<UInt32>, by owner: ObjectIdentifier) {
+        shown[owner] = dirs.isEmpty ? nil : dirs
+        shownDirs = shown.values.reduce(into: Set()) { $0.formUnion($1) }
+    }
+
+    /// The speed setting changed how far waits stretch: deadlines already set
+    /// move with it, so plugging in doesn't leave a two-minute wait behind.
+    private func rescaleDue() {
+        let factor = SpeedController.shared.pace.paceFactor
+        guard factor != dueFactor else { return }
+        let clock = ProcessInfo.processInfo.systemUptime
+        for (dir, due) in dueAt {
+            let last = listedAt[dir] ?? clock
+            dueAt[dir] = (last + (due.at - last) * factor / dueFactor, due.event)
+        }
+        dueFactor = factor
+    }
+
+    /// Folders that wait this long between updates are shown as busy.
+    static let busyAfter: TimeInterval = 4
+
+    /// Re-lists `dir` now, or once its pace allows (`paceGap`). A folder
+    /// that changes again within 2 s (or twice its wait) of being listed
+    /// runs hotter, so a folder that never stops changing ends up listed
+    /// every 30 s; one quiet for 10 s (or four times its wait) cools off at
+    /// once. Small, quiet folders are never held back. A Live rule lists on
+    /// every change.
     private func refreshPaced(_ dir: UInt32, children: UInt32, now: TimeInterval, urgent: Bool,
-                              event: FSEventStreamEventId) {
-        let gap = min(5, Double(children) * 40e-6)
-        guard gap >= 0.1 else {
+                              event: FSEventStreamEventId, rule: FolderRule? = nil) {
+        if rule == .live {
+            heat[dir] = nil
+            noteBusy(dir, every: 0)
+            listedAt[dir] = now
+            dueAt[dir] = nil
             tree.refresh(dir: dir, deep: false, urgent: urgent)
             return
         }
-        if let last = listedAt[dir], now - last < gap {
-            if dueAt[dir] == nil { dueAt[dir] = (last + gap, event) }
+        // Already waiting: that listing will cover this change too.
+        guard dueAt[dir] == nil else { return }
+        var h = heat[dir] ?? 0
+        let last = listedAt[dir]
+        if let last {
+            let elapsed = now - last
+            let gap = paceGap(dir, children: children, heat: h, rule: rule)
+            if elapsed < max(2, 2 * gap) { h = min(8, h + 1) } else if elapsed > max(10, 4 * gap) { h = 0 }
+        }
+        heat[dir] = h == 0 ? nil : h
+        let gap = paceGap(dir, children: children, heat: h, rule: rule)
+        // Busy means it changes constantly, not that it's big or the pace slow.
+        noteBusy(dir, every: rule != .slow && hotGap(dir, heat: h) >= Self.busyAfter ? gap : 0)
+        dueFactor = SpeedController.shared.pace.paceFactor
+        if gap < 0.1 {
+            listedAt[dir] = now
+            tree.refresh(dir: dir, deep: false, urgent: urgent)
+            return
+        }
+        if let last, now - last < gap {
+            dueAt[dir] = (last + gap, event)
             return
         }
         listedAt[dir] = now
-        dueAt[dir] = nil // this listing covers whatever was waiting
         tree.refresh(dir: dir, deep: false, urgent: urgent)
+    }
+
+    /// Keeps `busyFolders` current: `dir` is updated every `every` seconds.
+    private func noteBusy(_ dir: UInt32, every: TimeInterval) {
+        let busy = every >= Self.busyAfter
+        guard busy || busyEvery[dir] != nil else { return }
+        if busy, let shown = busyEvery[dir], abs(shown - every) < 0.5 { return }
+        busyEvery[dir] = busy ? every : nil
+        publishBusy()
+    }
+
+    private func publishBusy() {
+        let next: [BusyFolder] = tree.withLock {
+            busyEvery.compactMap { dir, every in
+                guard dir < tree.raw.pointee.dir_count, tree.isLive(tree.dirEntry(dir)) else { return nil }
+                return BusyFolder(dir: dir, path: tree.path(of: tree.dirEntry(dir)), every: every)
+            }
+        }.sorted { $0.path < $1.path }
+        if next != busyFolders { busyFolders = next }
+    }
+
+    /// Busy folders that have gone quiet: off the list, and cooled.
+    private func coolQuietFolders(now: TimeInterval) {
+        var changed = false
+        for (dir, every) in busyEvery where now - (listedAt[dir] ?? 0) > max(10, 4 * every) && dueAt[dir] == nil {
+            busyEvery[dir] = nil
+            heat[dir] = nil
+            changed = true
+        }
+        if changed { publishBusy() }
+    }
+
+    /// When the next busy folder may go quiet, for the timer.
+    private var nextCooling: TimeInterval? {
+        busyEvery.lazy.map { dir, every in (self.listedAt[dir] ?? 0) + max(10, 4 * every) }.min()
+    }
+
+    // MARK: Folder rules
+
+    /// Lists the Paused folders inside `dir` (itself included) that have
+    /// changes waiting.
+    func releasePaused(under dir: UInt32) {
+        guard !pausedPending.isEmpty else { return }
+        let inside: [(UInt32, Bool)] = tree.withLock {
+            pausedPending.filter { d, _ in
+                var p = d
+                while true {
+                    if p == dir { return true }
+                    guard p < tree.raw.pointee.dir_count, tree.isLive(tree.dirEntry(p)) else { return false }
+                    let parent = tree.entry(tree.dirEntry(p)).parent
+                    if parent == NONE { return false }
+                    p = parent
+                }
+            }.map { ($0.key, $0.value) }
+        }
+        for (d, deep) in inside {
+            pausedPending[d] = nil
+            if deep { startRescan(d, explicit: false, urgent: true) } else { tree.refresh(dir: d, deep: false, urgent: true) }
+        }
+        if !inside.isEmpty {
+            persistPaused()
+            rearm()
+        }
+    }
+
+    /// Paused folders with changes waiting are saved by path: a snapshot
+    /// taken meanwhile is past those changes, so no replay would bring them
+    /// back after a relaunch.
+    private var pausedKey: String { "pausedPending:" + url.path }
+
+    private func persistPaused() {
+        guard keepsHistory else { return }
+        if pausedPending.isEmpty {
+            UserDefaults.standard.removeObject(forKey: pausedKey)
+            return
+        }
+        let byPath: [String: Bool] = tree.withLock {
+            var out: [String: Bool] = [:]
+            for (d, deep) in pausedPending where d < tree.raw.pointee.dir_count && tree.isLive(tree.dirEntry(d)) {
+                out[tree.path(of: tree.dirEntry(d))] = deep
+            }
+            return out
+        }
+        UserDefaults.standard.set(byPath, forKey: pausedKey)
+    }
+
+    private func restorePaused() {
+        guard let saved = UserDefaults.standard.dictionary(forKey: pausedKey) as? [String: Bool] else { return }
+        tree.withLock {
+            for (path, deep) in saved {
+                let i = tree.lookup(path)
+                guard i != NONE, tree.isLive(i), tree.entry(i).isDir else { continue }
+                pausedPending[tree.entry(i).aux] = deep
+            }
+        }
+    }
+
+    /// Whether a Paused folder at or inside `dir` has changes waiting.
+    func hasPausedChanges(under dir: UInt32) -> Bool {
+        guard !pausedPending.isEmpty else { return false }
+        return tree.withLock {
+            pausedPending.keys.contains { d in
+                var p = d
+                while true {
+                    if p == dir { return true }
+                    guard p < tree.raw.pointee.dir_count, tree.isLive(tree.dirEntry(p)) else { return false }
+                    let parent = tree.entry(tree.dirEntry(p)).parent
+                    if parent == NONE { return false }
+                    p = parent
+                }
+            }
+        }
+    }
+
+    /// The excluded folders inside this scan.
+    private var exclusions: Set<String> {
+        let root = url.path
+        let prefix = root == "/" ? "/" : root + "/"
+        return Set(FolderRules.shared.excluded.filter { $0.hasPrefix(prefix) && $0 != root })
+    }
+
+    /// Gives the tree the current exclusions. `refresh`: re-list the parent
+    /// of every folder whose exclusion changed, so it's dropped or scanned.
+    private func applyExclusions(refresh: Bool, also extra: Set<String> = []) {
+        let next = exclusions
+        let changed = next.symmetricDifference(appliedExclusions).union(extra)
+        appliedExclusions = next
+        let paths = Array(next)
+        var cStrings = paths.map { strdup($0) }
+        defer { cStrings.forEach { free($0) } }
+        cStrings.withUnsafeMutableBufferPointer { buf in
+            buf.withMemoryRebound(to: UnsafePointer<CChar>?.self) {
+                silt_tree_set_excluded(tree.raw, $0.baseAddress, UInt32(paths.count))
+            }
+        }
+        guard refresh, !changed.isEmpty else { return }
+        let parents: Set<UInt32> = tree.withLock {
+            Set(changed.compactMap { path in
+                let i = tree.lookup((path as NSString).deletingLastPathComponent)
+                guard i != NONE, tree.isLive(i), tree.entry(i).isDir else { return nil }
+                return tree.entry(i).aux
+            })
+        }
+        for d in parents { tree.refresh(dir: d, deep: false, urgent: true) }
+        rearm()
+    }
+
+    /// Rules changed while parked: applied on waking.
+    @ObservationIgnored private var rulesPending = false
+
+    /// Where a saved scan disagrees with the rules: folders it flags
+    /// EXCLUDED that no rule excludes any more, and excluded folders it
+    /// still holds the contents of.
+    private func staleExclusions() -> [String] {
+        let wanted = exclusions
+        return tree.withLock {
+            var out = [UInt32](repeating: 0, count: 256)
+            let n = Int(silt_tree_excluded_dirs(tree.raw, &out, UInt32(out.count)))
+            if n > out.count {
+                out = [UInt32](repeating: 0, count: n)
+                _ = silt_tree_excluded_dirs(tree.raw, &out, UInt32(n))
+            }
+            let flagged = out.prefix(n).map { tree.path(of: $0) }
+            let unwanted = flagged.filter { !wanted.contains($0) }
+            let unflagged = wanted.filter { path in
+                let i = tree.lookup(path)
+                return i != NONE && tree.isLive(i) && tree.entry(i).flags & UInt8(SILT_FLAG_EXCLUDED) == 0
+            }
+            return unwanted + unflagged
+        }
+    }
+
+    private func rulesChanged() {
+        guard isAwake else {
+            rulesPending = true
+            return
+        }
+        rulesPending = false
+        applyExclusions(refresh: true)
+        // Folders whose Paused rule went away: bring them up to date.
+        let rules = FolderRules.shared
+        let freed: [UInt32] = tree.withLock {
+            pausedPending.keys.filter { d in
+                guard d < tree.raw.pointee.dir_count, tree.isLive(tree.dirEntry(d)) else { return true }
+                return rules.rule(for: tree.path(of: tree.dirEntry(d)))?.rule != .paused
+            }
+        }
+        for d in freed { releasePaused(under: d) }
+        // A folder now Live or Slowly starts over.
+        for (dir, _) in busyEvery { heat[dir] = nil }
+        busyEvery = [:]
+        publishBusy()
+        rearm()
     }
 
     /// Paced refreshes whose time has come (all of them, with `.infinity`).
@@ -987,10 +1354,12 @@ final class Session: Identifiable {
                 tree.refresh(dir: dir, deep: false, urgent: false)
             }
         }
-        // Forget folders that have gone quiet.
+        // Forget folders that have gone quiet (busy ones keep their pace).
         if listedAt.count > 256 {
-            listedAt = listedAt.filter { clock - $0.value < 10 }
+            listedAt = listedAt.filter { clock - $0.value < 10 || heat[$0.key] != nil || dueAt[$0.key] != nil }
+            heat = heat.filter { listedAt[$0.key] != nil }
         }
+        coolQuietFolders(now: clock)
     }
 
     /// FSEvents asks for a subtree revalidation when it coalesced or dropped
@@ -1014,7 +1383,17 @@ final class Session: Identifiable {
     /// would never rest.
     private func deepDue(_ dir: UInt32) -> TimeInterval {
         guard let start = deepAt[dir] else { return -.infinity }
-        return start + max(30, (deepCost[dir] ?? 0) * 11)
+        return start + max(30, (deepCost[dir] ?? 0) * 11) * SpeedController.shared.pace.paceFactor
+    }
+
+    /// Every folder the running deep checks cover has been listed since.
+    private func deepChecksListed() -> Bool {
+        guard !deepRunning.isEmpty else { return false }
+        return tree.withLock {
+            deepRunning.allSatisfy { d in
+                d >= tree.raw.pointee.dir_count || !tree.isLive(tree.dirEntry(d)) || tree.dir(d).pending == 0
+            }
+        }
     }
 
     /// Deferred deep checks that are due.
@@ -1027,6 +1406,17 @@ final class Session: Identifiable {
 
     /// Deep checks waiting until they're due, for tests.
     var deferredDeepChecks: Int { deferredDeep.count }
+
+    /// How hot `dir` runs (see `refreshPaced`), for tests.
+    func heat(of dir: UInt32) -> Int { heat[dir] ?? 0 }
+
+    /// Lets every paced refresh through now, for tests.
+    func releasePacedNow() { releaseDueRefreshes(now: .infinity) }
+
+    /// Moves every folder's last listing `seconds` earlier, for tests.
+    func backdatePacing(by seconds: TimeInterval) {
+        for (dir, at) in listedAt { listedAt[dir] = at - seconds }
+    }
 
     /// Moves every deep check's start `seconds` earlier, as if each had
     /// started (and taken) that much longer ago. For tests.
@@ -1092,26 +1482,41 @@ final class Session: Identifiable {
         rearm()
     }
 
+    /// Catching up ends when the replay has been delivered and everything it
+    /// queued is listed; a recheck of a saved scan, when every folder has been
+    /// listed since it began (whichever rescan did it).
+    private func tickCatchUp(_ p: silt_progress) {
+        guard catchingUp || recheckingSince != nil, p.urgent_queued == 0 else { return }
+        let settled = p.idle || tree.withLock { tree.dir(0).pending == 0 }
+        guard settled else { return }
+        if catchingUp, historyDelivered {
+            catchingUp = false
+            lastGeneration = .max // rows drawn as out of date should look again
+            reportLive()
+        }
+        if recheckingSince != nil, rescanBase == nil {
+            // The saved scan is fully replaced, and worth saving again.
+            recheckingSince = nil
+            saveSoon = true
+            lastGeneration = .max
+            reportLive()
+        }
+    }
+
     private func tickRescan(_ p: silt_progress, now: TimeInterval) {
         if let base = rescanBase {
             // A rescan someone waits on ends with its urgent work (which
             // counts everything the refresh leads to), even while background
             // refreshes carry on.
-            let done = base.urgent ? p.urgent_queued == 0 : p.idle
+            // A background one, when what it checks has all been listed: on a
+            // busy disk the background queue itself may never empty.
+            let done = base.urgent ? p.urgent_queued == 0 : p.idle || deepChecksListed()
             if done {
                 for dir in deepRunning { deepCost[dir] = now - (deepAt[dir] ?? now) }
                 deepRunning = []
                 let wasExplicit = rescanState?.explicit ?? false
                 rescanBase = nil
                 rescanState = nil
-                if recheckingSince != nil {
-                    // Every folder has been listed since: the saved scan is
-                    // fully replaced, and worth saving again.
-                    recheckingSince = nil
-                    saveSoon = true
-                    lastGeneration = .max
-                    reportLive()
-                }
                 if wasExplicit {
                     // What it corrected must reach the snapshot: parking
                     // skips saving while the old one is still replayable.
@@ -1419,7 +1824,11 @@ final class Session: Identifiable {
         alert.messageText = items.count == 1
             ? "Delete “\(items[0].url.lastPathComponent)” immediately?"
             : "Delete \(items.count) items immediately?"
-        alert.informativeText = "This frees \(Fmt.bytes(bytes)) right away and can’t be undone."
+        // A folder left out of the scan has no size Silt knows.
+        let unscanned = tree.withLock { items.filter { tree.entry($0.entry).flags & UInt8(SILT_FLAG_EXCLUDED) != 0 }.count }
+        alert.informativeText = unscanned > 0
+            ? "It can’t be undone. Silt doesn’t scan \(unscanned == items.count ? (items.count == 1 ? "it" : "them") : "\(unscanned) of them"), so how much this frees isn’t known."
+            : "This frees \(Fmt.bytes(bytes)) right away and can’t be undone."
         let delete = alert.addButton(withTitle: "Delete")
         delete.hasDestructiveAction = true
         alert.addButton(withTitle: "Cancel")
@@ -1591,6 +2000,10 @@ final class Session: Identifiable {
         if residency == .waking || (residency == .parking && wakeWhenParked) {
             return Activity(fraction: nil, label: "Loading")
         }
+        if SpeedController.shared.pace.upkeepPaused, phase == .live,
+           catchingUp || recheckingSince != nil || rescanState.map({ !$0.explicit }) == true {
+            return Activity(fraction: rescanState?.fraction, label: "Paused")
+        }
         switch phase {
         case .scanning:
             guard let est = scanEstimate, est > 0 else { return Activity(fraction: nil, label: "Scanning") }
@@ -1678,7 +2091,7 @@ final class Session: Identifiable {
             }
         }
         let next = HiddenSpace.measure(url: url, scanned: stats.bytes, capacity: capacity,
-                                       unreadable: stats.denied, snapshots: snapshots)
+                                       unreadable: stats.denied, excluded: appliedExclusions.count, snapshots: snapshots)
         if next != hidden { hidden = next }
     }
 
@@ -2241,10 +2654,11 @@ extension Session {
         lastAnalysis = now
         let v = version
         let tree = tree
+        let excluded = appliedExclusions
         Task { [weak self] in
             let start = ProcessInfo.processInfo.systemUptime
             let result = await Task.detached(priority: .utility) {
-                Reclaim.analyze(tree: tree, under: 0)
+                Reclaim.analyze(tree: tree, under: 0, excluded: excluded)
             }.value
             guard let self else { return }
             self.analysisCost = ProcessInfo.processInfo.systemUptime - start
@@ -2482,10 +2896,14 @@ extension Session {
                         self.residency = .awake
                         self.lastGeneration = .max // everything showing it should look again
                         if let root { self.resumeWatching(root) }
-                        // It's being woken to be shown: catching up is urgent.
-                        self.releaseParkedEvents(urgent: true)
+                        if self.rulesPending { self.rulesChanged() }
+                        // It's being woken to be shown. Catching up runs at the
+                        // speed setting's pace; what's opened comes first
+                        // (`lookedAt`).
+                        self.releaseParkedEvents(urgent: self.catchUpUrgent)
                         self.releaseDueRefreshes(now: .infinity)
                         self.releaseDeferredDeep(now: now)
+                        self.lookedAtShown()
                         self.resolvePendingFocus()
                         self.bumpVersion(now)
                         self.bumpQuiet(now)
@@ -2513,6 +2931,7 @@ extension Session {
             startWatching(since: lastEventId)
             if watcher?.running == true {
                 catchingUp = true
+                historyDelivered = false
                 holdBusyActivity(true)
                 return
             }
@@ -2522,7 +2941,7 @@ extension Session {
             rootVolume = root.volume
         }
         startWatching(since: nil)
-        startRescan(0, explicit: false, urgent: true)
+        startRescan(0, explicit: false, urgent: catchUpUrgent)
     }
 
     private func releaseParkedEvents(urgent: Bool) {

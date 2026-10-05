@@ -21,6 +21,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
         // Parked trees belong to the run that parked them.
         try? FileManager.default.removeItem(at: Session.parkDirectory)
+        // The speed setting applies from the first scan on.
+        MainActor.assumeIsolated { _ = SpeedController.shared }
         // Icon Services is slow to wake the first time; do it while the
         // window is still being built.
         DispatchQueue.global(qos: .userInitiated).async {

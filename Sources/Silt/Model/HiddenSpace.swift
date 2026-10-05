@@ -23,7 +23,7 @@ struct HiddenSpace: Equatable {
     /// container's (APFS volumes share it); nil if the gap is too small to
     /// mention.
     static func measure(url: URL, scanned: Int64, capacity: Capacity,
-                        unreadable: Int, snapshots: [String]) -> HiddenSpace? {
+                        unreadable: Int, excluded: Int = 0, snapshots: [String]) -> HiddenSpace? {
         let used = capacity.total - capacity.free
         let gap = used - scanned
         guard gap > capacity.total / 200 else { return nil }
@@ -71,8 +71,10 @@ struct HiddenSpace: Equatable {
         }
         if onVolume >= 100_000_000 {
             let folders = unreadable > 0 ? " Silt couldn’t open \(Fmt.count(unreadable)) folder\(unreadable == 1 ? "" : "s") here." : ""
-            parts.append(Part(id: "unreadable", kind: .unreadable, title: "Unreadable and system data",
-                              detail: "Folders only macOS can read (Spotlight’s index, logs, other users’ files), snapshot data it doesn’t count as purgeable, and file-system bookkeeping.\(folders)",
+            let left = excluded > 0 ? " It also holds the \(excluded == 1 ? "folder" : "\(excluded) folders") you chose not to scan." : ""
+            parts.append(Part(id: "unreadable", kind: .unreadable,
+                              title: excluded > 0 ? "Unreadable, system and unscanned data" : "Unreadable and system data",
+                              detail: "Folders only macOS can read (Spotlight’s index, logs, other users’ files), snapshot data it doesn’t count as purgeable, and file-system bookkeeping.\(folders)\(left)",
                               bytes: onVolume))
         }
         parts.sort { $0.bytes > $1.bytes }

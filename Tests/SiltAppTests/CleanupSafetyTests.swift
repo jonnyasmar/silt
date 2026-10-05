@@ -327,6 +327,9 @@ private func surviving(_ names: [String], in root: URL) -> [String] {
         return try #require(item.markedSize)
     }
     try Data(repeating: 9, count: 4_000_000).write(to: old.appendingPathComponent("documents.bin"))
+    // Listed again now, rather than whenever background upkeep gets to it
+    // on a loaded machine.
+    await MainActor.run { if let ref = first.liveRef(path: old.path) { first.rescan(ref) } }
     #expect(await wait { first.markedItems().first?.grew == true })
     await MainActor.run { first.flushMarks() }
     await finish(first)
