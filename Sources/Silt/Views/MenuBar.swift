@@ -11,14 +11,25 @@ enum MenuBarMode {
     /// No window left: Silt leaves the Dock and lives in the menu bar.
     @MainActor static func windowsGone() {
         guard isOn else { return }
-        NSApp.setActivationPolicy(.accessory)
+        let ok = NSApp.setActivationPolicy(.accessory)
+        Perf.log.notice("menu bar only: activation policy accessory \(ok, privacy: .public), now \(NSApp.activationPolicy().rawValue, privacy: .public)")
     }
 
     /// A window is coming: back in the Dock, in front.
     @MainActor static func windowComing() {
-        if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
+        if NSApp.activationPolicy() != .regular {
+            Perf.log.notice("window coming: back in the Dock")
+            NSApp.setActivationPolicy(.regular)
+        }
         NSApp.activate()
     }
+}
+
+/// The scans the last window left when it closed in menu-bar mode, where the
+/// menu can see them come and go.
+@MainActor @Observable final class KeptScans {
+    static let shared = KeptScans()
+    var model: WindowModel?
 }
 
 /// The menu under Silt's menu bar icon.
@@ -51,7 +62,7 @@ struct MenuBarContent: View {
 
     /// What the window last showed, kept for the next one.
     private var scanLine: String? {
-        guard let s = WindowModel.keptSession else { return nil }
+        guard let s = KeptScans.shared.model?.current else { return nil }
         let state = s.residency == .parked ? "parked until you open it" : "watching for changes"
         return "\(s.title): \(Fmt.compactCount(s.stats.items)) items, \(state)"
     }

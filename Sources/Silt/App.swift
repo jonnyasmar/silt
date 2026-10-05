@@ -132,9 +132,18 @@ final class WindowModel {
     private(set) var current: Session? {
         didSet {
             guard current !== oldValue else { return }
-            oldValue?.hiddenSince = ProcessInfo.processInfo.systemUptime
-            current?.hiddenSince = nil
-            current?.wake()
+            let now = ProcessInfo.processInfo.systemUptime
+            oldValue?.hiddenSince = now
+            // Kept for the menu bar, nothing is on screen: a scan that
+            // finishes and takes over stays out of sight until a window
+            // comes (`takeBack`).
+            if kept {
+                if current?.hiddenSince == nil { current?.hiddenSince = now }
+                scheduleParking()
+            } else {
+                current?.hiddenSince = nil
+                current?.wake()
+            }
             setNeedsSync()
         }
     }
@@ -184,16 +193,14 @@ final class WindowModel {
 
     /// Menu-bar mode: the model of the last window to close, with its scans
     /// (they park once out of sight), for the next window to take over.
-    private static var keptModel: WindowModel?
-
-    /// The kept model, for a new window's view to use instead of a new one.
-    static func takeKept() -> WindowModel? {
-        defer { keptModel = nil }
-        return keptModel
+    private static var keptModel: WindowModel? {
+        didSet { KeptScans.shared.model = keptModel } // read here, it isn't observed
     }
 
-    /// The scan the kept model was showing (the menu bar mentions it).
-    static var keptSession: Session? { keptModel?.current }
+    /// The kept model, for a new window's view to start from. Only looked at:
+    /// SwiftUI builds a view (and its state's first value) more than once,
+    /// so it's the window arriving that takes it over (`takeBack`).
+    static var keptForNextWindow: WindowModel? { keptModel }
 
     /// A main window that's open, if any.
     static var openWindow: NSWindow? {
@@ -284,7 +291,7 @@ final class WindowModel {
     private func parkHidden(after: TimeInterval) {
         guard !windowClosed else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        for s in sessions where s !== current {
+        for s in sessions where s !== current || kept {
             guard let hidden = s.hiddenSince, now - hidden >= after, s.canPark else { continue }
             s.park()
         }
@@ -302,7 +309,7 @@ final class WindowModel {
         guard !windowClosed else { return }
         let now = ProcessInfo.processInfo.systemUptime
         var due = TimeInterval.infinity
-        for s in sessions where s !== current && s.residency != .parked && !s.closed {
+        for s in sessions where (s !== current || kept) && s.residency != .parked && !s.closed {
             guard let hidden = s.hiddenSince else { continue }
             let at = hidden + Self.parkAfter
             due = min(due, at > now && s.isAwake ? at : max(at, now + Self.parkRetry))
@@ -358,8 +365,10 @@ final class WindowModel {
     /// the main thread first; quitting waits for that.
     private func windowWillClose() {
         guard !windowClosed else { return }
-        if MenuBarMode.isOn, !Self.active.contains(where: { $0.model !== self && $0.model?.window != nil
-                                                        && $0.model?.windowClosed == false && $0.model?.kept == false }) {
+        let others = Self.active.contains(where: { $0.model !== self && $0.model?.window != nil
+                                                   && $0.model?.windowClosed == false && $0.model?.kept == false })
+        Perf.log.notice("window closing: menu bar mode \(MenuBarMode.isOn, privacy: .public), other windows open \(others, privacy: .public)")
+        if MenuBarMode.isOn, !others {
             keep()
             return
         }
@@ -379,9 +388,10 @@ final class WindowModel {
     }
 
     /// The last window closed and Silt stays in the menu bar: its scans stay,
-    /// out of sight from now, so they park after the usual wait and stop
-    /// watching; the next window takes them over (`takeBack`).
+    /// out of sight from now, so they park after the usual wait (noting what
+    /// changes, for waking); the next window takes them over (`takeBack`).
     private func keep() {
+        Perf.log.notice("keeping the window's scans for the menu bar")
         kept = true
         Self.keptModel = self
         let center = NotificationCenter.default
@@ -400,6 +410,7 @@ final class WindowModel {
 
     /// A new window took this model over: what it shows wakes up.
     private func takeBack() {
+        Perf.log.notice("a new window took over the kept scans")
         kept = false
         if Self.keptModel === self { Self.keptModel = nil }
         current?.hiddenSince = nil
@@ -586,7 +597,7 @@ final class WindowModel {
         // as it settles.
         session.onResidencyChange = { [weak self] in self?.setNeedsSync() }
         session.onSettled = { [weak self, weak session] in
-            guard let self, let session, !self.windowClosed, session !== self.current,
+            guard let self, let session, !self.windowClosed, session !== self.current || self.kept,
                   let hidden = session.hiddenSince,
                   ProcessInfo.processInfo.systemUptime - hidden >= Self.parkAfter else { return }
             session.park()
