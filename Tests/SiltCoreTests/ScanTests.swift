@@ -951,11 +951,13 @@ extension Fixture {
     let f = try Fixture(["a/one.bin": 10_000])
     let h = f.handles
     let locked = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), read = DispatchSemaphore(value: 0)
+    let unlocked = DispatchSemaphore(value: 0)
     let holder = Thread {
         silt_tree_lock(h.tree)
         locked.signal()
         release.wait()
         silt_tree_unlock(h.tree)
+        unlocked.signal()
     }
     holder.start()
     locked.wait()
@@ -967,6 +969,7 @@ extension Fixture {
     let answered = read.wait(timeout: .now() + 3) == .success
     release.signal()
     if !answered { read.wait() }
+    unlocked.wait() // the fixture frees the tree when this returns
     #expect(answered)
     #expect(f.progress.files == 2) // a and a/one.bin
 }
