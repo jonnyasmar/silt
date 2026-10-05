@@ -307,3 +307,36 @@ private func surviving(_ names: [String], in root: URL) -> [String] {
     #expect(names == [root.appendingPathComponent("repo/model.bin").path])
 }
 
+// MARK: Marks that went stale
+
+/// A folder that fills up after it was marked is flagged in the review, and
+/// what it was is remembered across a relaunch.
+@Test func folderThatGrewSinceMarkedIsFlagged() async throws {
+    let root = try scratchRoot("silt-grew")
+    defer { cleanUp(root) }
+    let old = root.appendingPathComponent("Old")
+    try writeCopies(["Old/small.bin"], in: root)
+    await settle(1.5)
+
+    let first = await live(root)
+    let marked: Int64 = try await MainActor.run {
+        let ref = try #require(first.liveRef(path: old.path))
+        first.mark([ref], reason: "test")
+        let item = try #require(first.markedItems().first)
+        #expect(!item.grew)
+        return try #require(item.markedSize)
+    }
+    try Data(repeating: 9, count: 4_000_000).write(to: old.appendingPathComponent("documents.bin"))
+    #expect(await wait { first.markedItems().first?.grew == true })
+    await MainActor.run { first.flushMarks() }
+    await finish(first)
+
+    let s = await live(root)
+    #expect(await wait { s.markedCount == 1 })
+    let item = try #require(await MainActor.run { s.markedItems().first })
+    #expect(item.markedSize == marked)
+    #expect(item.grew)
+    #expect(item.markedAt != nil)
+    await finish(s)
+}
+

@@ -1828,6 +1828,11 @@ extension Session {
         /// Set for a duplicate copy: cleanup holds it to the file that was
         /// compared and removes it only while another copy survives.
         var copy: CopyCheck? = nil
+        /// Its size and the time it was marked, so the review can point out a
+        /// folder that has grown since (marks from before these were kept
+        /// have neither).
+        var size: Int64? = nil
+        var at: Date? = nil
     }
 
     /// A duplicate copy as it was compared, and the other copies of its
@@ -1851,18 +1856,20 @@ extension Session {
         }
     }
 
-    /// Identity of what each ref is right now, for new marks.
-    private func captureMarks(_ refs: [ItemRef]) -> [(MarkKey, MarkInfo)] {
-        let resolved: [(MarkKey, String)] = tree.withLock {
+    /// Identity and size of what each ref is right now, for new marks.
+    private func captureMarks(_ refs: [ItemRef], reason: String) -> [(MarkKey, MarkInfo)] {
+        let resolved: [(MarkKey, String, Int64)] = tree.withLock {
             refs.compactMap { r in
                 guard let k = markKey(for: r) else { return nil }
-                return (k, tree.path(of: entryIndex(r)))
+                let i = entryIndex(r)
+                return (k, tree.path(of: i), tree.entry(i).size)
             }
         }
-        return resolved.compactMap { k, path in
+        let now = Date()
+        return resolved.compactMap { k, path, size in
             var st = stat()
             guard lstat(path, &st) == 0 else { return nil }
-            return (k, MarkInfo(reason: "", dev: st.st_dev, ino: st.st_ino))
+            return (k, MarkInfo(reason: reason, dev: st.st_dev, ino: st.st_ino, size: size, at: now))
         }
     }
 
@@ -1874,18 +1881,14 @@ extension Session {
         if keys.allSatisfy({ marks[$0] != nil }) {
             for k in keys { marks.removeValue(forKey: k) }
         } else {
-            for (k, info) in captureMarks(refs) where marks[k] == nil {
-                marks[k] = MarkInfo(reason: reason ?? "", dev: info.dev, ino: info.ino)
-            }
+            for (k, info) in captureMarks(refs, reason: reason ?? "") where marks[k] == nil { marks[k] = info }
         }
         marksChanged()
     }
 
     func mark(_ refs: [ItemRef], reason: String) {
         guard isAwake, !refs.isEmpty else { return } // e.g. a search that finished after parking
-        for (k, info) in captureMarks(refs) where marks[k] == nil {
-            marks[k] = MarkInfo(reason: reason, dev: info.dev, ino: info.ino)
-        }
+        for (k, info) in captureMarks(refs, reason: reason) where marks[k] == nil { marks[k] = info }
         marksChanged()
     }
 
@@ -1901,16 +1904,18 @@ extension Session {
         guard isAwake, !copies.isEmpty else { return }
         var setOf: [String: DuplicateSet] = [:]
         for s in sets { for c in s.copies { setOf[c.path] = s } }
-        let found: [(MarkKey, DuplicateSet.Copy)] = tree.withLock {
+        let found: [(MarkKey, DuplicateSet.Copy, Int64)] = tree.withLock {
             copies.compactMap { c in
                 let i = tree.lookup(c.path)
                 guard i != NONE, tree.isLive(i), let k = markKey(for: ref(forEntry: i)) else { return nil }
-                return (k, c)
+                return (k, c, tree.entry(i).size)
             }
         }
-        for (k, c) in found where marks[k] == nil {
+        let now = Date()
+        for (k, c, size) in found where marks[k] == nil {
             guard let set = setOf[c.path] else { continue }
-            marks[k] = MarkInfo(reason: reason, dev: c.stamp.dev, ino: c.stamp.ino, copy: CopyCheck(c, in: set))
+            marks[k] = MarkInfo(reason: reason, dev: c.stamp.dev, ino: c.stamp.ino, copy: CopyCheck(c, in: set),
+                                size: size, at: now)
         }
         marksChanged()
     }
@@ -1925,7 +1930,9 @@ extension Session {
             marks.removeValue(forKey: k)
         } else {
             guard FileStamp(path: c.path) == c.stamp else { return false }
-            marks[k] = MarkInfo(reason: reason, dev: c.stamp.dev, ino: c.stamp.ino, copy: CopyCheck(c, in: set))
+            let size = tree.withLock { tree.entry(entryIndex(ref)).size }
+            marks[k] = MarkInfo(reason: reason, dev: c.stamp.dev, ino: c.stamp.ino, copy: CopyCheck(c, in: set),
+                                size: size, at: Date())
         }
         marksChanged()
         return true
@@ -1957,7 +1964,17 @@ extension Session {
         let size: Int64
         let isDir: Bool
         let reason: String
+        /// Size and time when marked, if known.
+        var markedSize: Int64? = nil
+        var markedAt: Date? = nil
         var id: MarkKey { key }
+
+        /// Noticeably bigger than when it was marked: a folder that has
+        /// filled with new things since, which the user may not want gone.
+        var grew: Bool {
+            guard let before = markedSize else { return false }
+            return size - before >= max(1_000_000, before / 10)
+        }
     }
 
     /// Lock held. Live marks with their entries, minus anything inside
@@ -1987,7 +2004,8 @@ extension Session {
             liveMarks().map { key, i in
                 let e = tree.entry(i)
                 return MarkedItem(key: key, entry: i, path: tree.path(of: i), size: e.size, isDir: e.isDir,
-                                  reason: marks[key]?.reason ?? "")
+                                  reason: marks[key]?.reason ?? "", markedSize: marks[key]?.size,
+                                  markedAt: marks[key]?.at)
             }
         }
         var stale: [MarkKey] = []
@@ -2152,6 +2170,8 @@ extension Session {
                 guard let i = resolveCached(key) else { return nil }
                 var m: [String: Any] = ["path": tree.path(of: i), "reason": info.reason,
                                         "dev": Int(info.dev), "ino": Int(info.ino)]
+                if let size = info.size { m["size"] = Int(size) }
+                if let at = info.at { m["at"] = at.timeIntervalSince1970 }
                 if let c = info.copy {
                     m["stamp"] = c.stamp.saved
                     m["others"] = c.others.map { ["path": $0.path, "stamp": $0.stamp.saved] }
@@ -2185,7 +2205,9 @@ extension Session {
                       }), !others.contains(where: { $0 == nil }) else { continue }
                 copy = CopyCheck(stamp: stamp, others: others.compactMap { $0 })
             }
-            marks[key] = MarkInfo(reason: m["reason"] as? String ?? "", dev: st.st_dev, ino: st.st_ino, copy: copy)
+            marks[key] = MarkInfo(reason: m["reason"] as? String ?? "", dev: st.st_dev, ino: st.st_ino, copy: copy,
+                                  size: (m["size"] as? Int).map(Int64.init),
+                                  at: (m["at"] as? Double).map(Date.init(timeIntervalSince1970:)))
         }
         recomputeMarks()
         notifyListeners()

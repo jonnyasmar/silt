@@ -46,6 +46,7 @@ struct CleanupSheet: View {
     private var total: Int64 { items.reduce(0) { $0 + $1.size } }
     private var safeFindings: [Finding] { session.findings.filter { $0.safety == .safe && !$0.isTrash } }
     private var keepers: [Session.MarkedItem] { items.filter { verdicts[$0.key]?.safety == .keep } }
+    private var grown: [Session.MarkedItem] { items.filter(\.grew) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -88,6 +89,14 @@ struct CleanupSheet: View {
             if !keepers.isEmpty {
                 Label("\(keepers.count == 1 ? "1 item" : "\(keepers.count) items") Silt would keep: "
                       + keepers.prefix(3).map { (($0.path as NSString).lastPathComponent) }.joined(separator: ", "),
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.orange)
+            }
+            if !grown.isEmpty {
+                Label("\(grown.count == 1 ? "1 item has" : "\(grown.count) items have") grown since you marked "
+                      + (grown.count == 1 ? "it" : "them") + ": "
+                      + grown.prefix(3).map { (($0.path as NSString).lastPathComponent) }.joined(separator: ", "),
                       systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.orange)
@@ -203,6 +212,13 @@ private struct MarkedRow: View {
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
                     .truncationMode(.head)
+                if item.grew, let before = item.markedSize {
+                    Text("Was \(Fmt.bytes(before)) when you marked it"
+                         + (item.markedAt.map { " " + Fmt.age(UInt32(clamping: Int($0.timeIntervalSince1970))) } ?? ""))
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                }
             }
             Spacer(minLength: 8)
             HStack(spacing: 8) {
