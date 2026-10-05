@@ -84,4 +84,32 @@ enum Brand {
             : NSColor(srgbRed: 0.78, green: 0.50, blue: 0.16, alpha: 1)
     }
     static var color: Color { Color(nsColor: ochre) }
+    /// Label colour on an ochre fill: white is ~2:1 on the dark-mode ochre.
+    static let ink = Color(nsColor: NSColor(srgbRed: 0.13, green: 0.09, blue: 0.04, alpha: 1))
+}
+
+/// A prominent button filled with the brand ochre and a legible label.
+/// `.borderedProminent` overrides a foreground set on the button itself, so the
+/// ink is applied to the label content.
+struct BrandButton<Label: View>: View {
+    let action: () -> Void
+    @ViewBuilder let label: Label
+    @Environment(\.controlActiveState) private var activeState
+    @Environment(\.isEnabled) private var isEnabled
+
+    var body: some View {
+        Button(action: action) {
+            // The fill goes gray when the window is inactive or the button is
+            // disabled; dark ink on that gray is unreadable, so only use it on ochre.
+            label.foregroundStyle(activeState != .inactive && isEnabled ? Brand.ink : Color.primary)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(Brand.color)
+    }
+}
+
+extension BrandButton where Label == Text {
+    init(_ title: String, action: @escaping () -> Void) {
+        self.init(action: action) { Text(title) }
+    }
 }

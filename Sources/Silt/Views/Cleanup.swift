@@ -23,9 +23,7 @@ struct CleanupBar: View {
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
                 .font(.system(size: 12))
-            Button("Review & Clean Up…") { reviewing = true }
-                .buttonStyle(.borderedProminent)
-                .tint(Brand.color)
+            BrandButton("Review & Clean Up…") { reviewing = true }
                 .controlSize(.small)
         }
         .padding(.horizontal, 12)
@@ -151,9 +149,7 @@ struct CleanupSheet: View {
                 Spacer()
                 // Return confirms only the recoverable path; deleting needs a click.
                 if method == .trash {
-                    Button("Move \(items.count) to Trash") { commit() }
-                        .buttonStyle(.borderedProminent)
-                        .tint(Brand.color)
+                    BrandButton("Move \(items.count) to Trash") { commit() }
                         .keyboardShortcut(.defaultAction)
                         .disabled(items.isEmpty)
                 } else {

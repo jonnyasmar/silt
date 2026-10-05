@@ -89,13 +89,11 @@ struct ScanPrompt: View {
                 .frame(width: 280)
             }
             VStack(spacing: 8) {
-                Button {
+                BrandButton {
                     model.scan(URL(fileURLWithPath: path))
                 } label: {
                     Text("Scan \(name)").padding(.horizontal, 10)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(Brand.color)
                 .controlSize(.large)
                 .keyboardShortcut(.defaultAction)
                 if let last = lastScanned {

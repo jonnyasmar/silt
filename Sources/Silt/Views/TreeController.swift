@@ -226,12 +226,13 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         }
         outline.sortDescriptors = [NSSortDescriptor(key: "size", ascending: false)]
 
-        // No horizontal scrolling: the table stays exactly as wide as the
-        // view, and the flexible column (name, or location in lists) absorbs
-        // every resize.
+        // The table stays exactly as wide as the view, and the flexible column
+        // (name, or location in lists) absorbs every resize. Below the
+        // columns' combined minimums (a narrow window) it scrolls sideways
+        // rather than cutting off what's on the right.
         scroll.documentView = outline
         scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = false
+        scroll.hasHorizontalScroller = true
         scroll.autohidesScrollers = true
         scroll.drawsBackground = false
         scroll.borderType = .noBorder

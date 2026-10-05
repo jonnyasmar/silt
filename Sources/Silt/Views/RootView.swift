@@ -64,9 +64,13 @@ struct RootView: View {
                 .disabled(model.current?.focus == 0 || model.pane != .files)
             }
             ToolbarItem(placement: .principal) {
+                // The segments show titles only; the symbols are for the
+                // toolbar's overflow menu, which draws a segmented picker as
+                // a palette of icons. Without them it's a row of blank tiles.
                 Picker("View", selection: paneBinding) {
-                    ForEach(Pane.allCases) { Text($0.shortTitle).tag($0) }
+                    ForEach(Pane.allCases) { Label($0.shortTitle, systemImage: $0.symbol).tag($0) }
                 }
+                .labelStyle(.titleOnly)
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .help(Pane.allCases.enumerated().map { "\($1.shortTitle) ⌘\($0 + 1)" }.joined(separator: " · "))
@@ -670,11 +674,30 @@ struct StatusBar: View {
 
     var body: some View {
         let s = session.stats
+        // In a narrow window the bar sheds what it can do without (the chips,
+        // then the capacity) instead of asking the window for more room: a
+        // detail column that needs more than it's given squeezes the sidebar
+        // and inspector until they're cut off.
+        ViewThatFits(in: .horizontal) {
+            row(s, chips: true, capacity: true)
+            row(s, chips: false, capacity: true)
+            row(s, chips: false, capacity: false)
+        }
+        .font(.system(size: 11))
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .padding(.horizontal, 12)
+        .frame(height: 28)
+        .background(.bar)
+        .overlay(alignment: .top) { Divider() }
+    }
+
+    private func row(_ s: ScanStats, chips showChips: Bool, capacity showCapacity: Bool) -> some View {
         HStack(spacing: 12) {
             leading(s)
             Spacer(minLength: 8)
-            chips(s)
-            if let cap = session.capacity {
+            if showChips { chips(s) }
+            if showCapacity, let cap = session.capacity {
                 HStack(spacing: 6) {
                     CapacityBar(fraction: Double(cap.total - cap.available) / Double(max(cap.total, 1)),
                                 marked: Double(session.markedBytes) / Double(max(cap.total, 1)))
@@ -687,12 +710,6 @@ struct StatusBar: View {
                       : "\(Fmt.bytes(cap.available)) available of \(Fmt.bytes(cap.total))")
             }
         }
-        .font(.system(size: 11))
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 12)
-        .frame(height: 28)
-        .background(.bar)
-        .overlay(alignment: .top) { Divider() }
     }
 
     /// Small, quiet pointers to the next useful thing.
