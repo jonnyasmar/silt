@@ -288,3 +288,22 @@ private func surviving(_ names: [String], in root: URL) -> [String] {
     #expect(guidance == nil)
 }
 
+/// Even with dependency and build folders included, nothing inside a
+/// version-control store is a duplicate candidate.
+@Test func versionControlStoresAreNeverDuplicateCandidates() async throws {
+    let root = try scratchRoot("silt-vcs")
+    defer { cleanUp(root) }
+    for path in ["repo/.git/lfs/objects/aa/blob", "repo/.hg/store/blob", "repo/model.bin"] {
+        let url = root.appendingPathComponent(path)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(repeating: 3, count: 1_200_000).write(to: url)
+    }
+    let tree = Tree(path: root.path)
+    tree.startScan()
+    defer { tree.stop() }
+    #expect(await wait { tree.progress.idle && tree.progress.finished > 0 })
+    let found = tree.filesAtLeast(1_000_000, skip: DuplicateFinder.alwaysSkipped, skipPackages: false, limit: 100)
+    let names = tree.withLock { found.map { tree.path(of: $0) } }
+    #expect(names == [root.appendingPathComponent("repo/model.bin").path])
+}
+

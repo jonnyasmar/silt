@@ -111,7 +111,8 @@ struct DuplicatesView: View {
                     Text("100 MB").tag(Int64(100_000_000))
                 }
                 .fixedSize()
-                Toggle("Include app bundles & dependency folders", isOn: $finder.includeManaged)
+                // Apps' insides and version-control stores stay out either way.
+                Toggle("Include dependency & build folders", isOn: $finder.includeManaged)
                     .toggleStyle(.checkbox)
             }
             .font(.system(size: 12))

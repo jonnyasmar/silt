@@ -162,6 +162,11 @@ final class DuplicateFinder {
         "SourcePackages", "checkouts", "artifacts", "Carthage", "build", "dist", "out",
     ]
 
+    /// Skipped even when managed folders are included: the Trash, and
+    /// version-control stores, whose objects are identical across clones and
+    /// whose loss corrupts the repository.
+    nonisolated static let alwaysSkipped = [".Trash", ".Trashes", ".git", ".hg", ".svn", ".jj"]
+
     /// Compiler output: identical copies across build folders are expected.
     nonisolated static let buildProducts: Set<String> = [
         "a", "o", "rlib", "rmeta", "dylib", "so", "d", "pcm", "pch", "swiftmodule", "swiftdoc", "dSYM", "wasm",
@@ -358,7 +363,7 @@ final class DuplicateFinder {
         capped: @escaping @Sendable () async -> Void
     ) async {
         // 1. Everything big enough, straight from the scan.
-        let entries = tree.filesAtLeast(minSize, skip: includeManaged ? [".Trash", ".Trashes"] : managedFolders,
+        let entries = tree.filesAtLeast(minSize, skip: includeManaged ? alwaysSkipped : managedFolders + alwaysSkipped,
                                         skipPackages: !includeManaged, limit: candidateCap)
         if entries.count >= candidateCap { await capped() }
         // Paths in short batches, so scanner commits aren't starved.
