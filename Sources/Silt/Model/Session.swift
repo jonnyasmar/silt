@@ -242,15 +242,20 @@ final class Session: Identifiable {
     }
     private struct RescanBase {
         let listed: UInt64
-        let total: Int
+        var total: Int
         /// Someone is waiting on it: it's over when the urgent work is,
         /// whatever background refreshes are still coming in.
         var urgent: Bool
     }
     @ObservationIgnored private var rescanBase: RescanBase?
+    /// When each folder's last deep check started, how long it took (until
+    /// the rescan it was part of ended), and the folders the rescan under
+    /// way is checking.
     @ObservationIgnored private var deepAt: [UInt32: TimeInterval] = [:]
-    /// Deep checks held back by their 30 s limit, with the first event that
-    /// asked for each.
+    @ObservationIgnored private var deepCost: [UInt32: TimeInterval] = [:]
+    @ObservationIgnored private var deepRunning: Set<UInt32> = []
+    /// Deep checks held back until they're due (see `deepDue`), with the
+    /// first event that asked for each.
     @ObservationIgnored private var deferredDeep: [UInt32: FSEventStreamEventId] = [:]
     /// Big folders that change constantly (build output, browser caches) are
     /// re-listed at a pace that scales with their size rather than on every
@@ -622,7 +627,7 @@ final class Session: Identifiable {
         // Chores with deadlines.
         if onScreen {
             if let first = dueAt.values.lazy.map({ $0.at }).min() { at(first) }
-            if rescanBase == nil { for dir in deferredDeep.keys { at((deepAt[dir] ?? 0) + 30) } }
+            if rescanBase == nil { for dir in deferredDeep.keys { at(deepDue(dir)) } }
             if versionPending { at(lastVersionBump + Self.versionInterval) }
             if version != quietSource { at(phase == .scanning ? now : lastQuietBump + quietInterval) }
             if marksDirty { at(lastMarksRecompute + 0.5) }
@@ -988,26 +993,45 @@ final class Session: Identifiable {
     }
 
     /// FSEvents asks for a subtree revalidation when it coalesced or dropped
-    /// events. On a busy disk that can arrive in bursts, so each folder is
-    /// revalidated at most every 30 s; requests in between are deferred.
+    /// events. On a busy disk that can arrive in bursts, and after every
+    /// burst it drops, it asks for the whole volume. A folder whose check is
+    /// still under way, or isn't due again yet, has the request deferred
+    /// rather than a second walk laid over the first.
     private func requestDeep(_ dir: UInt32, event: FSEventStreamEventId, urgent: Bool) {
         let now = ProcessInfo.processInfo.systemUptime
-        if let last = deepAt[dir], now - last < 30 {
+        if deepRunning.contains(dir) || now < deepDue(dir) {
             if deferredDeep[dir] == nil { deferredDeep[dir] = event }
             return
         }
-        deepAt[dir] = now
         startRescan(dir, explicit: false, urgent: urgent)
     }
 
-    /// Deferred deep checks whose 30 s wait is over.
+    /// When `dir` may be checked in depth again: 30 s after its last check
+    /// started, and not until ten times what that check took has passed
+    /// since it ended. Checking a whole disk takes minutes, and FSEvents can
+    /// ask again sooner than that, so without the second limit the scanner
+    /// would never rest.
+    private func deepDue(_ dir: UInt32) -> TimeInterval {
+        guard let start = deepAt[dir] else { return -.infinity }
+        return start + max(30, (deepCost[dir] ?? 0) * 11)
+    }
+
+    /// Deferred deep checks that are due.
     private func releaseDeferredDeep(now: TimeInterval) {
         guard !deferredDeep.isEmpty, rescanBase == nil else { return }
-        for dir in deferredDeep.keys where now - (deepAt[dir] ?? 0) >= 30 - Self.slack {
-            deferredDeep[dir] = nil
-            deepAt[dir] = now
+        for dir in deferredDeep.keys where now >= deepDue(dir) - Self.slack {
             startRescan(dir, explicit: false, urgent: false)
         }
+    }
+
+    /// Deep checks waiting until they're due, for tests.
+    var deferredDeepChecks: Int { deferredDeep.count }
+
+    /// Moves every deep check's start `seconds` earlier, as if each had
+    /// started (and taken) that much longer ago. For tests.
+    func backdateDeepChecks(by seconds: TimeInterval) {
+        for (dir, at) in deepAt { deepAt[dir] = at - seconds }
+        rearm()
     }
 
     /// Lock held.
@@ -1051,11 +1075,17 @@ final class Session: Identifiable {
     /// work, like any other FSEvents refresh.
     private func startRescan(_ dir: UInt32, explicit: Bool, urgent: Bool) {
         let p = tree.progress
-        let total = tree.withLock { Int(tree.dir(dir).items) }
+        let total = max(tree.withLock { Int(tree.dir(dir).items) }, 1)
         if rescanBase == nil || explicit || (urgent && rescanBase?.urgent == false) {
-            rescanBase = RescanBase(listed: p.listed, total: max(total, 1), urgent: urgent)
+            rescanBase = RescanBase(listed: p.listed, total: total, urgent: urgent)
             rescanState = RescanState(fraction: 0, explicit: explicit || (rescanState?.explicit ?? false))
+        } else {
+            rescanBase?.total += total // joins the one under way: more for it to get through
         }
+        // It covers whatever a deferred request for the folder was waiting on.
+        deferredDeep[dir] = nil
+        deepAt[dir] = ProcessInfo.processInfo.systemUptime
+        deepRunning.insert(dir)
         tree.refresh(dir: dir, deep: true, urgent: urgent)
         if urgent { holdBusyActivity(true) }
         rearm()
@@ -1068,6 +1098,8 @@ final class Session: Identifiable {
             // refreshes carry on.
             let done = base.urgent ? p.urgent_queued == 0 : p.idle
             if done {
+                for dir in deepRunning { deepCost[dir] = now - (deepAt[dir] ?? now) }
+                deepRunning = []
                 let wasExplicit = rescanState?.explicit ?? false
                 rescanBase = nil
                 rescanState = nil

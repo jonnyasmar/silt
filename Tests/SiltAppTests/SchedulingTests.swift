@@ -104,6 +104,49 @@ private func finish(_ s: Session) async {
     await finish(s)
 }
 
+/// After a burst it couldn't keep up with, FSEvents asks for the whole
+/// volume to be checked again, and on a busy disk it asks again before a
+/// check of a whole disk is through. A request for a folder whose check is
+/// under way waits for it to end, then for ten times what it took, instead
+/// of starting a second walk over it.
+@Test func droppedEventsDontStackWholeLocationChecks() async throws {
+    let root = try await scratch("silt-dropped", files: 400, in: 8)
+    defer { cleanUp(root) }
+    let walk = UInt64(400 + 8) // what one check of it lists
+    let s = await MainActor.run { Session(url: root, guardPrivateFolders: true, fresh: true) }
+    #expect(await wait { s.phase == .live && s.canPark })
+    await settle(1.5)
+
+    let dropped = FSWatcher.Event(
+        path: root.path + "/",
+        flags: UInt32(kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped),
+        id: FSEventsGetCurrentEventId())
+    let (listed, held): (UInt64, Int) = await MainActor.run {
+        let listed = s.tree.progress.listed
+        s.handle([dropped]) // starts a check of everything
+        // Past the old 30 s limit, and the check (as far as the session
+        // knows) still going: it's been running a minute.
+        s.backdateDeepChecks(by: 60)
+        s.handle([dropped])
+        return (listed, s.deferredDeepChecks)
+    }
+    #expect(held == 1)
+    #expect(await wait { s.rescanState == nil }) // the first check ends
+    #expect(await MainActor.run { s.tree.progress.listed } - listed >= walk)
+
+    // It took a minute, so the next one waits ten more.
+    await settle(2)
+    #expect(await MainActor.run { s.deferredDeepChecks } == 1)
+    let afterOne = await MainActor.run { s.tree.progress.listed }
+    #expect(afterOne - listed < 2 * walk)
+
+    // Once that has passed, the deferred check runs.
+    await MainActor.run { s.backdateDeepChecks(by: 11 * 60) }
+    #expect(await wait { s.deferredDeepChecks == 0 })
+    #expect(await wait { s.rescanState == nil && s.tree.progress.listed >= afterOne + walk })
+    await finish(s)
+}
+
 /// A scan that settles is saved soon after, on screen or not, without
 /// anything else happening to prompt it.
 @Test(arguments: [true, false])
