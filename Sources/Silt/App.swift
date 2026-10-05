@@ -672,8 +672,9 @@ struct SiltCommands: Commands {
             Button("Rescan from Scratch") { model?.rescanFromScratch() }
                 .keyboardShortcut("r", modifiers: [.command, .shift, .option])
                 .disabled(model?.current == nil)
-            Picker("Scan Speed", selection: Binding(get: { SpeedController.shared.mode },
-                                                    set: { SpeedController.shared.mode = $0 })) {
+            // Read here, so the checkmark follows changes made elsewhere.
+            let speed = SpeedController.shared.mode
+            Picker("Scan Speed", selection: Binding(get: { speed }, set: { SpeedController.shared.mode = $0 })) {
                 ForEach(ScanSpeed.allCases) { Text($0.title).tag($0) }
             }
         }

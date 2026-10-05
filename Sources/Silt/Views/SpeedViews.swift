@@ -53,6 +53,8 @@ private func everyText(_ seconds: TimeInterval) -> String {
 /// The folders Silt is updating less often, with a way to change that.
 struct BusyFoldersPopover: View {
     let folders: [Session.BusyFolder]
+    /// After a choice: the folder leaves the list, so the popover closes.
+    var done: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -82,11 +84,11 @@ struct BusyFoldersPopover: View {
                         .font(.system(size: 11).monospacedDigit())
                         .foregroundStyle(.secondary)
                     Menu {
-                        Button("Keep It Live") { FolderRules.shared.set(.live, for: f.path) }
-                        Button("Update Slowly") { FolderRules.shared.set(.slow, for: f.path) }
-                        Button("Pause Updates") { FolderRules.shared.set(.paused, for: f.path) }
+                        Button("Keep It Live") { choose(.live, f.path) }
+                        Button("Update Slowly") { choose(.slow, f.path) }
+                        Button("Pause Updates") { choose(.paused, f.path) }
                         Divider()
-                        Button("Don’t Scan It") { FolderRules.shared.set(.excluded, for: f.path) }
+                        Button("Don’t Scan It") { choose(.excluded, f.path) }
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
@@ -99,6 +101,11 @@ struct BusyFoldersPopover: View {
         }
         .padding(14)
         .frame(width: 380)
+    }
+
+    private func choose(_ rule: FolderRule, _ path: String) {
+        done()
+        FolderRules.shared.set(rule, for: path)
     }
 }
 

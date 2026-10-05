@@ -34,11 +34,20 @@ private struct ItemInspector: View {
     let ref: ItemRef
     let isFocus: Bool
     @State private var cache = InspectorCache()
+    /// Bumped when the session's held changes move, so the updates note
+    /// follows them.
+    @State private var pausedTick = 0
 
     var body: some View {
         let _ = session.version
-        if let item = cache.load(ref, in: session) {
-            single(item.header, item.live)
+        let _ = pausedTick
+        Group {
+            if let item = cache.load(ref, in: session) {
+                single(item.header, item.live)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .siltPausedChanged, object: session)) { _ in
+            pausedTick += 1
         }
     }
 

@@ -46,8 +46,21 @@ private func dirID(_ s: Session, _ path: String) -> UInt32? {
     }
 }
 
+/// A change inside folder `path`, as FSEvents reports it: the folder's
+/// path with a trailing slash.
 private func event(_ path: String) -> FSWatcher.Event {
-    FSWatcher.Event(path: path, flags: 0, id: FSEventsGetCurrentEventId())
+    FSWatcher.Event(path: path.hasSuffix("/") ? path : path + "/", flags: 0, id: FSEventsGetCurrentEventId())
+}
+
+@MainActor private func total(_ s: Session) -> Int64 { s.tree.withLock { s.tree.entry(0).size } }
+
+@MainActor private func entry(_ s: Session, _ path: String) -> (size: Int64, excluded: Bool)? {
+    s.tree.withLock {
+        let i = s.tree.lookup(path)
+        guard i != NONE else { return nil }
+        let e = s.tree.entry(i)
+        return (e.size, e.flags & UInt8(SILT_FLAG_EXCLUDED) != 0)
+    }
 }
 
 // MARK: Policy
@@ -69,8 +82,9 @@ private func event(_ path: String) -> FSWatcher.Event {
 
     // Paused holds Silt's own work back, not what the user starts.
     let paused = SpeedPolicy.pace(.paused, plugged, cores: cores)
-    #expect(paused.upkeepPaused && !paused.paused)
+    #expect(paused.upkeepPaused && paused.holdUpkeep && !paused.paused)
     #expect(paused.urgentQoS == auto.urgentQoS && paused.urgentMax == auto.urgentMax)
+    #expect(paused.backgroundMax == auto.backgroundMax) // the scanner stays free
 
     // Automatic eases off with the Mac.
     let battery = SpeedPolicy.pace(.automatic, PowerConditions(onBattery: true), cores: cores)
@@ -164,7 +178,7 @@ private func event(_ path: String) -> FSWatcher.Event {
     await MainActor.run { FolderRules.shared.set(.paused, for: quietPath) }
     #expect(await wait { s.tree.progress.idle }) // the Live folder's listings are done
     let listed = await MainActor.run { s.tree.progress.listed }
-    await MainActor.run { s.handle([event(quietPath + "/f0.bin")]) }
+    await MainActor.run { s.handle([event(quietPath)]) }
     await settle(0.5)
     let quiet = try #require(await MainActor.run { dirID(s, quietPath) })
     #expect(await MainActor.run { s.tree.progress.listed } == listed)
@@ -193,24 +207,17 @@ private func event(_ path: String) -> FSWatcher.Event {
     let vm = root.appendingPathComponent("vm").path
     defer { cleanUp(root) }
     let s = await live(root)
-    let whole = await MainActor.run { s.tree.withLock { s.tree.entry(0).size } }
-    @MainActor @Sendable func total(_ s: Session) -> Int64 { s.tree.withLock { s.tree.entry(0).size } }
-    @MainActor @Sendable func vmEntry(_ s: Session) -> (size: Int64, excluded: Bool)? {
-        s.tree.withLock {
-            let i = s.tree.lookup(vm)
-            guard i != NONE else { return nil }
-            let e = s.tree.entry(i)
-            return (e.size, e.flags & UInt8(SILT_FLAG_EXCLUDED) != 0)
-        }
-    }
+    let whole = await MainActor.run { total(s) }
 
     await MainActor.run { FolderRules.shared.set(.excluded, for: vm) }
-    #expect(await wait { vmEntry(s)?.excluded == true })
-    #expect(await MainActor.run { vmEntry(s)?.size } == 0)
+    #expect(await wait { entry(s, vm)?.excluded == true })
+    #expect(await MainActor.run { entry(s, vm)?.size } == 0)
     #expect(await MainActor.run { total(s) } < whole)
+    // A scan of the excluded folder itself isn't served from this one.
+    #expect(await MainActor.run { !s.covers(vm) && s.covers(root.appendingPathComponent("keep").path) })
 
     await MainActor.run { FolderRules.shared.set(nil, for: vm) }
-    #expect(await wait { vmEntry(s)?.excluded == false && total(s) == whole })
+    #expect(await wait { entry(s, vm)?.excluded == false && total(s) == whole })
     await MainActor.run { s.flushMarks() }
     _ = await wait { Snapshots.savedAt(for: root.path) != nil }
     await finish(s)
@@ -218,8 +225,38 @@ private func event(_ path: String) -> FSWatcher.Event {
     // Saved with vm scanned; excluded since: the restored scan drops it.
     await MainActor.run { FolderRules.shared.set(.excluded, for: vm) }
     let restored = await MainActor.run { Session(url: root, guardPrivateFolders: true) }
-    #expect(await wait { restored.phase == .live && vmEntry(restored)?.excluded == true })
-    #expect(await MainActor.run { vmEntry(restored)?.size } == 0)
+    #expect(await wait { restored.phase == .live && entry(restored, vm)?.excluded == true })
+    #expect(await MainActor.run { entry(restored, vm)?.size } == 0)
     await finish(restored)
     await MainActor.run { FolderRules.shared.set(nil, for: vm) }
+}
+
+// MARK: Paused speed
+
+/// Paused, Silt notes what changed instead of keeping up, so the scanner
+/// stays idle (the scan can still be parked and saved); changing the speed
+/// catches up.
+@Test func pausedSpeedHoldsUpkeepAndCatchesUp() async throws {
+    let root = try await scratch("silt-paused", folders: ["work": 3])
+    defer { cleanUp(root) }
+    let work = root.appendingPathComponent("work").path
+    let s = await live(root)
+    await settle(1)
+    #expect(await wait { s.tree.progress.idle })
+    let (listed, dir): (UInt64, UInt32) = await MainActor.run {
+        s.paceOverride = SpeedPolicy.pace(.paused, PowerConditions())
+        return (s.tree.progress.listed, dirID(s, work)!)
+    }
+    try Data(repeating: 5, count: 8192).write(to: root.appendingPathComponent("work/new.bin"))
+    await MainActor.run { s.handle([event(work)]) }
+    await settle(0.5)
+    #expect(await MainActor.run { s.tree.progress.listed } == listed)
+    #expect(await MainActor.run { s.hasPausedChanges(under: dir) })
+    #expect(await MainActor.run { s.canPark }) // nothing queued in the scanner
+    #expect(await wait { UserDefaults.standard.dictionary(forKey: "pausedPending:" + root.path)?[work] != nil })
+
+    await MainActor.run { s.paceOverride = SpeedPolicy.pace(.automatic, PowerConditions()) }
+    #expect(await wait { s.tree.withLock { s.tree.lookup(root.appendingPathComponent("work/new.bin").path) } != NONE })
+    #expect(await MainActor.run { !s.hasPausedChanges(under: dir) })
+    await finish(s)
 }

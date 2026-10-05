@@ -99,6 +99,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     private var cachedRow: (node: Node, values: RowValues)?
     private var focusObserver: NSObjectProtocol?
     private var rulesObserver: NSObjectProtocol?
+    private var pausedObserver: NSObjectProtocol?
     private var quickLookURLs: [URL] = []
     /// Folders that became expandable while being rebuilt; the outline must
     /// be told or it keeps showing them without a disclosure triangle.
@@ -135,6 +136,11 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         // Rule tags change without the tree changing.
         rulesObserver = NotificationCenter.default.addObserver(forName: .siltFolderRulesChanged, object: nil,
                                                                queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateVisibleValues() }
+        }
+        // "Paused · changes waiting" comes and goes without the tree changing.
+        pausedObserver = NotificationCenter.default.addObserver(forName: .siltPausedChanged, object: session,
+                                                                queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.updateVisibleValues() }
         }
         session.addListener(self) { [weak self] in self?.treeChanged() }
@@ -178,6 +184,8 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         focusObserver = nil
         if let rulesObserver { NotificationCenter.default.removeObserver(rulesObserver) }
         rulesObserver = nil
+        if let pausedObserver { NotificationCenter.default.removeObserver(pausedObserver) }
+        pausedObserver = nil
         if QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
             QLPreviewPanel.shared().orderOut(nil)
         }

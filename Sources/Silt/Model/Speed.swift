@@ -87,8 +87,13 @@ struct Pace: Equatable {
     /// Multiplies how long busy folders wait between updates.
     var paceFactor: Double = 1
 
-    /// Silt's own upkeep is held back (Paused).
-    var upkeepPaused: Bool { paused || backgroundMax == 0 }
+    /// Paused: Silt notes what changed instead of keeping up with it, and
+    /// catches up when the speed changes (the scanner itself stays free, so
+    /// scans can still be saved and parked).
+    var holdUpkeep = false
+
+    /// Silt's own upkeep is held back.
+    var upkeepPaused: Bool { paused || holdUpkeep || backgroundMax == 0 }
     /// Why Automatic is easing off, if it is ("Low Power Mode").
     var reason: String?
 
@@ -124,7 +129,7 @@ enum SpeedPolicy {
             // Upkeep waits; what you start still runs (a rescan, a scan of
             // somewhere new, the refresh after you put something back).
             var p = pace(.automatic, c, cores: cores)
-            p.backgroundMax = 0
+            p.holdUpkeep = true
             p.reason = nil
             return p
         case .automatic:

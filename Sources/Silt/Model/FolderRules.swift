@@ -50,6 +50,9 @@ enum FolderRule: String, CaseIterable, Identifiable {
 extension Notification.Name {
     /// Folder rules changed: sessions re-apply them.
     static let siltFolderRulesChanged = Notification.Name("SiltFolderRulesChanged")
+    /// A session's folders with changes held back (Paused) changed; the
+    /// object is the session.
+    static let siltPausedChanged = Notification.Name("SiltPausedChanged")
 }
 
 /// The folder rules, app-wide, by absolute path. A rule covers the folder
@@ -79,6 +82,7 @@ final class FolderRules {
     func rule(for path: String) -> (path: String, rule: FolderRule)? {
         guard !rules.isEmpty else { return nil }
         var p = path
+        while p.count > 1, p.hasSuffix("/") { p.removeLast() } // FSEvents' folder paths end in one
         while true {
             if let r = rules[p] { return (p, r) }
             guard p.count > 1 else { return nil }

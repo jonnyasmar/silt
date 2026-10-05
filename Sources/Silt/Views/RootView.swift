@@ -681,6 +681,8 @@ struct StatusBar: View {
         // and inspector until they're cut off.
         ViewThatFits(in: .horizontal) {
             row(s, chips: true, capacity: true)
+                // The chip it hangs from is gone: don't reopen by itself later.
+                .onChange(of: session.busyFolders.isEmpty) { _, empty in if empty { showingBusy = false } }
             row(s, chips: false, capacity: true)
             row(s, chips: false, capacity: false)
         }
@@ -745,7 +747,9 @@ struct StatusBar: View {
             Chip(symbol: "flame", text: n == 1 ? "1 busy folder" : "\(n) busy folders", tint: .secondary) {
                 showingBusy.toggle()
             }
-            .popover(isPresented: $showingBusy, arrowEdge: .top) { BusyFoldersPopover(folders: session.busyFolders) }
+            .popover(isPresented: $showingBusy, arrowEdge: .top) {
+                BusyFoldersPopover(folders: session.busyFolders) { showingBusy = false }
+            }
             .help("Folders that change constantly, so Silt updates them less often")
         }
         let easy = session.findings.filter { $0.safety == .safe && !$0.isTrash }.reduce(Int64(0)) { $0 + $1.bytes }
