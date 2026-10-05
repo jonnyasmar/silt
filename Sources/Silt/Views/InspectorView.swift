@@ -154,6 +154,7 @@ private struct ItemInspector: View {
             Note(symbol: "externaldrive", color: .secondary,
                  text: "Another volume is mounted here. Scan it from the sidebar.") { EmptyView() }
         }
+        if h.isDir { updates(h, flags: f) }
         if f & UInt8(SILT_FLAG_CLONE) != 0 {
             Note(symbol: "square.on.square.dashed", color: .secondary,
                  text: "An APFS clone: it shares \(Fmt.bytes(h.rawAlloc)) of blocks with other copies, so Silt counts only its share (\(Fmt.bytes(s.size))). Deleting it frees little unless every copy goes.") { EmptyView() }
@@ -165,6 +166,43 @@ private struct ItemInspector: View {
         if f & UInt8(SILT_FLAG_DATALESS) != 0 {
             Note(symbol: "icloud", color: .secondary,
                  text: "Stored in iCloud. It isn’t using space on this Mac.") { EmptyView() }
+        }
+    }
+
+    /// How the folder is kept up to date, when it's anything but the usual.
+    @ViewBuilder
+    private func updates(_ h: InspectorCache.Header, flags f: UInt8) -> some View {
+        let rules = FolderRules.shared
+        let ruled = rules.rule(for: h.path)
+        if f & UInt8(SILT_FLAG_EXCLUDED) != 0 {
+            Note(symbol: "eye.slash", color: .secondary,
+                 text: "You left this folder out of the scan, so its size isn’t counted.") {
+                if ruled?.rule == .excluded, let path = ruled?.path {
+                    Button("Scan It Again") { rules.set(nil, for: path) }
+                        .controlSize(.small)
+                }
+            }
+        } else if let ruled, ruled.rule != .excluded {
+            let from = ruled.path == h.path ? "" : " (set on “\((ruled.path as NSString).lastPathComponent)”)"
+            let waiting = ruled.rule == .paused && session.hasPausedChanges(under: ref.dir)
+            Note(symbol: ruled.rule.symbol, color: waiting ? .orange : .secondary,
+                 text: "Updates: \(ruled.rule.title)\(from). \(ruled.rule.detail)\(waiting ? " Changes are waiting." : "")") {
+                HStack(spacing: 8) {
+                    if waiting {
+                        Button("Update Now") { session.releasePaused(under: ref.dir) }
+                    }
+                    if ruled.path == h.path {
+                        Button("Back to Automatic") { rules.set(nil, for: ruled.path) }
+                    }
+                }
+                .controlSize(.small)
+            }
+        } else if let busy = session.busyFolders.first(where: { $0.dir == ref.dir }) {
+            Note(symbol: "flame", color: .secondary,
+                 text: "This folder changes constantly, so Silt updates it every \(Int(busy.every.rounded())) s instead of on every change.") {
+                Button("Keep It Live") { rules.set(.live, for: h.path) }
+                    .controlSize(.small)
+            }
         }
     }
 

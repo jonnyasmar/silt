@@ -98,6 +98,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
     /// good until the current main-queue turn ends.
     private var cachedRow: (node: Node, values: RowValues)?
     private var focusObserver: NSObjectProtocol?
+    private var rulesObserver: NSObjectProtocol?
     private var quickLookURLs: [URL] = []
     /// Folders that became expandable while being rebuilt; the outline must
     /// be told or it keeps showing them without a disclosure triangle.
@@ -131,6 +132,11 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         root = makeRoot(for: source)
         configureOutline()
         reportShown()
+        // Rule tags change without the tree changing.
+        rulesObserver = NotificationCenter.default.addObserver(forName: .siltFolderRulesChanged, object: nil,
+                                                               queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateVisibleValues() }
+        }
         session.addListener(self) { [weak self] in self?.treeChanged() }
         if !source.isList {
             session.captureTreeState = { [weak self] in
@@ -170,6 +176,8 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         resortTimer = nil
         if let focusObserver { NotificationCenter.default.removeObserver(focusObserver) }
         focusObserver = nil
+        if let rulesObserver { NotificationCenter.default.removeObserver(rulesObserver) }
+        rulesObserver = nil
         if QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
             QLPreviewPanel.shared().orderOut(nil)
         }
@@ -534,6 +542,7 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
 
     /// Lock held.
     private func values(for n: Node) -> RowValues {
+        let rules = FolderRules.shared
         var v = RowValues()
         switch n.kind {
         case .file:
@@ -583,6 +592,10 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
                 n.guidance = .some(Guide.classify(tree: tree, entry: i, name: n.name(in: tree)) { tree.path(of: i) })
             }
             v.guidance = n.guidance ?? nil
+            if n.isDir, !rules.rules.isEmpty {
+                v.rule = rules.rules[tree.path(of: session.entryIndex(n.ref))]
+                if v.rule == .paused { v.pausedChanges = session.hasPausedChangesLocked(under: n.dir) }
+            }
         }
         if source.isList && n.parent === root {
             // Bars compare hits with each other; the percentage says how much
@@ -1257,6 +1270,37 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
 
     // MARK: Context menu
 
+    /// "Updates ▸": how this folder is kept current. The scan's own root
+    /// can't be left out of it.
+    private func updatesItem(for n: Node) -> NSMenuItem {
+        let path = session.path(n.ref)
+        let rules = FolderRules.shared
+        let own = rules.rules[path]
+        let sub = NSMenu()
+        func choice(_ title: String, _ rule: FolderRule?, detail: String) {
+            let i = ClosureMenuItem(title: title) { rules.set(rule, for: path) }
+            i.state = own == rule ? .on : .off
+            i.toolTip = detail
+            sub.addItem(i)
+        }
+        choice("Automatic", nil, detail: "Updated as it changes; slowed down while it changes constantly.")
+        sub.addItem(.separator())
+        for rule in FolderRule.allCases where !(rule == .excluded && n.dir == 0) {
+            choice(rule.title, rule, detail: rule.detail)
+        }
+        if own == nil, let inherited = rules.rule(for: path), inherited.path != path {
+            sub.addItem(.separator())
+            let note = NSMenuItem(title: "\(inherited.rule.title), set on “\((inherited.path as NSString).lastPathComponent)”",
+                                  action: nil, keyEquivalent: "")
+            note.isEnabled = false
+            sub.addItem(note)
+        }
+        let parent = NSMenuItem(title: "Updates", action: nil, keyEquivalent: "")
+        parent.image = NSImage(systemSymbolName: own?.symbol ?? "arrow.triangle.2.circlepath", accessibilityDescription: nil)
+        parent.submenu = sub
+        return parent
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         let nodes = targetNodes().filter(\.isReal)
@@ -1287,6 +1331,10 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
         if let one, one.isDir {
             menu.addItem(.separator())
             item("Rescan Folder", "arrow.clockwise") { [session] in session.rescan(one.ref) }
+            if session.hasPausedChanges(under: one.dir) {
+                item("Update Now", "arrow.triangle.2.circlepath") { [session] in session.releasePaused(under: one.dir) }
+            }
+            menu.addItem(updatesItem(for: one))
         }
         menu.addItem(.separator())
         let allMarked = refs.allSatisfy { session.isMarked($0) }

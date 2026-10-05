@@ -14,6 +14,10 @@ struct RowValues {
     var marked = false
     var covered = false
     var guidance: Guidance?
+    /// A rule set on this folder itself (inherited ones aren't tagged).
+    var rule: FolderRule?
+    /// A Paused folder with changes waiting.
+    var pausedChanges = false
     /// Change since the last scan, when it's worth pointing out.
     var growth: Int64?
     var items: Int = 0
@@ -159,6 +163,8 @@ final class NameCell: NSTableCellView, ValueCell {
             badgeColor = .systemOrange
         } else if f & UInt8(SILT_FLAG_MOUNT) != 0 {
             text = "Other volume"
+        } else if f & UInt8(SILT_FLAG_EXCLUDED) != 0 {
+            text = FolderRule.excluded.tag
         } else if f & UInt8(SILT_FLAG_DATALESS) != 0 {
             text = "In iCloud"
         } else if values.marked {
@@ -169,6 +175,9 @@ final class NameCell: NSTableCellView, ValueCell {
         } else if let g = values.growth {
             text = (g > 0 ? "+" : "−") + Fmt.bytesShort(abs(g))
             badgeColor = g > 0 ? .systemOrange : .systemGreen
+        } else if let r = values.rule, r != .excluded {
+            text = values.pausedChanges ? "Paused · changes waiting" : r.tag
+            if values.pausedChanges { badgeColor = .systemOrange }
         } else if values.copies > 1 {
             text = "\(values.copies) copies"
         } else if f & UInt8(SILT_FLAG_CLONE) != 0 {

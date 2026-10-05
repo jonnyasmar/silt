@@ -1248,16 +1248,19 @@ final class Session: Identifiable {
     /// Whether a Paused folder at or inside `dir` has changes waiting.
     func hasPausedChanges(under dir: UInt32) -> Bool {
         guard !pausedPending.isEmpty else { return false }
-        return tree.withLock {
-            pausedPending.keys.contains { d in
-                var p = d
-                while true {
-                    if p == dir { return true }
-                    guard p < tree.raw.pointee.dir_count, tree.isLive(tree.dirEntry(p)) else { return false }
-                    let parent = tree.entry(tree.dirEntry(p)).parent
-                    if parent == NONE { return false }
-                    p = parent
-                }
+        return tree.withLock { hasPausedChangesLocked(under: dir) }
+    }
+
+    /// Lock held.
+    func hasPausedChangesLocked(under dir: UInt32) -> Bool {
+        pausedPending.keys.contains { d in
+            var p = d
+            while true {
+                if p == dir { return true }
+                guard p < tree.raw.pointee.dir_count, tree.isLive(tree.dirEntry(p)) else { return false }
+                let parent = tree.entry(tree.dirEntry(p)).parent
+                if parent == NONE { return false }
+                p = parent
             }
         }
     }

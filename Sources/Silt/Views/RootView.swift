@@ -671,6 +671,7 @@ struct StatusBar: View {
     let session: Session
     let model: WindowModel
     @State private var showingChanges = false
+    @State private var showingBusy = false
 
     var body: some View {
         let s = session.stats
@@ -697,6 +698,7 @@ struct StatusBar: View {
             leading(s)
             Spacer(minLength: 8)
             if showChips { chips(s) }
+            SpeedMenu(compact: !showChips)
             if showCapacity, let cap = session.capacity {
                 HStack(spacing: 6) {
                     CapacityBar(fraction: Double(cap.total - cap.available) / Double(max(cap.total, 1)),
@@ -738,6 +740,14 @@ struct StatusBar: View {
                 ChangesPopover(session: session, title: sinceText.capitalizedFirstLetter) { showingChanges = false }
             }
         }
+        if !session.busyFolders.isEmpty {
+            let n = session.busyFolders.count
+            Chip(symbol: "flame", text: n == 1 ? "1 busy folder" : "\(n) busy folders", tint: .secondary) {
+                showingBusy.toggle()
+            }
+            .popover(isPresented: $showingBusy, arrowEdge: .top) { BusyFoldersPopover(folders: session.busyFolders) }
+            .help("Folders that change constantly, so Silt updates them less often")
+        }
         let easy = session.findings.filter { $0.safety == .safe && !$0.isTrash }.reduce(Int64(0)) { $0 + $1.bytes }
         if easy > 500_000_000, session.markedCount == 0, model.pane != .reclaim {
             Chip(symbol: "sparkles", text: "\(Fmt.bytesShort(easy)) easy to reclaim", tint: Brand.color) {
@@ -773,6 +783,9 @@ struct StatusBar: View {
     }
 
     private func liveHelp(_ s: ScanStats) -> String {
+        if SpeedController.shared.pace.upkeepPaused {
+            return "Scan speed is Paused: Silt isn’t following changes on its own. Scans and rescans you start still run. Choose another speed to catch up."
+        }
         if session.catchingUp {
             return "These sizes are from the scan saved \(restoredAge). Silt is replaying what changed since; hatched rows may be out of date until it’s done."
         }
@@ -821,9 +834,16 @@ struct StatusBar: View {
                          : session.recheckingSince != nil ? "\(showingSaved) · rechecking · \(Int(r.fraction * 100))%"
                          : "Checking for changes · \(Int(r.fraction * 100))%")
                         .monospacedDigit()
+                } else if session.catchingUp, SpeedController.shared.pace.upkeepPaused {
+                    Image(systemName: "pause.circle").foregroundStyle(.secondary)
+                    Text("\(showingSaved) · paused")
                 } else if session.catchingUp {
                     ProgressView().controlSize(.mini)
                     Text("\(showingSaved) · catching up")
+                } else if SpeedController.shared.pace.upkeepPaused {
+                    Image(systemName: "pause.circle").foregroundStyle(.secondary)
+                    Text("Paused · \(Fmt.compactCount(s.items)) items")
+                        .monospacedDigit()
                 } else {
                     Circle().fill(.green).frame(width: 6, height: 6)
                     Text("Live · \(Fmt.compactCount(s.items)) items")

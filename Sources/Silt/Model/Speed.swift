@@ -131,7 +131,7 @@ enum SpeedPolicy {
             if c.lowPower || c.hot {
                 return Pace(urgentQoS: .utility, urgentMax: UInt32(max(2, cores.performance / 2)),
                             backgroundQoS: .background, backgroundMax: 1, paceFactor: 4,
-                            reason: c.lowPower ? "Low Power Mode" : "the Mac is running hot")
+                            reason: c.lowPower ? "Low Power Mode" : "running hot")
             }
             if c.onBattery {
                 return Pace(urgentQoS: .userInitiated, urgentMax: 0, backgroundQoS: .background, backgroundMax: 2,

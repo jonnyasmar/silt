@@ -79,7 +79,7 @@ private func event(_ path: String) -> FSWatcher.Event {
     let low = SpeedPolicy.pace(.automatic, PowerConditions(lowPower: true, onBattery: true), cores: cores)
     #expect(low.urgentQoS == .utility && low.urgentMax == 5 && low.paceFactor == 4 && low.reason == "Low Power Mode")
     let hot = SpeedPolicy.pace(.automatic, PowerConditions(thermal: .serious), cores: cores)
-    #expect(hot.urgentQoS == .utility && hot.reason == "the Mac is running hot")
+    #expect(hot.urgentQoS == .utility && hot.reason == "running hot")
     // Fast and Gentle are what they say, whatever the conditions.
     #expect(SpeedPolicy.pace(.fast, PowerConditions(lowPower: true), cores: cores) == fast)
     // No efficiency cores (Intel): Gentle still runs two at a time.
@@ -147,13 +147,7 @@ private func event(_ path: String) -> FSWatcher.Event {
 /// until the folder is opened.
 @Test func liveAndPausedRules() async throws {
     let root = try await scratch("silt-rules", folders: ["live": 2, "quiet": 2])
-    defer {
-        cleanUp(root)
-        Task { @MainActor in
-            FolderRules.shared.set(nil, for: root.appendingPathComponent("live").path)
-            FolderRules.shared.set(nil, for: root.appendingPathComponent("quiet").path)
-        }
-    }
+    defer { cleanUp(root) }
     let livePath = root.appendingPathComponent("live").path
     let quietPath = root.appendingPathComponent("quiet").path
     let s = await live(root)
@@ -183,6 +177,10 @@ private func event(_ path: String) -> FSWatcher.Event {
     #expect(await MainActor.run { !s.hasPausedChanges(under: quiet) })
     #expect(UserDefaults.standard.dictionary(forKey: "pausedPending:" + root.path) == nil)
     await finish(s)
+    await MainActor.run {
+        FolderRules.shared.set(nil, for: livePath)
+        FolderRules.shared.set(nil, for: quietPath)
+    }
 }
 
 /// Don't Scan: the folder's contents leave the scan (and its size), and come
@@ -190,14 +188,11 @@ private func event(_ path: String) -> FSWatcher.Event {
 @Test func excludeRuleDropsAndRestoresAFolder() async throws {
     let root = try await scratch("silt-exclude", folders: ["keep": 2, "vm": 20])
     let vm = root.appendingPathComponent("vm").path
-    defer {
-        cleanUp(root)
-        Task { @MainActor in FolderRules.shared.set(nil, for: vm) }
-    }
+    defer { cleanUp(root) }
     let s = await live(root)
     let whole = await MainActor.run { s.tree.withLock { s.tree.entry(0).size } }
-    @MainActor func total(_ s: Session) -> Int64 { s.tree.withLock { s.tree.entry(0).size } }
-    @MainActor func vmEntry(_ s: Session) -> (size: Int64, excluded: Bool)? {
+    @MainActor @Sendable func total(_ s: Session) -> Int64 { s.tree.withLock { s.tree.entry(0).size } }
+    @MainActor @Sendable func vmEntry(_ s: Session) -> (size: Int64, excluded: Bool)? {
         s.tree.withLock {
             let i = s.tree.lookup(vm)
             guard i != NONE else { return nil }
@@ -223,4 +218,5 @@ private func event(_ path: String) -> FSWatcher.Event {
     #expect(await wait { restored.phase == .live && vmEntry(restored)?.excluded == true })
     #expect(await MainActor.run { vmEntry(restored)?.size } == 0)
     await finish(restored)
+    await MainActor.run { FolderRules.shared.set(nil, for: vm) }
 }

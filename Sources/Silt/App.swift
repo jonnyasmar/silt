@@ -14,6 +14,8 @@ struct SiltApp: App {
         .defaultSize(width: 1280, height: 800)
         .windowToolbarStyle(.unified)
         .commands { SiltCommands() }
+
+        Settings { SettingsView() }
     }
 }
 
@@ -670,6 +672,10 @@ struct SiltCommands: Commands {
             Button("Rescan from Scratch") { model?.rescanFromScratch() }
                 .keyboardShortcut("r", modifiers: [.command, .shift, .option])
                 .disabled(model?.current == nil)
+            Picker("Scan Speed", selection: Binding(get: { SpeedController.shared.mode },
+                                                    set: { SpeedController.shared.mode = $0 })) {
+                ForEach(ScanSpeed.allCases) { Text($0.title).tag($0) }
+            }
         }
         CommandMenu("Item") {
             let none = model?.current?.selection.isEmpty ?? true
