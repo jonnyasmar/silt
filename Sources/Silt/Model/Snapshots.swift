@@ -111,6 +111,8 @@ enum Snapshots {
     @discardableResult
     static func save(_ tree: Tree, url: URL, eventId: FSEventStreamEventId, fullDiskAccess: Bool) -> Bool {
         guard eligible(url) else { return false }
+        let start = ProcessInfo.processInfo.systemUptime
+        defer { Perf.note("save", seconds: ProcessInfo.processInfo.systemUptime - start) }
         guard let uuid = FSWatcher.databaseUUID(for: url.path) else {
             log.error("No file-system history for \(url.path, privacy: .public); can't save its scan")
             return false

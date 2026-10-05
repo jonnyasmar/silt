@@ -36,6 +36,7 @@ struct SubtreeResult: Equatable {
         return (result, ProcessInfo.processInfo.systemUptime - start)
     }.value
     session.noteQueryCost(cost)
+    Perf.note("query", seconds: cost)
     return result
 }
 

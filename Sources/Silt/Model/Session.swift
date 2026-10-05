@@ -180,6 +180,10 @@ final class Session: Identifiable {
     /// The replay of what changed while Silt wasn't watching has all been
     /// delivered; catching up ends once what it asked for is listed.
     @ObservationIgnored private var historyDelivered = false
+    /// When catching up (or the running rescan) began, the entries listed
+    /// and the CPU used by then, for the performance log.
+    @ObservationIgnored private var catchUpStart: (at: TimeInterval, listed: UInt64, cpu: Double)?
+    @ObservationIgnored private var rescanStart: (at: TimeInterval, listed: UInt64, cpu: Double)?
     /// The pace factor `dueAt` deadlines were set under.
     @ObservationIgnored private var dueFactor: Double = 1
     /// Folders open on screen, per tree view (see `setShown`).
@@ -412,7 +416,13 @@ final class Session: Identifiable {
         isVolume = values?.isVolume == true || resolved.path == "/"
         fullDiskAccess = !guardPrivateFolders
         keepsHistory = Snapshots.eligible(resolved)
+        let loadStart = ProcessInfo.processInfo.systemUptime
         let restored = fresh ? nil : Snapshots.load(for: resolved, fullDiskAccess: fullDiskAccess)
+        if let restored {
+            let seconds = ProcessInfo.processInfo.systemUptime - loadStart
+            let age = Int(Date().timeIntervalSince(restored.savedAt))
+            Perf.log.notice("restored \(resolved.path, privacy: .public) in \(String(format: "%.2f", seconds), privacy: .public)s, saved \(age, privacy: .public)s ago, replayable \(restored.replayable, privacy: .public)")
+        }
         tree = restored.map { Tree(restored: $0.tree, path: resolved.path) } ?? Tree(path: resolved.path)
         // A restored tree is what's saved, until something changes it. A new
         // scan isn't saved at all: taken after it starts, the generation
@@ -449,6 +459,7 @@ final class Session: Identifiable {
             if restored.replayable, watcher?.running == true {
                 catchingUp = true
                 historyDelivered = false
+                catchUpStart = (ProcessInfo.processInfo.systemUptime, tree.progress.listed, Perf.processCPU())
                 // A listing that stopped early may have missed changes no
                 // replay will bring back.
                 let incomplete = tree.withLock {
@@ -522,6 +533,19 @@ final class Session: Identifiable {
         dirs.insert(focus)
         if let open = treeStates[focus]?.expanded { dirs.formUnion(open) }
         for d in dirs { lookedAt(dir: d) }
+    }
+
+    /// One line of state for the performance log.
+    var perfState: String {
+        var parts = ["\(residency)", "\(phase)"]
+        if catchingUp { parts.append(historyDelivered ? "catching up (history in)" : "catching up") }
+        if recheckingSince != nil { parts.append("rechecking") }
+        if let r = rescanState { parts.append("rescan \(Int(r.fraction * 100))%\(r.explicit ? " explicit" : "")") }
+        if !busyEvery.isEmpty { parts.append("busy \(busyEvery.count)") }
+        if !pausedPending.isEmpty { parts.append("held \(pausedPending.count)") }
+        if analyzing { parts.append("analyzing") }
+        parts.append(isOnScreen ? "on screen" : "hidden")
+        return parts.joined(separator: ", ")
     }
 
     /// Whether catching up counts as work someone waits on (the speed
@@ -675,7 +699,11 @@ final class Session: Identifiable {
         guard residency == .awake, !closed else { return }
         ticks += 1
         inTick = true
-        defer { inTick = false }
+        let tickStart = ProcessInfo.processInfo.systemUptime
+        defer {
+            inTick = false
+            Perf.note("tick", seconds: ProcessInfo.processInfo.systemUptime - tickStart)
+        }
         let now = ProcessInfo.processInfo.systemUptime
         lastTick = now
         let p = tree.progress
@@ -1607,6 +1635,8 @@ final class Session: Identifiable {
         if explicit { dropPaused(under: dir) }
         let p = tree.progress
         let total = max(tree.withLock { Int(tree.dir(dir).items) }, 1)
+        Perf.log.notice("rescan \(self.title, privacy: .public) dir \(dir, privacy: .public) (\(total, privacy: .public) items) explicit \(explicit, privacy: .public) urgent \(urgent, privacy: .public)")
+        if rescanStart == nil { rescanStart = (ProcessInfo.processInfo.systemUptime, p.listed, Perf.processCPU()) }
         if rescanBase == nil || explicit || (urgent && rescanBase?.urgent == false) {
             rescanBase = RescanBase(listed: p.listed, total: total, urgent: urgent)
             rescanState = RescanState(fraction: 0, explicit: explicit || (rescanState?.explicit ?? false))
@@ -1632,6 +1662,12 @@ final class Session: Identifiable {
         let settled = p.idle || tree.withLock { tree.dir(0).pending == 0 }
         guard settled else { return }
         if catchingUp, historyDelivered {
+            if let start = catchUpStart {
+                let took = Int(ProcessInfo.processInfo.systemUptime - start.at)
+                let cpu = String(format: "%.1f", Perf.processCPU() - start.cpu)
+                Perf.log.notice("caught up \(self.title, privacy: .public) in \(took, privacy: .public)s: listed \(p.listed &- start.listed, privacy: .public) entries, process CPU \(cpu, privacy: .public)s")
+                catchUpStart = nil
+            }
             catchingUp = false
             lastGeneration = .max // rows drawn as out of date should look again
             reportLive()
@@ -1656,6 +1692,11 @@ final class Session: Identifiable {
             if done {
                 for dir in deepRunning { deepCost[dir] = now - (deepAt[dir] ?? now) }
                 deepRunning = []
+                if let start = rescanStart {
+                    let cpu = String(format: "%.1f", Perf.processCPU() - start.cpu)
+                    Perf.log.notice("rescan done \(self.title, privacy: .public) in \(Int(now - start.at), privacy: .public)s: listed \(p.listed &- start.listed, privacy: .public) entries, process CPU \(cpu, privacy: .public)s")
+                    rescanStart = nil
+                }
                 let wasExplicit = rescanState?.explicit ?? false
                 rescanBase = nil
                 rescanState = nil
@@ -2808,6 +2849,7 @@ extension Session {
             }.value
             guard let self else { return }
             self.analysisCost = ProcessInfo.processInfo.systemUptime - start
+            Perf.note("reclaim", seconds: self.analysisCost)
             if result != self.findings { self.findings = result }
             self.analyzedVersion = v
             self.analyzing = false
@@ -2862,6 +2904,8 @@ extension Session {
     }
 
     fileprivate func computeChanges() {
+        let changesStart = ProcessInfo.processInfo.systemUptime
+        defer { Perf.note("changes", seconds: ProcessInfo.processInfo.systemUptime - changesStart) }
         let base = baseline
         let expanded = baselineExpanded
         let found: [Change] = tree.withLock {
@@ -3079,6 +3123,7 @@ extension Session {
             if watcher?.running == true {
                 catchingUp = true
                 historyDelivered = false
+                catchUpStart = (ProcessInfo.processInfo.systemUptime, tree.progress.listed, Perf.processCPU())
                 holdBusyActivity(true)
                 return
             }

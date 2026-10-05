@@ -35,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = false
+        MainActor.assumeIsolated { PerfReporter.start() }
         // Launched with a folder argument (`Silt ~/dev`), SwiftUI makes no
         // first window, though the launch still counts as a default one.
         DispatchQueue.main.async { Self.ensureWindow() }
@@ -169,6 +170,12 @@ final class WindowModel {
 
     private static var active: [WeakModel] = []
     private static var pendingOpen: [URL] = []
+
+    /// Every open location, once each (for the performance log).
+    static var allSessions: [Session] {
+        var seen = Set<ObjectIdentifier>()
+        return active.compactMap(\.model).flatMap(\.sessions).filter { seen.insert(ObjectIdentifier($0)).inserted }
+    }
 
     init() {
         Self.active.append(WeakModel(model: self))
