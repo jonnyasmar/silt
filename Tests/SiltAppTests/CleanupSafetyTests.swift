@@ -1,4 +1,5 @@
 import Foundation
+import SiltCore
 import Testing
 @testable import Silt
 
@@ -250,3 +251,40 @@ private func surviving(_ names: [String], in root: URL) -> [String] {
     }
     await finish(s)
 }
+
+// MARK: What's called safe
+
+/// Only a DerivedData folder Xcode made counts as build output: one beside a
+/// project, or with Xcode's layout inside. The name alone isn't enough.
+@Test func derivedDataNeedsXcodeEvidence() async throws {
+    let root = try scratchRoot("silt-deriveddata")
+    defer { cleanUp(root) }
+    let fm = FileManager.default
+    for dir in ["research/DerivedData", "app/Foo.xcodeproj", "app/DerivedData/Build",
+                "loose/DerivedData/Build", "loose/DerivedData/Logs",
+                "workspace/DerivedData/Foo-abcdef/ModuleCache.noindex"] {
+        try fm.createDirectory(at: root.appendingPathComponent(dir), withIntermediateDirectories: true)
+    }
+    try Data("subject,score\n".utf8).write(to: root.appendingPathComponent("research/DerivedData/results.csv"))
+
+    let tree = Tree(path: root.path)
+    tree.startScan()
+    defer { tree.stop() }
+    #expect(await wait { tree.progress.idle && tree.progress.finished > 0 })
+    func xcode(_ folder: String) -> Bool {
+        tree.withLock {
+            let i = tree.lookup(root.appendingPathComponent(folder + "/DerivedData").path)
+            return i != NONE && Guide.isXcodeDerivedData(tree, tree.entry(i))
+        }
+    }
+    #expect(!xcode("research"))
+    #expect(xcode("app"))
+    #expect(xcode("loose"))
+    #expect(xcode("workspace"))
+    let research = root.appendingPathComponent("research/DerivedData").path
+    let guidance = tree.withLock {
+        Guide.classify(tree: tree, entry: tree.lookup(research), name: "DerivedData", path: { research })
+    }
+    #expect(guidance == nil)
+}
+

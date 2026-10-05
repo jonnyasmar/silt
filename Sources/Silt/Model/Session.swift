@@ -1218,8 +1218,8 @@ final class Session: Identifiable {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         var s = ["/", "/System", "/Library", "/Applications", "/Users", "/private", "/usr", "/bin", "/sbin",
                  "/etc", "/var", "/opt", "/cores", "/Volumes", "/tmp", "/System/Volumes/Data", home]
-        for sub in ["Library", "Desktop", "Documents", "Downloads", "Applications", "Movies", "Music", "Pictures",
-                    "Public", ".Trash"] {
+        for sub in ["Library", "Library/Caches", "Desktop", "Documents", "Downloads", "Applications", "Movies", "Music",
+                    "Pictures", "Public", ".Trash"] {
             s.append(home + "/" + sub)
         }
         return s

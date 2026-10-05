@@ -40,6 +40,35 @@ enum Guide {
         return false
     }
 
+    /// Lock held. A DerivedData folder Xcode made: a project beside it, or
+    /// Xcode's own layout inside (in the folder, or one level down where a
+    /// workspace keeps a folder per project). The name alone proves nothing:
+    /// processed research data is often called that too.
+    static func isXcodeDerivedData(_ tree: Tree, _ e: silt_entry) -> Bool {
+        guard e.isDir else { return false }
+        let projectFiles: Set<String> = ["Package.swift", "project.yml", "Project.swift"]
+        if e.parent != NONE {
+            let p = tree.dir(e.parent)
+            for k in p.first..<(p.first + p.count) {
+                let c = tree.entry(k)
+                if c.isRemoved { continue }
+                let n = tree.name(of: c)
+                if projectFiles.contains(n) || n.hasSuffix(".xcodeproj") || n.hasSuffix(".xcworkspace") { return true }
+            }
+        }
+        func xcodeLayout(_ dir: UInt32) -> Bool {
+            has(tree, dir: dir, child: "ModuleCache.noindex") || has(tree, dir: dir, child: "Index.noindex")
+                || (has(tree, dir: dir, child: "Build") && has(tree, dir: dir, child: "Logs"))
+        }
+        if xcodeLayout(e.aux) { return true }
+        let d = tree.dir(e.aux)
+        for k in d.first..<(d.first + d.count) {
+            let c = tree.entry(k)
+            if !c.isRemoved, c.isDir, xcodeLayout(c.aux) { return true }
+        }
+        return false
+    }
+
     /// The install command the project's lockfile implies.
     private static func installCommand(_ tree: Tree, _ e: silt_entry) -> String {
         if sibling(tree, of: e, "pnpm-lock.yaml") { return "pnpm install" }
@@ -105,7 +134,9 @@ enum Guide {
             let p = path()
             let g = Guidance(tag: "Build output", title: "Xcode build output",
                              detail: "Intermediate build products. Xcode recreates them on the next build.", safety: .safe)
-            return p.hasSuffix("/Library/Developer/Xcode/DerivedData") ? g : inProject(g, Place.of(p), what: "this folder")
+            if p.hasSuffix("/Library/Developer/Xcode/DerivedData") { return g }
+            guard isXcodeDerivedData(tree, e) else { return nil }
+            return inProject(g, Place.of(p), what: "this folder")
         case ".build":
             if sibling(tree, of: e, "Package.swift") {
                 return inProject(Guidance(tag: "Build output", title: "SwiftPM build output",
@@ -141,7 +172,8 @@ enum Guide {
             let p = path()
             if p == home + "/Library/Caches" || (p.hasPrefix(home + "/Library/Containers/") && p.hasSuffix("/Data/Library/Caches")) {
                 return Guidance(tag: "Cache", title: "App caches",
-                                detail: "Apps rebuild these as needed. Quit large apps before clearing them.", safety: .safe)
+                                detail: "Apps rebuild what’s in here as needed. Clear the folders inside (macOS won’t let this one move), after quitting large apps.",
+                                safety: .safe)
             }
             if p == "/Library/Caches" {
                 return Guidance(tag: "Cache", title: "Shared caches",

@@ -24,11 +24,15 @@ enum Reclaim {
         let detail: String
         let symbol: String
         let safety: Finding.Safety
+        /// List what's inside rather than the folder: one macOS won't let
+        /// move (Caches) or that Silt won't delete (Downloads).
+        var contents = false
     }
 
     private static let known: [Known] = [
         Known(path: "Library/Caches", id: "caches", title: "App caches",
-              detail: "Apps rebuild these as needed. Quit big apps first.", symbol: "shippingbox", safety: .safe),
+              detail: "Apps rebuild these as needed. Quit big apps first.", symbol: "shippingbox", safety: .safe,
+              contents: true),
         Known(path: "Library/Developer/Xcode/DerivedData", id: "deriveddata", title: "Xcode DerivedData",
               detail: "Build intermediates. Xcode recreates them on the next build.", symbol: "hammer", safety: .safe),
         Known(path: "Library/Developer/Xcode/iOS DeviceSupport", id: "devicesupport", title: "iOS device support",
@@ -69,12 +73,12 @@ enum Reclaim {
               detail: "Local language models.", symbol: "brain", safety: .review),
         Known(path: "Downloads", id: "downloads", title: "Downloads",
               detail: "Everything you’ve downloaded. Usually safe to thin out.", symbol: "arrow.down.circle",
-              safety: .review),
+              safety: .review, contents: true),
     ]
 
     /// Build output and dependencies, found by folder name. They count only in
     /// projects of yours (see `Place`), next to a file that proves the
-    /// project is there to rebuild them.
+    /// project is there to rebuild them (DerivedData: `Guide.isXcodeDerivedData`).
     private struct Pattern {
         let name: String
         let markers: [String] // one of these must sit next to the folder
@@ -155,8 +159,12 @@ enum Reclaim {
             guard e != NONE, !claimed.contains(e), within(e) else { continue }
             let bytes = sizes([e])
             guard bytes > 10_000_000 else { continue }
+            let entries = k.contents
+                ? tree.withLock { tree.entry(e).isDir ? tree.children(of: tree.entry(e).aux, key: .size) : [] }
+                : [e]
+            guard !entries.isEmpty else { continue }
             findings.append(Finding(id: k.id, title: k.title, detail: k.detail, symbol: k.symbol,
-                                    safety: k.safety, entries: [e], bytes: bytes))
+                                    safety: k.safety, entries: entries, bytes: bytes))
             claimed.insert(e)
         }
 
@@ -180,7 +188,8 @@ enum Reclaim {
                     let parentName = (parent as NSString).lastPathComponent
                     if parentName == "lib" || parentName == "libexec" { continue }
                 }
-                let marked = p.markers.isEmpty || p.markers.contains { tree.lookup(parent + "/" + $0) != NONE }
+                let marked = p.name == "DerivedData" ? Guide.isXcodeDerivedData(tree, tree.entry(m.entry))
+                    : p.markers.contains { tree.lookup(parent + "/" + $0) != NONE }
                 if marked {
                     grouped[m.which, default: []].append(m.entry)
                 } else if p.name == "node_modules", inRepository(tree, tree.entry(m.entry).parent, cache: &repos) {
