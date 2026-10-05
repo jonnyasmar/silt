@@ -530,7 +530,7 @@ final class Session: Identifiable {
     /// queue, so what's on screen is current first.
     func lookedAt(dir: UInt32) {
         guard isAwake, phase == .live else { return }
-        releasePaused(under: dir)
+        releasePaused(under: dir, opened: true)
         let due: Bool = tree.withLock {
             guard dir < tree.raw.pointee.dir_count, tree.isLive(tree.dirEntry(dir)) else { return false }
             let d = tree.dir(dir)
@@ -1188,19 +1188,28 @@ final class Session: Identifiable {
     // MARK: Folder rules
 
     /// Lists the Paused folders inside `dir` (itself included) that have
-    /// changes waiting.
-    func releasePaused(under dir: UInt32) {
+    /// changes waiting. `opened`: the user opened `dir`, which counts only
+    /// for the Paused folder itself and what's inside it; opening a folder
+    /// above it doesn't update it.
+    func releasePaused(under dir: UInt32, opened: Bool = false) {
         guard !pausedPending.isEmpty else { return }
+        let rules = FolderRules.shared
         let inside: [(UInt32, Bool)] = tree.withLock {
-            pausedPending.filter { d, _ in
+            let openedPath = opened && dir < tree.raw.pointee.dir_count ? tree.path(of: tree.dirEntry(dir)) : nil
+            return pausedPending.filter { d, _ in
                 var p = d
                 while true {
-                    if p == dir { return true }
+                    if p == dir { break }
                     guard p < tree.raw.pointee.dir_count, tree.isLive(tree.dirEntry(p)) else { return false }
                     let parent = tree.entry(tree.dirEntry(p)).parent
                     if parent == NONE { return false }
                     p = parent
                 }
+                guard let openedPath else { return true }
+                guard d < tree.raw.pointee.dir_count, tree.isLive(tree.dirEntry(d)),
+                      let ruled = rules.rule(for: tree.path(of: tree.dirEntry(d))), ruled.rule == .paused
+                else { return true } // no longer under a Paused rule: due anyway
+                return openedPath == ruled.path || openedPath.hasPrefix(ruled.path + "/")
             }.map { ($0.key, $0.value) }
         }
         for (d, deep) in inside {

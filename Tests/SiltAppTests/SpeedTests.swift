@@ -172,6 +172,9 @@ private func event(_ path: String) -> FSWatcher.Event {
     // Remembered for a relaunch.
     #expect(UserDefaults.standard.dictionary(forKey: "pausedPending:" + root.path)?[quietPath] != nil)
 
+    // Opening a folder above it doesn't count.
+    await MainActor.run { s.lookedAt(dir: 0) }
+    #expect(await MainActor.run { s.hasPausedChanges(under: quiet) })
     await MainActor.run { s.lookedAt(dir: quiet) }
     #expect(await wait { s.tree.progress.listed > listed })
     #expect(await MainActor.run { !s.hasPausedChanges(under: quiet) })
