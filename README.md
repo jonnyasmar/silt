@@ -1,7 +1,9 @@
 # Silt
 
-A fast, live disk-space explorer for macOS. **[usesilt.app](https://usesilt.app)** ·
-[Download](https://github.com/jonnyasmar/silt/releases/latest/download/Silt.dmg) It's a drillable file tree in the
+**[usesilt.app](https://usesilt.app)** ·
+[Download for Mac](https://github.com/jonnyasmar/silt/releases/latest/download/Silt.dmg)
+
+A fast, live disk-space explorer for macOS. It's a drillable file tree in the
 spirit of WinDirStat: it fills in while it scans and stays current as files
 change.
 
