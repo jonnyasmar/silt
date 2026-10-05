@@ -23,7 +23,6 @@ export default async function OpenGraphImage() {
           color: "#211709",
         }}
       >
-        {/* eslint-disable-next-line @next/next/no-img-element */}
         <img src={src} width={360} height={360} alt="" />
         <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
           <div style={{ fontSize: 96, fontWeight: 700, letterSpacing: -3 }}>Silt</div>

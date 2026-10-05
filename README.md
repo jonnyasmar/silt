@@ -209,7 +209,9 @@ the same session as the build before the performance round:
 | Settled CPU on a quiet folder | 1.8 % of a core | ~0.03 % |
 | Threads when settled | 32–35 | 4–7 |
 
-`du -sk` took 71 s on the same folder.
+For comparison, two back-to-back runs on 2026-10-05 on the same folder (by
+then 1.1M items, warm cache, heavily loaded machine): Silt's engine took 9.0
+and 10.8 s, `du -sk` 26.8 and 40.8 s.
 
 ## Sizes, precisely
 

@@ -20,13 +20,13 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Strata } from "./_components/strata";
-import { downloadURL, latestRelease, repo } from "@/lib/release";
+import { downloadURL, latestRelease, repo, stars } from "@/lib/release";
 
 export default async function Home() {
-  const release = await latestRelease();
+  const [release, starCount] = await Promise.all([latestRelease(), stars()]);
   return (
     <>
-      <Header />
+      <Header stars={starCount} />
       <main>
         <Hero version={release?.version} />
         <Strata className="h-16 md:h-24" />
@@ -64,7 +64,7 @@ function DownloadButton({ size = "lg" }: { size?: "sm" | "lg" }) {
   );
 }
 
-function Header() {
+function Header({ stars }: { stars: number | null }) {
   return (
     <header className="sticky top-0 z-20 border-b border-line/60 bg-paper/80 backdrop-blur-md">
       <div className="mx-auto flex h-14 max-w-6xl items-center justify-between px-5">
@@ -89,6 +89,11 @@ function Header() {
           >
             <GitHubMark />
             <span className="hidden sm:inline">GitHub</span>
+            {stars !== null && (
+              <span className="hidden tabular-nums sm:inline">
+                · {new Intl.NumberFormat("en", { notation: "compact" }).format(stars)} ★
+              </span>
+            )}
           </a>
           <DownloadButton size="sm" />
         </nav>
@@ -110,9 +115,9 @@ function Hero({ version }: { version?: string }) {
             <span className="text-muted italic">As it fills.</span>
           </h1>
           <p className="mt-6 max-w-xl text-lg leading-relaxed text-muted">
-            Silt scans your disk in seconds, then keeps a live, drillable tree of every folder as files
-            come and go. When you’re ready to clear space, it tells you what’s safe and refuses to
-            delete what isn’t.
+            Silt reads a million files in about ten seconds, then keeps a live, drillable tree of every
+            folder as files come and go. When you’re ready to clear space, it tells you what’s safe and
+            refuses to delete what isn’t.
           </p>
           <div className="mt-9 flex flex-wrap items-center gap-4">
             <DownloadButton />
@@ -158,17 +163,19 @@ function SectionHeading({ eyebrow, title, children }: { eyebrow: string; title: 
 }
 
 function Fast() {
+  // Two runs each, back to back, on the same folder with a warm cache
+  // (2026-10-05): Silt's engine 9.0 and 10.8 s, du -sk 26.8 and 40.8 s.
   const runs = [
-    { label: "Silt", seconds: 8.9, tone: "bg-ochre" },
-    { label: "du -sk", seconds: 71, tone: "bg-muted/40" },
+    { label: "Silt", text: "9–11 s", seconds: 9.9, tone: "bg-ochre" },
+    { label: "du -sk", text: "27–41 s", seconds: 33.8, tone: "bg-muted/40" },
   ];
-  const max = 71;
+  const max = 33.8;
   return (
     <section className="bg-sand/60">
       <div className="mx-auto max-w-6xl px-5 py-20">
-        <SectionHeading eyebrow="Fast" title="Fast enough to leave open.">
-          A whole developer folder, 1.3 million items, in under nine seconds. Then Silt stays current by
-          re-reading only the folders that change.
+        <SectionHeading eyebrow="Fast" title="Fast to scan, then live.">
+          A developer folder of 1.1 million items in about ten seconds, three to four times faster than
+          du. Then Silt stays current by re-reading only the folders that change.
         </SectionHeading>
         <div className="mt-10 space-y-4">
           {runs.map((r) => (
@@ -178,21 +185,21 @@ function Fast() {
                 {/* Scaled to the row minus room for its label, so the label sits at the bar's end. */}
                 <div
                   className={`h-3.5 shrink-0 rounded-full ${r.tone}`}
-                  style={{ width: `calc((100% - 4.5rem) * ${r.seconds / max})`, minWidth: "1.5rem" }}
+                  style={{ width: `calc((100% - 5rem) * ${r.seconds / max})`, minWidth: "1.5rem" }}
                 />
-                <span className="font-mono text-sm whitespace-nowrap tabular-nums">{r.seconds} s</span>
+                <span className="font-mono text-sm whitespace-nowrap tabular-nums">{r.text}</span>
               </div>
             </div>
           ))}
           <p className="pt-1 text-xs text-muted">
-            Scanning ~/dev (1.3M items) on an M3 Max with other work running.
+            Two runs each on the same folder (1.1M items, warm cache) on an M3 Max with plenty of other work
+            running.
           </p>
         </div>
-        <dl className="mt-14 grid gap-8 sm:grid-cols-3">
+        <dl className="mt-14 grid gap-8 sm:grid-cols-2">
           {[
-            ["~55 MB", "for 1.2 million items, held in a flat, chunked tree"],
-            ["0.03%", "of a core while a quiet folder sits open"],
-            ["Instant", "relaunch: the last scan loads straight back, then catches up"],
+            ["~60 bytes", "per item in memory: 66 MB for that folder, under 900 MB for a whole 12.7-million-item disk"],
+            ["Instant", "relaunch: the last scan loads straight back, then catches up on what changed"],
           ].map(([value, label]) => (
             <div key={value} className="border-t border-line pt-4">
               <dt className="font-display text-4xl tracking-tight">{value}</dt>
@@ -255,7 +262,7 @@ function Speed() {
   const modes: [LucideIcon, string, string][] = [
     [Gauge, "Automatic", "Scans you start run flat out. Keeping up with changes runs in the background, and everything eases off on battery, in Low Power Mode or when the Mac runs hot."],
     [Rabbit, "Fast", "Everything at full priority, catching up included. Close a few apps and get the answer now."],
-    [Turtle, "Gentle", "Low priority, on the efficiency cores, with slower disk access. Takes longer; you won’t notice it."],
+    [Turtle, "Gentle", "Low priority, on the efficiency cores, with slower disk access. Takes several times longer and stays out of your way."],
     [Pause, "Paused", "Silt does nothing on its own, but remembers what changed and catches up when you resume."],
   ];
   return (
