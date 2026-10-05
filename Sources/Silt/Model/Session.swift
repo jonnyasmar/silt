@@ -1684,12 +1684,13 @@ final class Session: Identifiable {
 
     /// Deletes the volume's local Time Machine snapshots, after asking.
     func deleteLocalSnapshots(window: NSWindow?) {
-        let n = snapshots.count
-        guard n > 0, !deletingSnapshots else { return }
+        guard !snapshots.isEmpty, !deletingSnapshots else { return }
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = n == 1 ? "Delete the local snapshot?" : "Delete \(n) local snapshots?"
-        alert.informativeText = "Time Machine’s restore points on this Mac are removed for good. Backups on your backup disk aren’t touched."
+        // No count: the list may have changed since it was last read. The
+        // result says how many went.
+        alert.messageText = "Delete this volume’s local snapshots?"
+        alert.informativeText = "Time Machine’s restore points on this Mac are removed for good. Backups on your backup disk aren’t touched, but if you’ve been away from it, these may be the only copies of recent changes."
         let delete = alert.addButton(withTitle: "Delete")
         delete.hasDestructiveAction = true
         alert.addButton(withTitle: "Cancel")
@@ -1700,7 +1701,7 @@ final class Session: Identifiable {
                 // Snapshot space already counts as available (it's
                 // purgeable): what deleting them changes is free space.
                 let before = Locations.volumeCapacity(for: url)?.free
-                let problem = LocalSnapshots.deleteAll(on: url.path)
+                let result = LocalSnapshots.deleteAll(on: url.path)
                 let after = Locations.volumeCapacity(for: url)
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
@@ -1709,14 +1710,20 @@ final class Session: Identifiable {
                         self.lastSnapshotCheck = -.infinity // list them again
                         if let after { self.adoptExactCapacity(after) }
                         else { self.measureHidden(now: ProcessInfo.processInfo.systemUptime) }
-                        if let problem {
-                            self.show(Toast(symbol: "exclamationmark.triangle", title: "Couldn’t delete the snapshots", detail: problem))
+                        let gained = max(0, (after?.free ?? 0) - (before ?? after?.free ?? 0))
+                        self.freedBytes += gained
+                        let n = result.deleted
+                        let deleted = n == 1 ? "1 local snapshot" : "\(n) local snapshots"
+                        let freed = gained > 0 ? "\(Fmt.bytes(gained)) freed." : nil
+                        if let problem = result.problem {
+                            self.show(Toast(symbol: "exclamationmark.triangle",
+                                            title: n == 0 ? "Couldn’t delete the snapshots"
+                                                : "Deleted \(n) of \(n + result.remaining) local snapshots",
+                                            detail: [freed, problem].compactMap { $0 }.joined(separator: " ")), seconds: 8)
                         } else {
-                            let gained = max(0, (after?.free ?? 0) - (before ?? after?.free ?? 0))
-                            self.freedBytes += gained
                             self.show(Toast(symbol: "checkmark.circle",
-                                            title: n == 1 ? "Deleted the local snapshot" : "Deleted \(n) local snapshots",
-                                            detail: gained > 0 ? "\(Fmt.bytes(gained)) freed" : nil))
+                                            title: n == 0 ? "No local snapshots were left to delete" : "Deleted \(deleted)",
+                                            detail: freed))
                         }
                     }
                 }

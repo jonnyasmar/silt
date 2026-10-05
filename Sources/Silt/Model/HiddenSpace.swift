@@ -153,21 +153,44 @@ enum LocalSnapshots {
     }
 
     /// Deletes every local Time Machine snapshot of the volume mounted at
-    /// `path` (no admin rights needed). Returns what went wrong, or nil.
-    static func deleteAll(on path: String) -> String? {
+    /// `path` (no admin rights needed). The snapshots are listed before and
+    /// after, so what's reported is what actually went, not the count shown
+    /// when the user asked.
+    static func deleteAll(on path: String) -> DeleteOutcome {
+        let before = list(for: path)
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/tmutil")
         p.arguments = ["deletelocalsnapshots", path]
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
-        do { try p.run() } catch { return error.localizedDescription }
+        do { try p.run() } catch { return DeleteOutcome(deleted: 0, remaining: before.count, problem: error.localizedDescription) }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        guard p.terminationStatus != 0 else { return nil }
-        let lines = String(decoding: data, as: UTF8.self).split(separator: "\n")
-        return lines.first(where: { $0.hasPrefix("Failed") }).map(String.init)
-            ?? "tmutil stopped with status \(p.terminationStatus)."
+        return outcome(before: before, after: list(for: path), status: p.terminationStatus,
+                       output: String(decoding: data, as: UTF8.self))
+    }
+
+    struct DeleteOutcome: Equatable {
+        let deleted: Int
+        /// Snapshots that were there before and still are.
+        let remaining: Int
+        let problem: String?
+    }
+
+    /// What a `tmutil deletelocalsnapshots` run did. It can print "Failed…"
+    /// for some snapshots and still exit 0, so its output and the lists
+    /// both count, not just its status.
+    static func outcome(before: [String], after: [String], status: Int32, output: String) -> DeleteOutcome {
+        let gone = Set(before).subtracting(after)
+        let remaining = Set(before).intersection(after).count
+        let lines = output.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        var problem = lines.first(where: { $0.hasPrefix("Failed") })
+        if problem == nil, status != 0 { problem = lines.last ?? "tmutil stopped with status \(status)." }
+        if problem == nil, remaining > 0 {
+            problem = remaining == 1 ? "1 snapshot is still there." : "\(remaining) snapshots are still there."
+        }
+        return DeleteOutcome(deleted: gone.count, remaining: remaining, problem: problem)
     }
 
     /// "com.apple.TimeMachine.2026-09-26-223928.local" → a date.

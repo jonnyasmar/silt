@@ -340,3 +340,25 @@ private func surviving(_ names: [String], in root: URL) -> [String] {
     await finish(s)
 }
 
+// MARK: Snapshots
+
+/// What a snapshot delete reports comes from the lists before and after,
+/// and from tmutil's output, not just its exit status.
+@Test func snapshotDeleteReportsWhatHappened() {
+    let three = ["com.apple.TimeMachine.1.local", "com.apple.TimeMachine.2.local", "com.apple.TimeMachine.3.local"]
+    #expect(LocalSnapshots.outcome(before: three, after: [], status: 0, output: "Deleted local snapshot …\n")
+            == .init(deleted: 3, remaining: 0, problem: nil))
+    // Exit 0, but one failed.
+    let partial = LocalSnapshots.outcome(before: three, after: [three[2]], status: 0,
+                                         output: "Deleted …\nFailed to delete local snapshot \(three[2])\n")
+    #expect(partial == .init(deleted: 2, remaining: 1, problem: "Failed to delete local snapshot \(three[2])"))
+    // A failure in its own words.
+    #expect(LocalSnapshots.outcome(before: three, after: three, status: 1, output: "Error: the volume is busy\n")
+            == .init(deleted: 0, remaining: 3, problem: "Error: the volume is busy"))
+    // Silent, but one is still there.
+    #expect(LocalSnapshots.outcome(before: three, after: [three[0]], status: 0, output: "")
+            == .init(deleted: 2, remaining: 1, problem: "1 snapshot is still there."))
+    // One made while deleting isn't counted against it.
+    #expect(LocalSnapshots.outcome(before: three, after: ["com.apple.TimeMachine.4.local"], status: 0, output: "")
+            == .init(deleted: 3, remaining: 0, problem: nil))
+}
