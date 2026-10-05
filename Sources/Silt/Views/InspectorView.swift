@@ -10,7 +10,9 @@ struct InspectorView: View {
             VStack(alignment: .leading, spacing: 20) {
                 if session.selection.isEmpty, let pick = session.hiddenSelection, let hidden = session.hidden {
                     HiddenSpaceCard(hidden: hidden, highlight: pick, volume: session.title,
-                                    used: session.capacity.map { $0.total - $0.free } ?? 0)
+                                    used: session.capacity.map { $0.total - $0.free } ?? 0,
+                                    deleting: session.deletingSnapshots,
+                                    deleteSnapshots: { session.deleteLocalSnapshots(window: NSApp.keyWindow) })
                 } else if session.selection.count > 1 {
                     SelectionTotal(session: session, refs: session.selection)
                 } else {
@@ -550,9 +552,8 @@ private struct HiddenSpaceCard: View {
     let highlight: String
     let volume: String
     let used: Int64
-    @State private var copied = false
-
-    private static let command = "tmutil deletelocalsnapshots /"
+    let deleting: Bool
+    let deleteSnapshots: () -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -608,24 +609,21 @@ private struct HiddenSpaceCard: View {
             Text(summary(dates))
                 .font(.system(size: 12))
                 .fixedSize(horizontal: false, vertical: true)
-            Text("macOS deletes them on its own as space runs low, so there’s usually nothing to do. To get the space back now, run this in Terminal:")
+            Text("macOS deletes them on its own as space runs low, so there’s usually nothing to do. To get the space back now, delete them here.")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: 6) {
-                Text(Self.command)
-                    .font(.system(size: 11.5, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                Button(copied ? "Copied" : "Copy") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(Self.command, forType: .string)
-                    copied = true
+            HStack(spacing: 8) {
+                Button(role: .destructive, action: deleteSnapshots) {
+                    Label("Delete Snapshots…", systemImage: "trash")
                 }
-                .controlSize(.small)
+                .disabled(deleting)
+                if deleting {
+                    ProgressView().controlSize(.small)
+                    Text("Deleting…")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
             }
             Text("That removes Time Machine’s local restore points on this Mac. Backups on your backup disk aren’t touched.")
                 .font(.system(size: 11))

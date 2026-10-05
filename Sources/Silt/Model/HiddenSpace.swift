@@ -152,6 +152,24 @@ enum LocalSnapshots {
             .sorted()
     }
 
+    /// Deletes every local Time Machine snapshot of the volume mounted at
+    /// `path` (no admin rights needed). Returns what went wrong, or nil.
+    static func deleteAll(on path: String) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/tmutil")
+        p.arguments = ["deletelocalsnapshots", path]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do { try p.run() } catch { return error.localizedDescription }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus != 0 else { return nil }
+        let lines = String(decoding: data, as: UTF8.self).split(separator: "\n")
+        return lines.first(where: { $0.hasPrefix("Failed") }).map(String.init)
+            ?? "tmutil stopped with status \(p.terminationStatus)."
+    }
+
     /// "com.apple.TimeMachine.2026-09-26-223928.local" → a date.
     static func date(of name: String) -> Date? {
         let parts = name.split(separator: ".")

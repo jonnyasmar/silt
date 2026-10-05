@@ -106,6 +106,7 @@ final class Session: Identifiable {
     var selection: [ItemRef] = []
     var toast: Toast?
     private(set) var freedBytes: Int64 = 0
+    private(set) var deletingSnapshots = false
     /// Scanning, but nothing has landed for a few seconds: usually threads
     /// parked on a macOS privacy prompt.
     private(set) var stalled = false
@@ -1637,6 +1638,49 @@ final class Session: Identifiable {
         let next = HiddenSpace.measure(url: url, scanned: stats.bytes, capacity: capacity,
                                        unreadable: stats.denied, snapshots: snapshots)
         if next != hidden { hidden = next }
+    }
+
+    /// Deletes the volume's local Time Machine snapshots, after asking.
+    func deleteLocalSnapshots(window: NSWindow?) {
+        let n = snapshots.count
+        guard n > 0, !deletingSnapshots else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = n == 1 ? "Delete the local snapshot?" : "Delete \(n) local snapshots?"
+        alert.informativeText = "Time Machine’s restore points on this Mac are removed for good. Backups on your backup disk aren’t touched."
+        let delete = alert.addButton(withTitle: "Delete")
+        delete.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        let run: (NSApplication.ModalResponse) -> Void = { [weak self] r in
+            guard r == .alertFirstButtonReturn, let url = self?.url else { return }
+            self?.deletingSnapshots = true
+            DispatchQueue.global(qos: .userInitiated).async {
+                // Snapshot space already counts as available (it's
+                // purgeable): what deleting them changes is free space.
+                let before = Locations.volumeCapacity(for: url)?.free
+                let problem = LocalSnapshots.deleteAll(on: url.path)
+                let after = Locations.volumeCapacity(for: url)
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        self.deletingSnapshots = false
+                        self.lastSnapshotCheck = -.infinity // list them again
+                        if let after { self.adoptExactCapacity(after) }
+                        else { self.measureHidden(now: ProcessInfo.processInfo.systemUptime) }
+                        if let problem {
+                            self.show(Toast(symbol: "exclamationmark.triangle", title: "Couldn’t delete the snapshots", detail: problem))
+                        } else {
+                            let gained = max(0, (after?.free ?? 0) - (before ?? after?.free ?? 0))
+                            self.freedBytes += gained
+                            self.show(Toast(symbol: "checkmark.circle",
+                                            title: n == 1 ? "Deleted the local snapshot" : "Deleted \(n) local snapshots",
+                                            detail: gained > 0 ? "\(Fmt.bytes(gained)) freed" : nil))
+                        }
+                    }
+                }
+            }
+        }
+        if let window { alert.beginSheetModal(for: window, completionHandler: run) } else { run(alert.runModal()) }
     }
 }
 
