@@ -1,0 +1,140 @@
+# Cuts a release from main without anyone tagging anything. A push whose
+# CFBundleShortVersionString (Resources/Info.plist) has no published release
+# yet is a release nobody has cut: test, build, sign, notarize, publish.
+#
+# The release, and with it the tag v<version>, is created as a draft and
+# published only once the disk image is attached, so a run that fails leaves
+# nothing anyone can download, and the next run replaces its leftover draft.
+# To release: bump the version in Resources/Info.plist and push to main.
+#
+# Secrets live in the `release` environment, which only main may deploy to,
+# so a workflow run from any other branch can't read them
+# (scripts/setup-release-secrets.sh creates it): SIGNING_CERTIFICATE_P12
+# (base64 of the Developer ID Application .p12), SIGNING_CERTIFICATE_PASSWORD,
+# NOTARY_APPLE_ID, NOTARY_PASSWORD (an app-specific password).
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# One at a time, and never cancelled halfway through a notarization.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      released: ${{ steps.version.outputs.released }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(sed -n '/<key>CFBundleShortVersionString<\/key>/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;}' Resources/Info.plist)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "CFBundleShortVersionString '$version' is not x.y.z" >&2
+            exit 1
+          fi
+          # Published releases only: a draft has no tag yet.
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/v$version" > /dev/null 2>&1; then
+            released=true
+            echo "v$version is already released: nothing to do."
+          else
+            released=false
+            echo "v$version has no release yet."
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "released=$released" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: detect
+    if: needs.detect.outputs.released == 'false'
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: swift --version
+      - name: Tests
+        run: swift test
+
+  release:
+    needs: [detect, test]
+    if: github.ref == 'refs/heads/main'
+    environment: release
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the previous tag, for the notes
+      - name: Check secrets
+        env:
+          SIGNING_CERTIFICATE_P12: ${{ secrets.SIGNING_CERTIFICATE_P12 }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+        run: |
+          missing=()
+          for name in SIGNING_CERTIFICATE_P12 SIGNING_CERTIFICATE_PASSWORD NOTARY_APPLE_ID NOTARY_PASSWORD; do
+            [[ -n "${!name}" ]] || missing+=("$name")
+          done
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::Missing release secrets in the release environment: ${missing[*]}. Run scripts/setup-release-secrets.sh, then re-run this workflow."
+            exit 1
+          fi
+      - name: Import the signing identity
+        env:
+          SIGNING_CERTIFICATE_P12: ${{ secrets.SIGNING_CERTIFICATE_P12 }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+        run: scripts/ci-keychain.sh import
+      - name: Build, sign and notarize
+        env:
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+        run: scripts/release.sh
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dmg="build/Silt-$VERSION.dmg"
+          sha="$(shasum -a 256 "$dmg" | cut -d' ' -f1)"
+          previous="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+          {
+            echo "Download **Silt-$VERSION.dmg** below, open it, and drag Silt to Applications. Requires macOS 15 or later; runs natively on Apple silicon and Intel."
+            echo
+            echo "SHA-256: \`$sha\`"
+            echo
+            echo "## Changes"
+            if [[ -n "$previous" ]]; then
+              git log --no-merges --pretty='- %s' "$previous..HEAD"
+            else
+              git log --no-merges --pretty='- %s'
+            fi
+          } > "$RUNNER_TEMP/notes.md"
+          # A draft a failed run left behind for this version goes first.
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.draft and .tag_name == \"v$VERSION\") | .id" |
+            while read -r id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"; done
+          # The same image under a name that never changes, so
+          # releases/latest/download/Silt.dmg is always the newest (the website
+          # links there).
+          cp "$dmg" build/Silt.dmg
+          gh release create "v$VERSION" "$dmg" build/Silt.dmg --draft --target "$GITHUB_SHA" \
+            --title "Silt $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+          gh release edit "v$VERSION" --draft=false
+          echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/v$VERSION"
+      - name: Delete the signing keychain
+        if: always()
+        run: scripts/ci-keychain.sh delete

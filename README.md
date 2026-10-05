@@ -22,25 +22,36 @@ than trigger a privacy prompt for each one, and marks them as locked.
 
 ## Releasing
 
-`scripts/release.sh` builds `build/Silt-<version>.dmg`: a universal (arm64 +
-x86_64) app signed with Developer ID and the hardened runtime, inside a signed
-drag-to-install disk image. Set the version in `Resources/Info.plist` first.
+Releases are cut by GitHub Actions (`.github/workflows/release.yml`), on
+GitHub's free hosted runners for public repositories. To release, bump
+`CFBundleShortVersionString` in `Resources/Info.plist` and push to `main`. A
+push whose version has no published release yet runs the tests, then
+`scripts/release.sh`, which builds a universal (arm64 + x86_64) app signed with
+Developer ID and the hardened runtime, inside a signed drag-to-install disk
+image, and notarizes and staples both. It then publishes a GitHub release
+`v<version>` with the disk image. A run that fails publishes nothing. Pull
+requests run the tests (`ci.yml`).
 
-Notarizing needs credentials stored once (an app-specific password, kept in
-your keychain):
+The workflow signs and notarizes with secrets kept in a `release` environment
+that only `main` can deploy to, set once with
+`scripts/setup-release-secrets.sh path/to/DeveloperID.p12` (the Developer ID
+Application identity exported from Keychain Access, plus an Apple ID and an
+app-specific password; each is checked before it's uploaded).
+
+To build a release locally instead:
 
 ```sh
 xcrun notarytool store-credentials silt-notary --apple-id <Apple ID email> --team-id Z4PL6853AL
 NOTARY_PROFILE=silt-notary scripts/release.sh
 ```
 
-That notarizes and staples both the app and the disk image, and only runs on
-a clean working tree. An App Store Connect API key works too (`NOTARY_KEY_P8`,
-`NOTARY_KEY_ID`, `NOTARY_ISSUER_ID`), and `SILT_RELEASE_IDENTITY` picks another
-Developer ID identity. Without credentials the image is signed but not
-notarized: Gatekeeper blocks it on other Macs, so don't hand it out. The
-background comes from `swift scripts/make-dmg-background.swift`, and the
-window layout from `scripts/dmg/layout.json`.
+That needs a clean working tree. An App Store Connect API key works too
+(`NOTARY_KEY_P8`, `NOTARY_KEY_ID`, `NOTARY_ISSUER_ID`), and
+`SILT_RELEASE_IDENTITY` picks another Developer ID identity. Without
+credentials the image is signed but not notarized: Gatekeeper blocks it on
+other Macs, so don't hand it out. The background comes from
+`swift scripts/make-dmg-background.swift`, and the window layout from
+`scripts/dmg/layout.json`.
 
 ## Using it
 

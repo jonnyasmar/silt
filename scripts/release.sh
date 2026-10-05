@@ -10,6 +10,9 @@
 #                          `security find-identity` lists, by hash, because
 #                          codesign refuses an ambiguous name.
 #   NOTARY_PROFILE         notarytool keychain profile, or
+#   NOTARY_APPLE_ID        an Apple ID, with
+#   NOTARY_PASSWORD        an app-specific password for it (the release
+#                          workflow's route; the team is the identity's), or
 #   NOTARY_KEY_P8          App Store Connect API key file, with
 #   NOTARY_KEY_ID          its key id and
 #   NOTARY_ISSUER_ID       its issuer id.
@@ -66,6 +69,13 @@ if [[ -n "${NOTARY_KEY_P8:-}" ]]; then
   fi
   NOTARIZING=true
   NOTARY=(--key "$NOTARY_KEY_P8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID")
+elif [[ -n "${NOTARY_APPLE_ID:-}" ]]; then
+  if [[ -z "${NOTARY_PASSWORD:-}" || -z "$TEAM_ID" ]]; then
+    echo "NOTARY_APPLE_ID needs NOTARY_PASSWORD, and an identity whose name ends in its team id" >&2
+    exit 1
+  fi
+  NOTARIZING=true
+  NOTARY=(--apple-id "$NOTARY_APPLE_ID" --password "$NOTARY_PASSWORD" --team-id "$TEAM_ID")
 elif [[ -n "${NOTARY_PROFILE:-}" ]]; then
   NOTARIZING=true
   NOTARY=(--keychain-profile "$NOTARY_PROFILE")

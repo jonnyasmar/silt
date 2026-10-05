@@ -1,0 +1,28 @@
+# Tests every pull request and every branch push except main (release.yml
+# tests main before it releases anything).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: swift --version
+      - name: Release build
+        run: swift build -c release
+      - name: Tests
+        run: swift test
