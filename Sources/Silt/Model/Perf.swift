@@ -86,7 +86,9 @@ enum PerfReporter {
         for s in WindowModel.allSessions {
             let id = ObjectIdentifier(s)
             let p = s.tree.progress
-            let listed = p.listed &- (lastListed[id] ?? p.listed)
+            // Parking and waking start the count again.
+            let before = lastListed[id] ?? p.listed
+            let listed = p.listed >= before ? p.listed - before : p.listed
             let ticks = s.ticks - (lastTicks[id] ?? s.ticks)
             lastListed[id] = p.listed
             lastTicks[id] = s.ticks
