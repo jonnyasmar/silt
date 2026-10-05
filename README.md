@@ -193,6 +193,13 @@ select it) to see what it's made of: purgeable space (local Time Machine
 snapshots and caches macOS frees by itself), the other volumes sharing the
 disk (swap, Preboot, Recovery), and data only macOS can read.
 
+## Support
+
+Silt is free and open source. If it got you some space back, you can buy me
+a coffee.
+
+<a href="https://www.buymeacoffee.com/jonnygravity"><img src=".github/buy-me-a-coffee.svg" alt="Buy me a coffee" height="40"></a>
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
