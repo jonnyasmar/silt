@@ -99,6 +99,20 @@ Other features:
 - **Largest Files** folds copies (same name and size in several places) into
   one row, so duplicates stand out.
 - **Search** matches names anywhere in the scan, largest first.
+- **Scan speed** (status bar, File menu, or Settings). Automatic runs scans
+  you start at full speed and keeps up with changes in the background,
+  easing off on battery, in Low Power Mode or when the Mac runs hot. Fast
+  puts everything at full priority, catching up included. Gentle keeps to
+  the efficiency cores with slower disk access, so it takes several times
+  longer. Paused stops Silt's own work, while scans you start still run.
+- **Busy folders.** A folder that never stops changing (agent logs, build
+  output) is updated less and less often, down to every 30 s. A folder you
+  have open still updates every couple of seconds. The status bar lists busy
+  folders.
+- **Folder rules.** Right-click a folder and choose Updates: Live (every
+  change), Slowly (once a minute), Paused (only when you open it or choose
+  Update Now), or Don't Scan (left out entirely). A rule covers everything
+  inside the folder, and Settings lists them all.
 
 ## How it's fast
 
@@ -111,9 +125,12 @@ Other features:
   more contention, not more speed. So the pool starts small and grows only
   while an extra pair of threads makes listing faster without making each
   item much more expensive. Threads leave after 5 s with nothing to do, so a
-  settled scan holds none. Refreshes the app starts on its own (FSEvents) run
-  as background work, at utility priority, two at a time. Listing never
-  updates access times.
+  settled scan holds none. Work Silt does on its own (keeping up with changes,
+  catching up after a relaunch) runs as background work at utility
+  priority, four at a time. On `~/dev` that is about 2.5× slower than a full
+  scan, for under one core on average. Each class's priority and limit can
+  change mid-scan: that's the speed setting. Listing never updates access
+  times.
 - The tree is flat and chunked: 24 bytes per entry, 48 per folder, and names
   in a shared arena. About 1.2M entries fit in ~55 MB.
 - After the scan, an FSEvents stream re-lists only the folders that changed,
@@ -124,8 +141,10 @@ Other features:
   cargo builds running, memory stays flat where it used to grow by
   ~200 MB a minute.
 - Big folders that change constantly (build output, browser caches) are
-  re-listed at a pace that scales with their size, a 60,000-file folder at
-  most every 2.4 s; small folders update immediately. Whole-tree views
+  re-listed at a pace that scales with their size: a 60,000-file folder is
+  re-listed at most every 2.4 s, and small folders update immediately. Any
+  folder that changes again right after being listed waits twice as long
+  next time, up to 30 s, and cools off once it's quiet. Whole-tree views
   (Largest, Types, the inspector's breakdown) skip folders where nothing
   changed and otherwise refresh at a pace set by what their last pass cost.
 - **Instant relaunch.** A settled scan is saved as a compacted, LZ4-compressed
