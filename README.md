@@ -20,6 +20,28 @@ For a complete picture, give Silt **Full Disk Access** (System Settings →
 Privacy & Security). Without it, Silt skips other apps' containers rather
 than trigger a privacy prompt for each one, and marks them as locked.
 
+## Releasing
+
+`scripts/release.sh` builds `build/Silt-<version>.dmg`: a universal (arm64 +
+x86_64) app signed with Developer ID and the hardened runtime, inside a signed
+drag-to-install disk image. Set the version in `Resources/Info.plist` first.
+
+Notarizing needs credentials stored once (an app-specific password, kept in
+your keychain):
+
+```sh
+xcrun notarytool store-credentials silt-notary --apple-id <Apple ID email> --team-id Z4PL6853AL
+NOTARY_PROFILE=silt-notary scripts/release.sh
+```
+
+That notarizes and staples both the app and the disk image, and only runs on
+a clean working tree. An App Store Connect API key works too (`NOTARY_KEY_P8`,
+`NOTARY_KEY_ID`, `NOTARY_ISSUER_ID`), and `SILT_RELEASE_IDENTITY` picks another
+Developer ID identity. Without credentials the image is signed but not
+notarized: Gatekeeper blocks it on other Macs, so don't hand it out. The
+background comes from `swift scripts/make-dmg-background.swift`, and the
+window layout from `scripts/dmg/layout.json`.
+
 ## Using it
 
 | | |

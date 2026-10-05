@@ -1,0 +1,10 @@
+{
+  "caption": "Drag Silt to Applications",
+  "captionY": 296,
+  "window": { "width": 640, "height": 380 },
+  "titleBar": 32,
+  "iconSize": 128,
+  "textSize": 13,
+  "app": { "x": 180, "y": 168 },
+  "applications": { "x": 460, "y": 168 }
+}
