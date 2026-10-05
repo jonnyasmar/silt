@@ -2,7 +2,8 @@ import AppKit
 import SwiftUI
 
 struct RootView: View {
-    @State private var model = WindowModel()
+    /// The scans the last window left behind (menu-bar mode), or new ones.
+    @State private var model = WindowModel.takeKept() ?? WindowModel()
 
     var body: some View {
         NavigationSplitView {

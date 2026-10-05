@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 @main
 struct SiltApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @AppStorage(MenuBarMode.key) private var menuBar = true
 
     var body: some Scene {
         WindowGroup("Silt", id: "main") {
@@ -16,6 +17,10 @@ struct SiltApp: App {
         .commands { SiltCommands() }
 
         Settings { SettingsView() }
+
+        MenuBarExtra("Silt", systemImage: "water.waves", isInserted: $menuBar) {
+            MenuBarContent()
+        }
     }
 }
 
@@ -63,7 +68,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let item, let action = item.action { NSApp.sendAction(action, to: item.target, from: item) }
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// In menu-bar mode Silt stays when its last window closes.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { !MenuBarMode.isOn }
 
     func applicationWillTerminate(_ notification: Notification) {
         MainActor.assumeIsolated { WindowModel.saveAll() }
@@ -155,11 +161,16 @@ final class WindowModel {
     @ObservationIgnored weak var window: NSWindow? {
         didSet {
             guard window !== oldValue else { return }
-            if window != nil { attach() }
+            if window != nil {
+                if kept { takeBack() } else { attach() }
+            }
             observeWindow()
             updateVisibility()
         }
     }
+    /// The window closed but Silt stayed in the menu bar: this model and its
+    /// scans wait, out of sight, for the next window (`keptModel`).
+    @ObservationIgnored private var kept = false
     @ObservationIgnored private var windowObservers: [NSObjectProtocol] = []
     @ObservationIgnored private var appObservers: [NSObjectProtocol] = []
     @ObservationIgnored private var workspaceObservers: [NSObjectProtocol] = []
@@ -170,6 +181,24 @@ final class WindowModel {
 
     private static var active: [WeakModel] = []
     private static var pendingOpen: [URL] = []
+
+    /// Menu-bar mode: the model of the last window to close, with its scans
+    /// (they park once out of sight), for the next window to take over.
+    private static var keptModel: WindowModel?
+
+    /// The kept model, for a new window's view to use instead of a new one.
+    static func takeKept() -> WindowModel? {
+        defer { keptModel = nil }
+        return keptModel
+    }
+
+    /// The scan the kept model was showing (the menu bar mentions it).
+    static var keptSession: Session? { keptModel?.current }
+
+    /// A main window that's open, if any.
+    static var openWindow: NSWindow? {
+        active.compactMap(\.model).first { $0.window != nil && !$0.windowClosed && !$0.kept }?.window
+    }
 
     /// Every open location, once each (for the performance log).
     static var allSessions: [Session] {
@@ -292,6 +321,7 @@ final class WindowModel {
     /// window isn't minimized, fully covered or on another Space. With no
     /// window yet (or none at all, in tests) it counts as seen.
     private var windowShown: Bool {
+        if kept { return false }
         if NSApp?.isHidden == true { return false }
         guard let window else { return true }
         return window.occlusionState.contains(.visible)
@@ -328,6 +358,11 @@ final class WindowModel {
     /// the main thread first; quitting waits for that.
     private func windowWillClose() {
         guard !windowClosed else { return }
+        if MenuBarMode.isOn, !Self.active.contains(where: { $0.model !== self && $0.model?.window != nil
+                                                        && $0.model?.windowClosed == false && $0.model?.kept == false }) {
+            keep()
+            return
+        }
         windowClosed = true
         parkTimer?.invalidate()
         parkTimer = nil
@@ -341,6 +376,36 @@ final class WindowModel {
         memoryPressure = nil
         // What's on screen is left as it is while the window animates away.
         for s in sessions { s.close(saving: true) }
+    }
+
+    /// The last window closed and Silt stays in the menu bar: its scans stay,
+    /// out of sight from now, so they park after the usual wait and stop
+    /// watching; the next window takes them over (`takeBack`).
+    private func keep() {
+        kept = true
+        Self.keptModel = self
+        let center = NotificationCenter.default
+        for o in windowObservers { center.removeObserver(o) }
+        windowObservers = []
+        let now = ProcessInfo.processInfo.systemUptime
+        for s in sessions {
+            s.flushMarks()
+            if s.hiddenSince == nil { s.hiddenSince = now }
+        }
+        updateVisibility()
+        scheduleParking()
+        // After the window has gone.
+        DispatchQueue.main.async { MainActor.assumeIsolated { MenuBarMode.windowsGone() } }
+    }
+
+    /// A new window took this model over: what it shows wakes up.
+    private func takeBack() {
+        kept = false
+        if Self.keptModel === self { Self.keptModel = nil }
+        current?.hiddenSince = nil
+        current?.wake()
+        MenuBarMode.windowComing()
+        setNeedsSync()
     }
 
     /// At quit: snapshots every live scan in every window, saves marks, waits

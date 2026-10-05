@@ -119,12 +119,37 @@ func tilde(_ path: String) -> String {
 struct SettingsView: View {
     var body: some View {
         TabView {
+            GeneralSettings()
+                .tabItem { Label("General", systemImage: "gearshape") }
             SpeedSettings()
                 .tabItem { Label("Speed", systemImage: "gauge.with.dots.needle.50percent") }
             FolderRulesSettings()
                 .tabItem { Label("Folders", systemImage: "folder") }
         }
         .frame(width: 520)
+    }
+}
+
+private struct GeneralSettings: View {
+    @AppStorage(MenuBarMode.key) private var menuBar = true
+
+    var body: some View {
+        Form {
+            Toggle(isOn: $menuBar) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Keep Silt in the menu bar when its window is closed")
+                    Text("Your scans stay ready: they’re put away to save memory, and catch up on what changed when you open Silt again.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .onChange(of: menuBar) { _, on in
+                // Off with no window left: back in the Dock, so Silt can't end up out of sight.
+                if !on, NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
+            }
+        }
+        .padding(20)
     }
 }
 
