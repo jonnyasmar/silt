@@ -167,7 +167,9 @@ Other features:
   quit, and at most every 30 minutes. Loading streams straight into the tree.
   Reopening the same
   location shows it immediately, then FSEvents replays everything that changed
-  since, so only those folders are re-listed. Removable and network volumes
+  since, so only those folders are re-listed. A replay that drops events (on
+  a busy disk, long ones do) can't be trusted, so Silt stops it and checks
+  everything again in the background instead. Removable and network volumes
   always rescan, and ⇧⌘R forces a fresh scan.
 - **One copy of everything.** A location or folder inside a scan that's
   already open (Home inside Macintosh HD, a project inside `~/dev`) is shown
@@ -179,8 +181,9 @@ Other features:
   `~/Library/Caches/com.jonnyasmar.silt/Parked` exactly as it is and frees
   it: Storage (7.6M items) goes from ~520 MB to ~26 MB, and comes back in
   about half a second when shown again, then catches up on what changed.
-  While parked it doesn't even listen for changes: waking replays them from
-  FSEvents history. Marks, open folders, Reclaim results and duplicates
+  While parked it only notes which folders change (watching a whole disk
+  live costs next to nothing; replaying hours of history doesn't), and waking
+  re-lists just those. Marks, open folders, Reclaim results and duplicates
   survive.
 - Tree chunks and big working buffers come straight from the kernel, so
   memory the engine frees really goes back to the system.

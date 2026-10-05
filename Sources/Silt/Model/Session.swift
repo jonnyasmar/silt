@@ -172,6 +172,8 @@ final class Session: Identifiable {
     /// The stream holds its watcher, so a session dropped without `close()`
     /// would leave it running: `deinit` stops it (hence reachable from there).
     @ObservationIgnored nonisolated(unsafe) private var watcher: FSWatcher?
+    /// Counts streams started, so batches from a replaced one are known.
+    @ObservationIgnored private(set) var watcherGeneration = 0
     @ObservationIgnored nonisolated(unsafe) private var paceObserver: NSObjectProtocol?
     @ObservationIgnored nonisolated(unsafe) private var rulesObserver: NSObjectProtocol?
     /// Per folder: how hot it runs. Each time it changes again soon after
@@ -179,7 +181,14 @@ final class Session: Identifiable {
     @ObservationIgnored private var heat: [UInt32: Int] = [:]
     /// The replay of what changed while Silt wasn't watching has all been
     /// delivered; catching up ends once what it asked for is listed.
-    @ObservationIgnored private var historyDelivered = false
+    @ObservationIgnored private var historyDelivered = false { didSet { replayListed = [:] } }
+    /// While history replays: per folder, the newest event id when it was
+    /// last asked for. Its listing reads the folder as it is now, which takes
+    /// in every change up to then, so older replayed changes to it (a busy
+    /// folder's come by the hundred) need nothing more.
+    @ObservationIgnored private var replayListed: [UInt32: FSEventStreamEventId] = [:]
+    /// Replayed changes that needed nothing more, for tests.
+    @ObservationIgnored private(set) var replaySkips = 0
     /// When catching up (or the running rescan) began, the entries listed
     /// and the CPU used by then, for the performance log.
     @ObservationIgnored private var catchUpStart: (at: TimeInterval, listed: UInt64, cpu: Double)?
@@ -240,8 +249,7 @@ final class Session: Identifiable {
 
     /// When the scan being shown was saved, if it came from a snapshot.
     private(set) var restoredFrom: Date?
-    /// Replaying file-system history since that snapshot (or since the
-    /// location was parked).
+    /// Replaying file-system history since that snapshot.
     private(set) var catchingUp = false {
         didSet { updateActivity() }
     }
@@ -262,9 +270,9 @@ final class Session: Identifiable {
     }
     @ObservationIgnored private let fullDiskAccess: Bool
     /// Whether FSEvents history for this location survives relaunches (see
-    /// `Snapshots.eligible`): it gets snapshots, and parks without a stream.
+    /// `Snapshots.eligible`): it gets snapshots.
     @ObservationIgnored private let keepsHistory: Bool
-    @ObservationIgnored private var lastEventId: FSEventStreamEventId = 0
+    @ObservationIgnored private(set) var lastEventId: FSEventStreamEventId = 0
     /// When the snapshot was last saved (or loaded), in system uptime.
     @ObservationIgnored private var lastSave: TimeInterval = ProcessInfo.processInfo.systemUptime
     @ObservationIgnored private var lastSaveAttempt: TimeInterval = -.infinity
@@ -329,10 +337,10 @@ final class Session: Identifiable {
     @ObservationIgnored fileprivate var parkedOverflow = false
     @ObservationIgnored fileprivate var parkedMaxEventId: FSEventStreamEventId = 0
     @ObservationIgnored fileprivate var parkedSpecial: [FSWatcher.Event] = []
-    /// Parked without its FSEvents stream: waking replays history instead.
-    @ObservationIgnored fileprivate var streamStopped = false
-    @ObservationIgnored fileprivate var parkedAt: Date?
-    @ObservationIgnored fileprivate var parkedDatabase: [UInt8]?
+    /// Folders noted as changed while parked, and whether a stream is
+    /// running, for tests.
+    var parkedChanges: Int { parkedEvents.count }
+    var watching: Bool { watcher != nil }
 
     /// The location or folder this scan is being shown as.
     private(set) var viewPath: String = ""
@@ -1037,22 +1045,27 @@ final class Session: Identifiable {
 
     private func startWatching(since: FSEventStreamEventId?) {
         watcher?.stop()
-        let w = Session.makeWatcher(path: url.path, since: since, session: self)
+        watcherGeneration += 1
+        let w = Session.makeWatcher(path: url.path, since: since, generation: watcherGeneration, session: self)
         watcher = w
         if since == nil { lastEventId = w.startId }
     }
 
-    private static func makeWatcher(path: String, since: FSEventStreamEventId?, session: Session?) -> FSWatcher {
+    private static func makeWatcher(path: String, since: FSEventStreamEventId?, generation: Int,
+                                    session: Session?) -> FSWatcher {
         FSWatcher(path: path, since: since) { [weak session] events in
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { session?.handle(events) }
+                MainActor.assumeIsolated { session?.handle(events, generation: generation) }
             }
         }
     }
 
-    /// Events from the stream (tests feed it directly).
-    func handle(_ events: [FSWatcher.Event]) {
+    /// Events from the stream (tests feed it directly). Batches a replaced
+    /// stream had already sent are dropped: the stream that replaced it
+    /// covers them.
+    func handle(_ events: [FSWatcher.Event], generation: Int? = nil) {
         guard !closed else { return } // one in flight when it closed
+        if let generation, generation != watcherGeneration { return }
         // Parked (or on the way in or out): remember which folders changed,
         // once each, and catch up on waking.
         if residency != .awake {
@@ -1094,14 +1107,30 @@ final class Session: Identifiable {
 
     private func apply(_ events: [FSWatcher.Event], urgent: Bool) {
         guard !events.isEmpty else { return }
-        var targets: [UInt32: (deep: Bool, event: FSEventStreamEventId)] = [:]
+        var targets: [UInt32: (deep: Bool, event: FSEventStreamEventId, latest: FSEventStreamEventId)] = [:]
         let root = url.path
-        var rootEvent: FSEventStreamEventId?, wrapEvent: FSEventStreamEventId?
+        var rootEvent: FSEventStreamEventId?, wrapEvent: FSEventStreamEventId?, dropped = false
         for event in events {
             if event.id > lastEventId && event.id != UInt64(kFSEventStreamEventIdSinceNow) { lastEventId = event.id }
             if event.historyDone { historyDelivered = true } // `tickCatchUp` ends it
             if event.rootChanged, rootEvent == nil { rootEvent = event.id }
             if event.idsWrapped, wrapEvent == nil { wrapEvent = event.id }
+            if event.dropped { dropped = true }
+        }
+        // A replay that dropped events can't be trusted, and on a busy disk
+        // it drops again and again while costing fseventsd a core: the saved
+        // scan is checked again in place instead, as when it's too old to
+        // replay. Watching from now starts first, so nothing changes unseen
+        // behind that check, and the rest of this batch is covered by it.
+        if dropped, catchingUp, !historyDelivered {
+            Perf.log.notice("replay for \(self.title, privacy: .public) dropped events: checking everything instead")
+            startWatching(since: nil)
+            historyDelivered = true
+            catchingUp = false
+            catchUpStart = nil
+            recheckingSince = UInt32(Date().timeIntervalSince1970)
+            startRescan(0, explicit: false, urgent: catchUpUrgent)
+            return
         }
         if let rootEvent {
             // Usually a volume that unmounted and came back: same volume (by
@@ -1132,7 +1161,8 @@ final class Session: Identifiable {
                 if event.rootChanged || event.historyDone { continue }
                 guard let dir = nearestListedDir(for: event.path, root: root) else { continue }
                 let known = targets[dir]
-                targets[dir] = ((known?.deep ?? false) || event.mustScanSubdirs, min(known?.event ?? .max, event.id))
+                targets[dir] = ((known?.deep ?? false) || event.mustScanSubdirs || event.dropped,
+                                min(known?.event ?? .max, event.id), max(known?.latest ?? 0, event.id))
                 sizes[dir] = tree.dir(dir).count
             }
             // Each folder by its own path, once: the folder refreshed is the
@@ -1144,6 +1174,8 @@ final class Session: Identifiable {
             }
         }
         let now = ProcessInfo.processInfo.systemUptime
+        let replaying = catchingUp && !historyDelivered
+        let asked = replaying ? FSEventsGetCurrentEventId() : 0
         for (dir, t) in targets {
             switch ruled[dir] {
             case .excluded:
@@ -1158,7 +1190,10 @@ final class Session: Identifiable {
             }
             if t.deep {
                 requestDeep(dir, event: t.event, urgent: urgent)
+            } else if replaying, let listed = replayListed[dir], t.latest <= listed {
+                replaySkips += 1
             } else {
+                if replaying { replayListed[dir] = asked }
                 refreshPaced(dir, children: sizes[dir] ?? 0, now: now, urgent: urgent, event: t.event, rule: ruled[dir])
             }
         }
@@ -2979,9 +3014,11 @@ extension Session {
 
     /// Writes the tree to a file and frees its memory. Everything that refers
     /// into it (marks, open folders, Reclaim results, duplicates) stays valid:
-    /// it comes back exactly as it was. A parked location has no timer, and
-    /// on a volume whose FSEvents history can be trusted, no stream either:
-    /// waking replays what changed meanwhile.
+    /// it comes back exactly as it was. A parked location has no timer. Its
+    /// stream stays, noting which folders change (once each) for waking to
+    /// list: live, a whole disk's events cost next to nothing, while
+    /// replaying hours of them costs fseventsd a core for minutes and, on a
+    /// busy disk, drops some, which means checking everything again.
     func park() {
         guard canPark else { return }
         flushMarks() // saving them needs the tree
@@ -2995,12 +3032,11 @@ extension Session {
         try? FileManager.default.createDirectory(at: Session.parkDirectory, withIntermediateDirectories: true)
         DispatchQueue.global(qos: .utility).async { [weak self] in
             tree.stopScanner()
-            // A relaunch should still open this instantly. A saved scan that
-            // FSEvents can bring up to date does that as well as a new one
-            // (and will for at least another day), so only save without one.
-            let saved = stale && !Snapshots.replayable(for: url, fullDiskAccess: fda, margin: 86400)
-                && Snapshots.save(tree, url: url, eventId: eventId, fullDiskAccess: fda)
-            let database = history ? FSWatcher.databaseID(for: url.path) : nil
+            // A relaunch should still open this instantly, and catch up on
+            // as little as possible: replaying long stretches of history is
+            // slow, and on a busy disk drops events, which means checking
+            // everything again.
+            let saved = stale && Snapshots.save(tree, url: url, eventId: eventId, fullDiskAccess: fda)
             let parked = tree.park(to: file)
             if !parked { tree.resumeIdle() }
             malloc_zone_pressure_relief(nil, 0)
@@ -3014,7 +3050,6 @@ extension Session {
                     self.residency = parked ? .parked : .awake
                     if parked {
                         self.duplicates.dropCache()
-                        if let database { self.stopWatchingWhileParked(database: database) }
                     } else {
                         self.releaseParkedEvents(urgent: false) // it stayed; catch up now
                         if self.rulesPending { self.rulesChanged() }
@@ -3029,36 +3064,6 @@ extension Session {
         }
     }
 
-    /// Parked on a volume whose history FSEvents keeps: the stream can go,
-    /// since waking replays everything after `lastEventId`.
-    private func stopWatchingWhileParked(database: [UInt8]) {
-        watcher?.stop()
-        watcher = nil
-        streamStopped = true
-        parkedAt = Date()
-        parkedDatabase = database
-        // The replay brings back whatever arrived while parking.
-        parkedEvents = [:]
-        parkedSpecial = []
-        parkedOverflow = false
-        parkedMaxEventId = 0
-    }
-
-    /// What a location's root is right now: which folder, on which volume,
-    /// and which FSEvents history its event ids belong to.
-    fileprivate struct RootIdentity: Sendable {
-        let inode: UInt64
-        let volume: String?
-        let database: [UInt8]?
-
-        init(_ url: URL) {
-            var st = stat()
-            inode = lstat(url.path, &st) == 0 ? st.st_ino : 0
-            volume = Session.volumeUUID(url)
-            database = FSWatcher.databaseID(for: url.path)
-        }
-    }
-
     /// Brings a parked tree back, then catches up on what changed meanwhile.
     func wake() {
         switch residency {
@@ -3068,12 +3073,11 @@ extension Session {
             wakeWhenParked = true
         case .parked:
             residency = .waking
-            let tree = tree, file = parkFile, url = url, replay = streamStopped
+            let tree = tree, file = parkFile
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let ok = tree.unpark(from: file)
                 if ok { tree.resumeIdle() }
                 try? FileManager.default.removeItem(atPath: file)
-                let root = replay ? RootIdentity(url) : nil
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
                         guard let self, !self.closed else { return }
@@ -3086,7 +3090,6 @@ extension Session {
                         let now = ProcessInfo.processInfo.systemUptime
                         self.residency = .awake
                         self.lastGeneration = .max // everything showing it should look again
-                        if let root { self.resumeWatching(root) }
                         if self.rulesPending { self.rulesChanged() }
                         // It's being woken to be shown. Catching up runs at the
                         // speed setting's pace; what's opened comes first
@@ -3105,37 +3108,6 @@ extension Session {
         }
     }
 
-    /// Restarts the stream a parked location went without, replaying what
-    /// changed meanwhile. A root that was replaced (a replay may not show
-    /// it), a different FSEvents history, or longer parked than a snapshot
-    /// may be old mean no replay can be trusted: everything is checked
-    /// again instead.
-    private func resumeWatching(_ root: RootIdentity) {
-        guard streamStopped else { return }
-        streamStopped = false
-        let away = parkedAt.map { Date().timeIntervalSince($0) } ?? .infinity
-        let sameRoot = root.inode != 0 && root.inode == rootInode && rootVolume != nil && root.volume == rootVolume
-        let sameHistory = root.database != nil && root.database == parkedDatabase
-        parkedAt = nil
-        parkedDatabase = nil
-        if sameRoot, sameHistory, away < Snapshots.maxAge {
-            startWatching(since: lastEventId)
-            if watcher?.running == true {
-                catchingUp = true
-                historyDelivered = false
-                catchUpStart = (ProcessInfo.processInfo.systemUptime, tree.progress.listed, Perf.processCPU())
-                holdBusyActivity(true)
-                return
-            }
-        }
-        if !sameRoot, root.inode != 0, root.volume != nil {
-            rootInode = root.inode
-            rootVolume = root.volume
-        }
-        startWatching(since: nil)
-        startRescan(0, explicit: false, urgent: catchUpUrgent)
-    }
-
     private func releaseParkedEvents(urgent: Bool) {
         let events = Array(parkedEvents.values)
         let special = parkedSpecial
@@ -3143,9 +3115,11 @@ extension Session {
         parkedEvents = [:]
         parkedSpecial = []
         parkedOverflow = false
+        // Before a remount restarts the stream from it.
+        lastEventId = max(lastEventId, parkedMaxEventId)
+        parkedMaxEventId = 0
         if !special.isEmpty { apply(special, urgent: urgent) } // remounts: reattach the stream first
         if overflow {
-            lastEventId = max(lastEventId, parkedMaxEventId)
             startRescan(0, explicit: false, urgent: urgent)
         } else if !events.isEmpty {
             apply(events, urgent: urgent)

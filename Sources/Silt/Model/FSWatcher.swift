@@ -20,6 +20,11 @@ final class FSWatcher {
         var historyDone: Bool { flags & UInt32(kFSEventStreamEventFlagHistoryDone) != 0 }
         /// Ids wrapped: continuity with any saved id is lost.
         var idsWrapped: Bool { flags & UInt32(kFSEventStreamEventFlagEventIdsWrapped) != 0 }
+        /// Events were lost (this process fell behind, or the kernel did):
+        /// what changed meanwhile is unknown.
+        var dropped: Bool {
+            flags & UInt32(kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped) != 0
+        }
     }
 
     private var stream: FSEventStreamRef?
@@ -80,11 +85,6 @@ final class FSWatcher {
         FSEventStreamStop(stream)
         FSEventStreamInvalidate(stream)
         FSEventStreamRelease(stream) // may release the last reference to self
-    }
-
-    /// `databaseUUID` as bytes, for comparing.
-    static func databaseID(for path: String) -> [UInt8]? {
-        databaseUUID(for: path).map { uuid in withUnsafeBytes(of: uuid) { Array($0) } }
     }
 
     /// Identifies the FSEvents database that event ids for `path` belong to.

@@ -1,3 +1,4 @@
+import CoreServices
 import Foundation
 import SiltCore
 import Testing
@@ -33,9 +34,17 @@ import Testing
     #expect(await wait { s.residency == .parked })
     #expect(await MainActor.run { silt_tree_is_parked(s.tree.raw) })
 
-    // Changes while parked are remembered, not lost.
-    try Data(repeating: 2, count: 300_000).write(to: root.appendingPathComponent("p2/new.bin"))
-    await settle(1.5) // FSEvents latency
+    // Changes while parked are remembered, not lost: the stream stays, and
+    // notes the folder. (Fed directly too: under load, FSEvents can take
+    // tens of seconds to deliver.)
+    let new = root.appendingPathComponent("p2/new.bin")
+    try Data(repeating: 2, count: 300_000).write(to: new)
+    let noted = await MainActor.run {
+        s.handle([FSWatcher.Event(path: new.deletingLastPathComponent().path + "/", flags: 0,
+                                  id: FSEventsGetCurrentEventId())])
+        return s.watching && s.parkedChanges > 0
+    }
+    #expect(noted)
     #expect(await MainActor.run { s.stats.bytes } == bytes) // nothing moves while parked
 
     await MainActor.run { s.wake() }

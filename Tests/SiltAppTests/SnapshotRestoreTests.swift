@@ -95,6 +95,69 @@ private func finish(_ s: Session) async {
     await finish(s)
 }
 
+/// Replayed history names a busy folder over and over. Listing it reads it
+/// as it is now, so changes older than that listing need nothing more; a
+/// newer one lists it again.
+@Test func replayListsAFolderOnceForEverythingOlder() async throws {
+    let saved = try await Saved()
+    defer { saved.cleanUp() }
+    #expect(await MainActor.run { saved.save(age: 60) })
+
+    // In the same turn as the restore, before the real replay is delivered.
+    let (s, replaying, skips): (Session, Bool, [Int]) = await MainActor.run {
+        let s = Session(url: saved.root, guardPrivateFolders: true)
+        let path = saved.url("p1").path + "/"
+        let replaying = s.catchingUp
+        var skips: [Int] = []
+        s.handle([FSWatcher.Event(path: path, flags: 0, id: 1)]) // listed
+        skips.append(s.replaySkips)
+        s.handle([FSWatcher.Event(path: path, flags: 0, id: 2)]) // older than that listing
+        skips.append(s.replaySkips)
+        s.handle([FSWatcher.Event(path: path, flags: 0, id: FSEventsGetCurrentEventId() + 1)]) // newer
+        skips.append(s.replaySkips)
+        return (s, replaying, skips)
+    }
+    #expect(replaying)
+    #expect(skips == [0, 1, 1])
+    #expect(await wait { !s.catchingUp })
+    await finish(s)
+}
+
+/// A replay that drops events can't be trusted: the saved scan is checked
+/// again in place instead, which finds what no replay would bring back.
+/// More drops the old stream had already sent change nothing.
+@Test func replayThatDropsEventsChecksEverythingInstead() async throws {
+    let saved = try await Saved()
+    defer { saved.cleanUp() }
+    // Lands before the id the snapshot is current as of: only a check of
+    // everything finds it.
+    let missed = saved.url("p1/missed.bin")
+    try Data(repeating: 3, count: 50_000).write(to: missed)
+    await settle(1.5)
+    #expect(await MainActor.run { saved.save(age: 60) })
+
+    let (s, replaying, rechecking, live, deferred): (Session, Bool, Bool, Bool, Int) = await MainActor.run {
+        let s = Session(url: saved.root, guardPrivateFolders: true)
+        let replaying = s.catchingUp
+        let now = FSEventsGetCurrentEventId(), old = s.watcherGeneration
+        let drop = FSWatcher.Event(path: saved.root.path + "/", flags: UInt32(kFSEventStreamEventFlagUserDropped), id: 0)
+        s.handle([drop], generation: old)
+        let rechecking = !s.catchingUp && s.recheckingSince != nil && s.rescanState != nil
+        // The replay is dropped for a stream from now, and what the old one
+        // already sent is ignored.
+        let live = s.lastEventId >= now && s.watcherGeneration != old
+        s.handle([drop], generation: old)
+        return (s, replaying, rechecking, live, s.deferredDeepChecks)
+    }
+    #expect(replaying)
+    #expect(rechecking)
+    #expect(live)
+    #expect(deferred == 0)
+    #expect(await wait { s.recheckingSince == nil })
+    #expect(await wait { s.tree.withLock { s.tree.lookup(missed.path) } != NONE })
+    await finish(s)
+}
+
 @Test func tooOldSnapshotIsShownWhileEverythingIsReadAgain() async throws {
     let saved = try await Saved()
     defer { saved.cleanUp() }
