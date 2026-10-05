@@ -1233,9 +1233,23 @@ final class Session: Identifiable {
         protectedIdentities.contains(identity) || protectedPaths.contains(path)
     }
 
-    private func targets(_ refs: [ItemRef]) -> (ok: [Target], refused: [String]) {
+    /// True for a mount point (or a firmlinked system folder): it's on a
+    /// different volume from the folder holding it. Deleting one would empty
+    /// the volume mounted there, so it's never a target. If its folder can't
+    /// be read, it's treated as one.
+    nonisolated static func isVolumeRoot(_ path: String) -> Bool {
+        var st = stat()
+        var up = stat()
+        guard lstat(path, &st) == 0 else { return false }
+        guard stat((path as NSString).deletingLastPathComponent, &up) == 0 else { return true }
+        return st.st_dev != up.st_dev
+    }
+
+    enum Refusal { case protected, volume }
+
+    private func targets(_ refs: [ItemRef]) -> (ok: [Target], refused: [(name: String, why: Refusal)]) {
         var ok: [Target] = []
-        var refused: [String] = []
+        var refused: [(name: String, why: Refusal)] = []
         var resolved: [(UInt32, String, Int64)] = []
         tree.withLock {
             for ref in refs {
@@ -1247,7 +1261,11 @@ final class Session: Identifiable {
         for (i, path, size) in resolved {
             guard let identity = Identity(path: path) else { continue }
             if Self.isProtected(path, identity) {
-                refused.append((path as NSString).lastPathComponent)
+                refused.append(((path as NSString).lastPathComponent, .protected))
+                continue
+            }
+            if Self.isVolumeRoot(path) {
+                refused.append(((path as NSString).lastPathComponent, .volume))
                 continue
             }
             ok.append(Target(entry: i, url: URL(fileURLWithPath: path), size: size, identity: identity))
@@ -1271,18 +1289,19 @@ final class Session: Identifiable {
         recycle(all.filter(\.unchanged))
     }
 
-    private func recycle(_ items: [Target]) {
+    /// `note`: what was left out of `items`, for the result's toast.
+    private func recycle(_ items: [Target], note: String? = nil) {
         guard !items.isEmpty else { return }
         NSWorkspace.shared.recycle(items.map(\.url)) { [weak self] trashed, error in
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
-                    self?.finishTrash(items, trashed: trashed, error: error)
+                    self?.finishTrash(items, trashed: trashed, error: error, note: note)
                 }
             }
         }
     }
 
-    private func finishTrash(_ items: [Target], trashed: [URL: URL], error: Error?) {
+    private func finishTrash(_ items: [Target], trashed: [URL: URL], error: Error?, note: String?) {
         let done = items.filter { trashed[$0.url] != nil }
         for t in done { tree.remove(entry: t.entry) }
         refreshParents(of: items)
@@ -1293,15 +1312,21 @@ final class Session: Identifiable {
         }
         let bytes = done.reduce(Int64(0)) { $0 + $1.size }
         trashedBytes += bytes
-        if done.isEmpty, let error {
-            show(Toast(symbol: "exclamationmark.triangle", title: "Couldn’t move to Trash", detail: error.localizedDescription))
+        if done.isEmpty {
+            let why = error?.localizedDescription ?? "macOS didn’t say why."
+            show(Toast(symbol: "exclamationmark.triangle", title: "Couldn’t move to Trash",
+                       detail: [why, note].compactMap { $0 }.joined(separator: " ")), seconds: note == nil ? 4 : 8)
         } else {
             let what = done.count == 1 ? done[0].url.lastPathComponent : "\(done.count) items"
             let moves = done.compactMap { t in trashed[t.url].map { (from: $0, to: t.url) } }
             for t in done { if let u = trashed[t.url] { inTrash.append((u, t.size)) } }
             recountTrash()
-            show(Toast(symbol: "trash", title: "Moved \(what) to the Trash",
-                       detail: "\(Fmt.bytes(bytes)) comes back when you empty the Trash",
+            let failed = items.count - done.count
+            let failure = failed == 0 ? nil
+                : "\(failed) couldn’t be moved" + (error.map { ": \($0.localizedDescription)" } ?? ".")
+            show(Toast(symbol: failed == 0 ? "trash" : "exclamationmark.triangle", title: "Moved \(what) to the Trash",
+                       detail: (["\(Fmt.bytes(bytes)) comes back when you empty the Trash."] + [failure, note].compactMap { $0 })
+                           .joined(separator: " "),
                        action: ("Undo", { [weak self] in self?.putBack(moves, bytes: bytes) })), seconds: 8)
         }
     }
@@ -1405,7 +1430,8 @@ final class Session: Identifiable {
         if let window { alert.beginSheetModal(for: window, completionHandler: run) } else { run(alert.runModal()) }
     }
 
-    private func performDelete(_ confirmed: [Target]) {
+    /// `note`: what was left out of `confirmed`, for the result's toast.
+    private func performDelete(_ confirmed: [Target], note: String? = nil) {
         // The sheet may have been open a while: only delete what is still the
         // very object the user confirmed.
         let items = confirmed.filter(\.unchanged)
@@ -1434,10 +1460,15 @@ final class Session: Identifiable {
                 self.refreshParents(of: items)
                 self.checkCapacity(now: ProcessInfo.processInfo.systemUptime, exact: true)
                 if let first = failed.first {
-                    self.show(Toast(symbol: "exclamationmark.triangle",
-                                    title: "Couldn’t delete \(first.key.lastPathComponent)", detail: first.value))
+                    let title = failed.count == 1 ? "Couldn’t delete \(first.key.lastPathComponent)"
+                        : "Couldn’t delete \(failed.count) of \(items.count) items"
+                    let freed = done.isEmpty ? nil : "Freed \(Fmt.bytes(bytes))."
+                    let why = failed.count == 1 ? first.value : "\(first.key.lastPathComponent): \(first.value)"
+                    self.show(Toast(symbol: "exclamationmark.triangle", title: title,
+                                    detail: [freed, why, note].compactMap { $0 }.joined(separator: " ")), seconds: 8)
                 } else {
-                    self.show(Toast(symbol: "checkmark.circle", title: "Freed \(Fmt.bytes(bytes))", detail: nil))
+                    self.show(Toast(symbol: "checkmark.circle", title: "Freed \(Fmt.bytes(bytes))", detail: note),
+                              seconds: note == nil ? 4 : 8)
                 }
             }
         }
@@ -1449,9 +1480,15 @@ final class Session: Identifiable {
     /// untouched. Returns a problem description, or nil on success.
     nonisolated private static func quarantineAndDelete(_ t: Target) -> String? {
         let path = t.url.path
+        let volume = "It’s another volume mounted there, so it was left alone."
+        guard !isVolumeRoot(path) else { return volume }
         let parked = t.url.deletingLastPathComponent()
             .appendingPathComponent(".silt-deleting-\(UUID().uuidString)").path
         guard rename(path, parked) == 0 else { return String(cString: strerror(errno)) }
+        guard !isVolumeRoot(parked) else {
+            _ = renamex_np(parked, path, UInt32(RENAME_EXCL))
+            return volume
+        }
         guard Identity(path: parked) == t.identity else {
             _ = renamex_np(parked, path, UInt32(RENAME_EXCL))
             return "It changed on disk after you confirmed, so it was left alone."
@@ -1477,9 +1514,14 @@ final class Session: Identifiable {
         rearm()
     }
 
-    private func refuse(_ names: [String]) {
-        show(Toast(symbol: "hand.raised", title: "Silt won’t delete \(names.joined(separator: ", "))",
-                   detail: "It’s a system or home folder location."))
+    private func refuse(_ refused: [(name: String, why: Refusal)]) {
+        let detail = refused.allSatisfy({ $0.why == .volume })
+            ? "It’s another volume mounted there. Eject it instead."
+            : refused.allSatisfy({ $0.why == .protected })
+            ? "It’s a system or home folder location."
+            : "They’re system or home folder locations, or other volumes."
+        show(Toast(symbol: "hand.raised",
+                   title: "Silt won’t delete \(refused.map(\.name).joined(separator: ", "))", detail: detail))
     }
 
     func show(_ toast: Toast, seconds: Double = 4) {
@@ -1783,6 +1825,30 @@ extension Session {
         var reason: String
         var dev: Int32
         var ino: UInt64
+        /// Set for a duplicate copy: cleanup holds it to the file that was
+        /// compared and removes it only while another copy survives.
+        var copy: CopyCheck? = nil
+    }
+
+    /// A duplicate copy as it was compared, and the other copies of its
+    /// contents as they were then.
+    struct CopyCheck {
+        struct Other {
+            let path: String
+            let stamp: FileStamp
+        }
+        let stamp: FileStamp
+        let others: [Other]
+
+        init(_ c: DuplicateSet.Copy, in set: DuplicateSet) {
+            stamp = c.stamp
+            others = set.copies.filter { $0.path != c.path }.map { Other(path: $0.path, stamp: $0.stamp) }
+        }
+
+        init(stamp: FileStamp, others: [Other]) {
+            self.stamp = stamp
+            self.others = others
+        }
     }
 
     /// Identity of what each ref is right now, for new marks.
@@ -1828,10 +1894,13 @@ extension Session {
         mark(tree.withLock { entries.filter { tree.isLive($0) }.map { ref(forEntry: $0) } }, reason: reason)
     }
 
-    /// Marks duplicate copies by the identity they were checked against
-    /// (`DuplicateFinder.extraCopies`), without looking each up on disk again.
-    func mark(copies: [DuplicateSet.Copy], reason: String) {
+    /// Marks duplicate copies of `sets` by the identity they were checked
+    /// against (`DuplicateFinder.extraCopies`), without looking each up on
+    /// disk again.
+    func mark(copies: [DuplicateSet.Copy], of sets: [DuplicateSet], reason: String) {
         guard isAwake, !copies.isEmpty else { return }
+        var setOf: [String: DuplicateSet] = [:]
+        for s in sets { for c in s.copies { setOf[c.path] = s } }
         let found: [(MarkKey, DuplicateSet.Copy)] = tree.withLock {
             copies.compactMap { c in
                 let i = tree.lookup(c.path)
@@ -1840,9 +1909,26 @@ extension Session {
             }
         }
         for (k, c) in found where marks[k] == nil {
-            marks[k] = MarkInfo(reason: reason, dev: c.stamp.dev, ino: c.stamp.ino)
+            guard let set = setOf[c.path] else { continue }
+            marks[k] = MarkInfo(reason: reason, dev: c.stamp.dev, ino: c.stamp.ino, copy: CopyCheck(c, in: set))
         }
         marksChanged()
+    }
+
+    /// Marks or unmarks one copy of `set`. A copy that changed since the
+    /// search isn't marked. Returns false if it wasn't marked for that reason.
+    @discardableResult
+    func toggleMark(copy c: DuplicateSet.Copy, of set: DuplicateSet, reason: String) -> Bool {
+        guard isAwake, let ref = liveRef(path: c.path),
+              let k = tree.withLock({ markKey(for: ref) }) else { return true }
+        if marks[k] != nil {
+            marks.removeValue(forKey: k)
+        } else {
+            guard FileStamp(path: c.path) == c.stamp else { return false }
+            marks[k] = MarkInfo(reason: reason, dev: c.stamp.dev, ino: c.stamp.ino, copy: CopyCheck(c, in: set))
+        }
+        marksChanged()
+        return true
     }
 
     func unmark(_ keys: [MarkKey]) {
@@ -1968,28 +2054,74 @@ extension Session {
     func cleanUp(_ method: CleanupMethod) {
         let items = markedItems()
         // The object each mark was made on, to hold every target to.
-        var expected: [String: (dev: Int32, ino: UInt64)] = [:]
+        var expected: [String: MarkInfo] = [:]
         for item in items {
-            if let m = marks[item.key] { expected[item.path] = (m.dev, m.ino) }
+            if let m = marks[item.key] { expected[item.path] = m }
         }
         let refs = tree.withLock { items.map { ref(forEntry: $0.entry) } }
         marks = [:]
         marksChanged()
         let (all, refused) = targets(refs)
-        if !refused.isEmpty { refuse(refused) }
-        let ok = all.filter { t in
-            guard let e = expected[t.url.path] else { return false }
-            return e.dev == t.identity.dev && e.ino == t.identity.ino && t.unchanged
+        var ok = all.filter { t in
+            guard let e = expected[t.url.path], e.dev == t.identity.dev, e.ino == t.identity.ino, t.unchanged
+            else { return false }
+            // A duplicate must still be exactly the file that was compared.
+            return e.copy.map { FileStamp(path: t.url.path) == $0.stamp } ?? true
         }
-        if ok.count < all.count {
-            show(Toast(symbol: "exclamationmark.triangle",
-                       title: "\(all.count - ok.count) \(all.count - ok.count == 1 ? "item" : "items") changed since marked",
-                       detail: "They were left alone."))
+        let changed = all.count - ok.count
+        let kept = Self.keepLastCopies(&ok) { expected[$0.url.path]?.copy }
+        // One summary at the end: a toast now would be replaced by the result.
+        var notes: [String] = []
+        if !refused.isEmpty {
+            notes.append("Silt won’t delete \(refused.map(\.name).joined(separator: ", ")): "
+                + (refused.allSatisfy({ $0.why == .volume }) ? "another volume is mounted there."
+                    : "it’s a system or home folder location, or another volume."))
+        }
+        if changed > 0 {
+            notes.append(changed == 1 ? "1 item changed since it was marked and was left alone."
+                                      : "\(changed) items changed since they were marked and were left alone.")
+        }
+        if kept > 0 {
+            notes.append(kept == 1 ? "1 copy was kept: it’s the last of its contents."
+                                   : "\(kept) copies were kept: they’re the last of their contents.")
+        }
+        let note = notes.isEmpty ? nil : notes.joined(separator: " ")
+        if ok.isEmpty {
+            if let note { show(Toast(symbol: "exclamationmark.triangle", title: "Nothing was removed", detail: note)) }
+            return
         }
         switch method {
-        case .trash: recycle(ok)
-        case .delete: performDelete(ok)
+        case .trash: recycle(ok, note: note)
+        case .delete: performDelete(ok, note: note)
         }
+    }
+
+    /// Drops from `targets` any duplicate copy whose contents would leave
+    /// with it: each one goes only while another copy stays, unchanged since
+    /// the search and not inside anything else going. Copies are taken in
+    /// order, so of copies marked together, one is kept. Returns how many
+    /// were kept. Reads the disk.
+    fileprivate static func keepLastCopies(_ targets: inout [Target], check: (Target) -> CopyCheck?) -> Int {
+        var going = Set(targets.map(\.url.path))
+        func isGoing(_ path: String) -> Bool {
+            var p = path
+            while p.count > 1 {
+                if going.contains(p) { return true }
+                p = (p as NSString).deletingLastPathComponent
+            }
+            return false
+        }
+        var kept = 0
+        targets = targets.filter { t in
+            guard let c = check(t) else { return true }
+            let survivor = c.others.contains { !isGoing($0.path) && FileStamp(path: $0.path) == $0.stamp }
+            if !survivor {
+                going.remove(t.url.path)
+                kept += 1
+            }
+            return survivor
+        }
+        return kept
     }
 
     // MARK: Persisted marks
@@ -2018,7 +2150,13 @@ extension Session {
         let entries: [[String: Any]] = tree.withLock {
             marks.compactMap { key, info in
                 guard let i = resolveCached(key) else { return nil }
-                return ["path": tree.path(of: i), "reason": info.reason, "dev": Int(info.dev), "ino": Int(info.ino)]
+                var m: [String: Any] = ["path": tree.path(of: i), "reason": info.reason,
+                                        "dev": Int(info.dev), "ino": Int(info.ino)]
+                if let c = info.copy {
+                    m["stamp"] = c.stamp.saved
+                    m["others"] = c.others.map { ["path": $0.path, "stamp": $0.stamp.saved] }
+                }
+                return m
             }
         }
         UserDefaults.standard.set(entries, forKey: marksDefaultsKey)
@@ -2037,7 +2175,17 @@ extension Session {
             var st = stat()
             guard lstat(path, &st) == 0, Int(st.st_dev) == dev, Int(st.st_ino) == ino,
                   let key = tree.withLock({ markKey(for: ref) }) else { continue }
-            marks[key] = MarkInfo(reason: m["reason"] as? String ?? "", dev: st.st_dev, ino: st.st_ino)
+            var copy: CopyCheck?
+            if m["stamp"] != nil {
+                // A duplicate whose check can't be read back can't be held to it.
+                guard let stamp = FileStamp(saved: m["stamp"]),
+                      let others = (m["others"] as? [[String: Any]])?.map({ o -> CopyCheck.Other? in
+                          guard let p = o["path"] as? String, let s = FileStamp(saved: o["stamp"]) else { return nil }
+                          return CopyCheck.Other(path: p, stamp: s)
+                      }), !others.contains(where: { $0 == nil }) else { continue }
+                copy = CopyCheck(stamp: stamp, others: others.compactMap { $0 })
+            }
+            marks[key] = MarkInfo(reason: m["reason"] as? String ?? "", dev: st.st_dev, ino: st.st_ino, copy: copy)
         }
         recomputeMarks()
         notifyListeners()
@@ -2495,5 +2643,25 @@ extension Session {
                 if let d = dirID(forPath: focusPath) { viewFocus[view] = d }
             }
         }
+    }
+}
+
+/// A stamp as saved with a duplicate's mark.
+extension FileStamp {
+    fileprivate var saved: [String: Int] {
+        ["dev": Int(dev), "ino": Int(truncatingIfNeeded: ino), "size": Int(size), "alloc": Int(alloc),
+         "ms": mtime.tv_sec, "mns": mtime.tv_nsec, "cs": ctime.tv_sec, "cns": ctime.tv_nsec]
+    }
+
+    fileprivate init?(saved: Any?) {
+        guard let d = saved as? [String: Int], let dev = d["dev"], let ino = d["ino"], let size = d["size"],
+              let alloc = d["alloc"], let ms = d["ms"], let mns = d["mns"], let cs = d["cs"], let cns = d["cns"]
+        else { return nil }
+        self.dev = Int32(truncatingIfNeeded: dev)
+        self.ino = UInt64(truncatingIfNeeded: ino)
+        self.size = Int64(size)
+        self.alloc = Int64(alloc)
+        mtime = timespec(tv_sec: ms, tv_nsec: mns)
+        ctime = timespec(tv_sec: cs, tv_nsec: cns)
     }
 }

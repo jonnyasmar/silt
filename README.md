@@ -47,7 +47,8 @@ Other features:
   lets you choose between Trash and deleting now. Only Trash is on the Return
   key. A mark remembers the exact file it was made on: if that file is
   replaced by another with the same name, the mark is dropped, not carried
-  over. Marks survive a relaunch.
+  over. Marks survive a relaunch. Silt never deletes system or home folder
+  locations, or a volume mounted inside the scan.
 - **Undo and follow-through.** "Moved to the Trash" toasts have Undo, which
   puts everything back. The status bar remembers what's still waiting in the
   Trash and offers to empty it.
@@ -63,7 +64,9 @@ Other features:
   sampled hash, then a full SHA-256, and skips dependency and build folders
   unless you ask. Results stream in, largest first. APFS clones already share
   their blocks, so they aren't counted as waste. Before anything is marked,
-  every copy is re-checked against the exact file that was compared.
+  every copy is re-checked against the exact file that was compared. Cleanup
+  never removes the last copy: a marked copy goes only while another copy
+  stays, unchanged since the search, and a copy edited since is left alone.
 - **Reclaim** finds known caches, build output (node_modules, Rust target
   folders wherever they live, SwiftPM `.build`, DerivedData…), orphaned build
   output whose project is gone, installers, model weights, and large files

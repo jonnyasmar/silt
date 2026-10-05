@@ -152,6 +152,10 @@ final class TreeController: NSObject, NSOutlineViewDataSource, NSOutlineViewDele
 
     func teardown() {
         if !source.isList { session.treeStates[root.dir] = captureState() }
+        // What this tree selected goes with it, so ⌘⌫ can't act on rows nobody
+        // can see (the Files tree brings its selection back when it returns).
+        // A tree that replaced this one may have selected already: leave that.
+        if session.selection == selectedNodes().filter(\.isReal).map(\.ref) { session.selection = [] }
         session.removeListener(self)
         resortTimer?.invalidate()
         resortTimer = nil

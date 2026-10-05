@@ -168,14 +168,14 @@ struct DuplicatesView: View {
             let (copies, changed) = await Task.detached(priority: .userInitiated) {
                 DuplicateFinder.extraCopies(of: sets, rule: rule)
             }.value
-            finishMarking(copies: copies, changed: changed, announce: announce)
+            finishMarking(copies: copies, of: sets, changed: changed, announce: announce)
         }
     }
 
     /// Marks by the identity each copy was just checked against, so nothing
     /// is looked up on disk again here.
-    private func finishMarking(copies: [DuplicateSet.Copy], changed: Int, announce: Bool) {
-        session.mark(copies: copies, reason: "Duplicate")
+    private func finishMarking(copies: [DuplicateSet.Copy], of sets: [DuplicateSet], changed: Int, announce: Bool) {
+        session.mark(copies: copies, of: sets, reason: "Duplicate")
         if changed > 0 {
             session.show(Toast(symbol: "exclamationmark.triangle",
                                title: "\(changed) \(changed == 1 ? "copy" : "copies") changed since the search",
@@ -318,7 +318,7 @@ private struct SetCard: View {
                 Divider().padding(.horizontal, 12)
                 VStack(spacing: 0) {
                     ForEach(group.copies) { copy in
-                        CopyRow(session: session, copy: copy, keep: copy.path == keeper?.path,
+                        CopyRow(session: session, set: group, copy: copy, keep: copy.path == keeper?.path,
                                 cloneOfKeeper: copy.path != keeper?.path && copy.family == keeper?.family,
                                 marked: marked.contains(copy.path))
                     }
@@ -348,6 +348,7 @@ private struct SetCard: View {
 
 private struct CopyRow: View {
     let session: Session
+    let set: DuplicateSet
     let copy: DuplicateSet.Copy
     let keep: Bool
     let cloneOfKeeper: Bool
@@ -357,10 +358,12 @@ private struct CopyRow: View {
     var body: some View {
         HStack(spacing: 10) {
             Group {
-                if keep {
-                    Text("Keep").foregroundStyle(.green)
-                } else if marked {
+                // Marked comes first: a copy marked under another keep rule
+                // is still going, whatever this rule would keep.
+                if marked {
                     Text("Cleanup").foregroundStyle(Brand.color)
+                } else if keep {
+                    Text("Keep").foregroundStyle(.green)
                 } else if cloneOfKeeper {
                     Text("Clone").foregroundStyle(.secondary)
                         .help("Shares its blocks with the kept copy: removing it frees almost nothing")
@@ -387,12 +390,15 @@ private struct CopyRow: View {
                 } label: { Image(systemName: "arrow.up.right.square") }
                     .help("Show in Finder")
                 Button {
-                    if let ref = session.liveRef(path: copy.path) { session.toggleMarks([ref], reason: "Duplicate") }
+                    if !session.toggleMark(copy: copy, of: set, reason: "Duplicate") {
+                        session.show(Toast(symbol: "exclamationmark.triangle", title: "This copy changed since the search",
+                                           detail: "It wasn’t marked. Search again to compare it fresh."))
+                    }
                 } label: {
                     Image(systemName: marked ? "minus.circle" : "checklist")
                 }
                 .help(marked ? "Remove from Cleanup" : "Mark for Cleanup")
-                .disabled(keep)
+                .disabled(keep && !marked)
             }
             .buttonStyle(.borderless)
             .opacity(hovering ? 1 : 0)

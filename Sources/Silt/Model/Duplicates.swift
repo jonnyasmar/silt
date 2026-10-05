@@ -323,7 +323,7 @@ final class DuplicateFinder {
     }
 
     /// `extras`, as the copies themselves. Each was just checked on disk
-    /// against its stamp, so `Session.mark(copies:reason:)` can take the
+    /// against its stamp, so `Session.mark(copies:of:reason:)` can take the
     /// identity from it instead of looking again. Reads the disk: call it
     /// off the main thread.
     nonisolated static func extraCopies(of sets: [DuplicateSet], rule: KeepRule) -> (copies: [DuplicateSet.Copy], changed: Int) {
