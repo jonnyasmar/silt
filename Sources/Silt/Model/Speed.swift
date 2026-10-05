@@ -111,8 +111,8 @@ struct Pace: Equatable {
 }
 
 enum SpeedPolicy {
-    /// The pace `mode` means right now. Measured on a 1.2M-item folder
-    /// (claudedocs/speed-plan-2026-10-05.md): full speed took 7–9 s for 21 s
+    /// The pace `mode` means right now. Measured with silt-bench
+    /// (`SILT_PACE`) on a 1.2M-item folder: full speed took 7–9 s for 21 s
     /// of CPU; utility QoS four at a time 19 s for 16–18 s, under one core on
     /// average; background QoS four at a time 18–61 s, depending on how busy
     /// the efficiency cores were.
