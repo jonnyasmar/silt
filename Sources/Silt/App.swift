@@ -31,10 +31,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = false
+        // Launched with a folder argument (`Silt ~/dev`), SwiftUI makes no
+        // first window, though the launch still counts as a default one.
+        DispatchQueue.main.async { Self.ensureWindow() }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls { WindowModel.open(url) }
+        // A drop on the Dock icon can be what launched Silt: the window it
+        // gets picks the folders up from the pending list.
+        DispatchQueue.main.async { Self.ensureWindow() }
+    }
+
+    private static var askedForWindow = false
+
+    /// Opens a window if there's none, once: the scan it starts with comes
+    /// from the pending list or the launch argument (`WindowModel.init`).
+    private static func ensureWindow() {
+        guard !askedForWindow, !NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeMain }) else { return }
+        askedForWindow = true
+        // SwiftUI's own File ▸ New Window, found by its shortcut (titles are
+        // localized).
+        let item = NSApp.mainMenu?.items.lazy.compactMap(\.submenu).flatMap(\.items).first {
+            $0.keyEquivalent == "n" && $0.keyEquivalentModifierMask == .command
+        }
+        if let item, let action = item.action { NSApp.sendAction(action, to: item.target, from: item) }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
