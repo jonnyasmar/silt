@@ -961,12 +961,16 @@ extension Fixture {
     }
     holder.start()
     locked.wait()
-    DispatchQueue.global().async {
+    // Its own thread, not a pool's: on a loaded 3-core CI runner a queued
+    // block can wait seconds just to start. A progress read that waited for
+    // the lock would never answer, so the timeout is only a backstop.
+    let reader = Thread {
         var p = silt_progress()
         silt_scanner_progress(h.scanner, &p)
         read.signal()
     }
-    let answered = read.wait(timeout: .now() + 3) == .success
+    reader.start()
+    let answered = read.wait(timeout: .now() + 15) == .success
     release.signal()
     if !answered { read.wait() }
     unlocked.wait() // the fixture frees the tree when this returns

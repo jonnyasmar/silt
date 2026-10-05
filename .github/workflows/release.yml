@@ -34,7 +34,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       released: ${{ steps.version.outputs.released }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - id: version
         env:
           GH_TOKEN: ${{ github.token }}
@@ -61,7 +61,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Toolchain
         run: swift --version
       - name: Tests
@@ -76,7 +76,7 @@ jobs:
     env:
       VERSION: ${{ needs.detect.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0 # the previous tag, for the notes
       - name: Check secrets
