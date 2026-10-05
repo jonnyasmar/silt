@@ -1,0 +1,70 @@
+@import "tailwindcss";
+
+/* Silt's palette: the warm paper and river-sediment ochre of the app icon. */
+:root {
+  --paper: #fbf6ec;
+  --sand: #f3e6cb;
+  --surface: #fffaf1;
+  --line: #e7d7b9;
+  --ink: #211709;
+  --muted: #6e5a43;
+  --ochre: #c78029;
+  --ochre-deep: #9a5f17;
+  --on-ochre: #211709;
+  --strata-1: #f0dfbc;
+  --strata-2: #e9c993;
+  --strata-3: #ddb070;
+  --strata-4: #c78a43;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #15100a;
+    --sand: #1d160e;
+    --surface: #1f1810;
+    --line: #3a2d1f;
+    --ink: #f4e9d6;
+    --muted: #b8a48c;
+    --ochre: #e8a854;
+    --ochre-deep: #f0bd75;
+    --on-ochre: #211709;
+    --strata-1: #2a2015;
+    --strata-2: #3a2b1a;
+    --strata-3: #57401f;
+    --strata-4: #7a5625;
+  }
+}
+
+@theme inline {
+  --color-paper: var(--paper);
+  --color-sand: var(--sand);
+  --color-surface: var(--surface);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-ochre: var(--ochre);
+  --color-ochre-deep: var(--ochre-deep);
+  --color-on-ochre: var(--on-ochre);
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+  --font-display: var(--font-instrument-serif), ui-serif, Georgia, serif;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+}
+
+::selection {
+  background: color-mix(in srgb, var(--ochre) 35%, transparent);
+}
+
+:focus-visible {
+  outline: 2px solid var(--ochre);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
