@@ -192,3 +192,7 @@ what the scan found appears as **System & hidden space**. Expand it (or
 select it) to see what it's made of: purgeable space (local Time Machine
 snapshots and caches macOS frees by itself), the other volumes sharing the
 disk (swap, Preboot, Recovery), and data only macOS can read.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
