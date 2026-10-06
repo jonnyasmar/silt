@@ -1290,3 +1290,53 @@ private func progress(_ s: OpaquePointer) -> silt_progress {
     silt_scanner_wait_idle(f.scanner)
     #expect(progress(f.scanner).dirs == listed + 2)
 }
+
+/// Measured on disk: each file goes to the bucket of the first snapshot
+/// after the earlier of its birth and modification, hard links and clones
+/// to `shared`, and every byte lands somewhere.
+@Test func measuringOnDiskBucketsEveryByte() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("silt-measure-\(UUID().uuidString)")
+        .resolvingSymlinksInPath()
+    defer { try? FileManager.default.removeItem(at: root) }
+    func write(_ rel: String, _ n: Int) throws -> URL {
+        let u = root.appendingPathComponent(rel)
+        try FileManager.default.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(repeating: 3, count: n).write(to: u)
+        return u
+    }
+    let t0: Int64 = 1_700_000_000, t1: Int64 = 1_750_000_000
+    let old = try write("a/old.bin", 40_000)          // born and written before t0
+    let edited = try write("a/edited.bin", 30_000)    // born before t0, written after t1
+    let fresh = try write("b/fresh.bin", 20_000)      // born now: after both
+    let source = try write("b/source.bin", 10_000)
+    func set(_ u: URL, born: Int64, written: Int64) throws {
+        // Setting an earlier mtime pulls the birth time back with it.
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: TimeInterval(born))], ofItemAtPath: u.path)
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: TimeInterval(written))], ofItemAtPath: u.path)
+    }
+    try set(old, born: t0 - 100, written: t0 - 100)
+    try set(edited, born: t0 - 100, written: t1 + 100)
+    let clone = root.appendingPathComponent("b/clone.bin")
+    #expect(copyfile(source.path, clone.path, nil, copyfile_flags_t(COPYFILE_CLONE)) == 0)
+    let link = root.appendingPathComponent("a/link.bin")
+    #expect(link_ok(fresh.path, link.path))
+    func alloc(_ u: URL) -> Int64 { Int64((try? u.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize) ?? 0) }
+    var cutoffs = [t0, t1]
+    var buckets = [Int64](repeating: 0, count: 3)
+    var out = silt_measure()
+    #expect(silt_measure_path(root.path, &cutoffs, 2, &buckets, nil, 0, 0, &out))
+    #expect(out.complete && out.unreadable == 0)
+    // Edited after t1 but born before t0: held by both snapshots, like old.
+    #expect(buckets[0] == alloc(old) + alloc(edited))
+    #expect(buckets[1] == 0 && buckets[2] == 0)
+    // fresh has a second link; source and its clone share blocks.
+    #expect(out.shared == alloc(fresh) + alloc(link) + alloc(source) + alloc(clone))
+    #expect(buckets.reduce(0, +) + out.shared == out.total)
+    // A single file, and a path that isn't there.
+    var one = [Int64](repeating: 0, count: 3)
+    #expect(silt_measure_path(old.path, &cutoffs, 2, &one, nil, 0, 0, &out))
+    #expect(one[0] == alloc(old) && out.total == alloc(old))
+    #expect(!silt_measure_path(root.appendingPathComponent("nope").path, &cutoffs, 2, &one, nil, 0, 0, &out))
+}
+
+private func link_ok(_ from: String, _ to: String) -> Bool { link(from, to) == 0 }

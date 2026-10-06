@@ -392,6 +392,43 @@ uint32_t silt_files_at_least(silt_tree *t, uint32_t dir, int64_t min_size,
 uint32_t silt_stale_files(silt_tree *t, uint32_t dir, int64_t min_size,
                           uint32_t before, uint32_t *out, uint32_t cap);
 
+// A local APFS snapshot of a volume: its name and when it was taken.
+typedef struct silt_volume_snapshot {
+  char name[256];
+  int64_t created; // unix seconds
+} silt_volume_snapshot;
+
+// Lists the snapshots of the volume mounted at `mount` (at most `cap`).
+// Returns how many, or -1 if they couldn't be listed.
+int silt_volume_snapshots(const char *mount, silt_volume_snapshot *out, int cap);
+
+// What removing `path` (a file, or a folder and everything in it) would
+// free, measured on disk now, against local snapshots taken at `cutoffs`
+// (unix seconds, ascending, `k` of them). Each file goes to bucket b of
+// `buckets` (k + 1 slots): the number of cutoffs at or before the earlier of
+// its birth and modification times. b < k means snapshots b...k-1 hold it;
+// b == k means none does. Hard links and clones go to `shared` instead
+// (other copies keep their blocks). Doesn't cross into other volumes. With
+// `deadline_seconds` > 0, stops after that long (`complete` false). Returns
+// false if `path` can't be read at all.
+typedef struct silt_measure {
+  int64_t total;
+  int64_t shared;
+  int64_t in_use; // open in a running app: freed only once it's closed
+  uint64_t files;
+  uint32_t unreadable; // folders that couldn't be opened
+  bool complete;
+} silt_measure;
+// Files whose inode is in `open_inodes` (sorted, `open_count` of them, from
+// silt_open_files) count as `in_use` instead of a bucket.
+bool silt_measure_path(const char *path, const int64_t *cutoffs, uint32_t k, int64_t *buckets,
+                       const uint64_t *open_inodes, uint32_t open_count, double deadline_seconds,
+                       silt_measure *out);
+
+// The inodes of files on device `dev` that the user's processes hold open
+// (sorted, deduplicated, at most `cap`). Returns how many.
+uint32_t silt_open_files(int32_t dev, uint64_t *inodes, uint32_t cap);
+
 // Files under `dir` whose lowercased extension is one of `exts` (no dots).
 // `which[i]` receives the index into `exts`. Largest first.
 uint32_t silt_find_files(silt_tree *t, uint32_t dir, const char *const *exts,
