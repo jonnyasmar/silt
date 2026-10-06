@@ -88,6 +88,20 @@ Other features:
 - **Undo and follow-through.** "Moved to the Trash" toasts have Undo, which
   puts everything back. The status bar remembers what's still waiting in the
   Trash and offers to empty it.
+- **Where the space is.** Click the capacity meter for the volume's ledger:
+  - **Available:** split into what's free right now and what macOS clears on
+    demand.
+  - **Being deleted:** Silt's deletes in progress.
+  - **In the Trash.**
+  - **Marked for cleanup.**
+  - **Held by local snapshots:** space Silt removed that local Time Machine
+    snapshots still keep.
+
+  A file a snapshot holds frees nothing until that snapshot goes. Silt
+  measures each removal against the volume's snapshots before anything goes.
+  Confirmations and results say how much comes back right away (at least)
+  and how much stays held (at most). Silt tracks held space until its last
+  snapshot is gone, and nothing counts as freed until it has been.
 - **What changed.** Silt compares against the last scan (or the moment this
   one finished) and shows the folders that grew or shrank most: a status-bar
   chip ("+2.8 GB since yesterday") opens the list, and changed folders carry a

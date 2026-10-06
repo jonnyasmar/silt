@@ -138,8 +138,13 @@ private func surviving(_ names: [String], in root: URL) -> [String] {
         s.mark(copies: set.copies, of: [set], reason: "Duplicate")
     }
     #expect(await MainActor.run { s.markedCount } == 3)
+    // What the Cleanup sheet promises counts only what would go: two copies.
+    let one = Int64((try? root.appendingPathComponent(names[0]).resourceValues(forKeys: [.totalFileAllocatedSizeKey])
+        .totalFileAllocatedSize) ?? 0)
+    let estimate = await MainActor.run { Task { await s.estimateMarked() } }
+    #expect(await estimate.value.measured == 2 * one)
     await MainActor.run { s.cleanUp(.delete) }
-    #expect(await wait { surviving(names, in: root).count == 1 && s.toast?.title.hasPrefix("Freed") == true })
+    #expect(await wait { surviving(names, in: root).count == 1 && s.toast?.title.hasPrefix("Deleted") == true })
     #expect(await MainActor.run { s.toast?.detail?.contains("last of its contents") } == true)
     await settle(0.5)
     #expect(surviving(names, in: root).count == 1)
@@ -163,7 +168,7 @@ private func surviving(_ names: [String], in root: URL) -> [String] {
     }
     #expect(await MainActor.run { s.markedCount } == 3)
     await MainActor.run { s.cleanUp(.delete) }
-    #expect(await wait { surviving(names, in: root).count == 1 && s.toast?.title.hasPrefix("Freed") == true })
+    #expect(await wait { surviving(names, in: root).count == 1 && s.toast?.title.hasPrefix("Deleted") == true })
     #expect(!surviving(names, in: root).contains("a/f.bin")) // the plain mark went; an extra stayed
     await finish(s)
 }
@@ -188,7 +193,7 @@ private func surviving(_ names: [String], in root: URL) -> [String] {
     await settle(1)
 
     await MainActor.run { s.cleanUp(.delete) }
-    #expect(await wait { s.toast?.title.hasPrefix("Freed") == true })
+    #expect(await wait { s.toast?.title.hasPrefix("Deleted") == true })
     #expect(surviving(names, in: root) == ["a/f.bin", "b/f.bin"])
     #expect(await MainActor.run { s.toast?.detail?.contains("changed since") } == true)
     await finish(s)
@@ -213,7 +218,7 @@ private func surviving(_ names: [String], in root: URL) -> [String] {
     let s = await live(root)
     #expect(await wait { s.markedCount == 2 })
     await MainActor.run { s.cleanUp(.delete) }
-    #expect(await wait { surviving(names, in: root).count == 1 && s.toast?.title.hasPrefix("Freed") == true })
+    #expect(await wait { surviving(names, in: root).count == 1 && s.toast?.title.hasPrefix("Deleted") == true })
     await settle(0.5)
     #expect(surviving(names, in: root).count == 1)
     await finish(s)

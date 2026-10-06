@@ -26,6 +26,13 @@ struct SiltApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
+        // Measuring what a delete frees holds a descriptor per folder level:
+        // more room than the default 256.
+        var limit = rlimit()
+        if getrlimit(RLIMIT_NOFILE, &limit) == 0, limit.rlim_cur < 10_240 {
+            limit.rlim_cur = min(limit.rlim_max, 10_240)
+            setrlimit(RLIMIT_NOFILE, &limit)
+        }
         // Parked trees belong to the run that parked them.
         try? FileManager.default.removeItem(at: Session.parkDirectory)
         // The speed setting applies from the first scan on.

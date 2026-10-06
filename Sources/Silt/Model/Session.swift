@@ -107,7 +107,11 @@ final class Session: Identifiable {
     }
     var selection: [ItemRef] = []
     var toast: Toast?
-    private(set) var freedBytes: Int64 = 0
+    /// The volume's space accounting, shared with every scan on it.
+    @ObservationIgnored let ledger: SpaceLedger
+    /// What Silt's removals on this volume gave back since it opened.
+    var freedBytes: Int64 { ledger.freed }
+    @ObservationIgnored private var lastLedgerRefresh: TimeInterval = -.infinity
     private(set) var deletingSnapshots = false
     /// Scanning, but nothing has landed for a few seconds: usually threads
     /// parked on a macOS privacy prompt.
@@ -416,9 +420,11 @@ final class Session: Identifiable {
     /// Without Full Disk Access, opening another app's container pops a
     /// privacy prompt and blocks the scanning thread until it's answered, so
     /// those folders are recorded but not opened.
-    init(url: URL, guardPrivateFolders: Bool, fresh: Bool = false) {
+    /// `ledger`: tests give a scan its own instead of its volume's.
+    init(url: URL, guardPrivateFolders: Bool, fresh: Bool = false, ledger: SpaceLedger? = nil) {
         let resolved = url.resolvingSymlinksInPath()
         self.url = resolved
+        self.ledger = ledger ?? SpaceLedger.of(resolved)
         title = Locations.displayName(for: resolved)
         let values = try? resolved.resourceValues(forKeys: [.isVolumeKey])
         isVolume = values?.isVolume == true || resolved.path == "/"
@@ -1915,6 +1921,7 @@ final class Session: Identifiable {
     /// `note`: what was left out of `items`, for the result's toast.
     private func recycle(_ items: [Target], note: String? = nil) {
         guard !items.isEmpty else { return }
+        ledger.beginRemoving(bytes: items.reduce(0) { $0 + $1.size }, items: items.count, deleting: false)
         NSWorkspace.shared.recycle(items.map(\.url)) { [weak self] trashed, error in
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
@@ -1925,6 +1932,7 @@ final class Session: Identifiable {
     }
 
     private func finishTrash(_ items: [Target], trashed: [URL: URL], error: Error?, note: String?) {
+        ledger.endRemoving(bytes: items.reduce(0) { $0 + $1.size }, items: items.count, deleting: false)
         let done = items.filter { trashed[$0.url] != nil }
         for t in done { tree.remove(entry: t.entry) }
         refreshParents(of: items)
@@ -1948,7 +1956,7 @@ final class Session: Identifiable {
             let failure = failed == 0 ? nil
                 : "\(failed) couldn’t be moved" + (error.map { ": \($0.localizedDescription)" } ?? ".")
             show(Toast(symbol: failed == 0 ? "trash" : "exclamationmark.triangle", title: "Moved \(what) to the Trash",
-                       detail: (["\(Fmt.bytes(bytes)) comes back when you empty the Trash."] + [failure, note].compactMap { $0 })
+                       detail: (["\(done.count == 1 ? "Its" : "Their") space comes back when you empty the Trash, less what local snapshots still hold."] + [failure, note].compactMap { $0 })
                            .joined(separator: " "),
                        action: ("Undo", { [weak self] in self?.putBack(moves, bytes: bytes) })), seconds: 8)
         }
@@ -1963,43 +1971,108 @@ final class Session: Identifiable {
 
     /// Empties the Trash through Finder (which asks permission the first time).
     func emptyTrash(window: NSWindow?) {
-        let alert = NSAlert()
-        alert.messageText = "Empty the Trash?"
-        alert.informativeText = waitingInTrash > 0
-            ? "Everything in the Trash is removed for good, including the \(Fmt.bytes(waitingInTrash)) Silt put there."
-            : "Everything in the Trash is removed for good."
-        let b = alert.addButton(withTitle: "Empty Trash")
-        b.hasDestructiveAction = true
-        alert.addButton(withTitle: "Cancel")
-        let run: (NSApplication.ModalResponse) -> Void = { [weak self] r in
-            guard r == .alertFirstButtonReturn, let url = self?.url else { return }
-            let estimate = self?.capacity?.available ?? 0
-            DispatchQueue.global(qos: .userInitiated).async {
-                // Exact figures on both sides (they're slow, so not on the
-                // main thread): the estimate between checks could be off.
-                let before = Locations.volumeCapacity(for: url)?.available ?? estimate
+        Task { [weak self] in
+            guard let self else { return }
+            // Measured on disk, not from the scan (which can lag). Finder
+            // empties every volume's Trash; only this volume's is counted.
+            let reading = await self.measureTrash(deadline: 2)
+            let alert = NSAlert()
+            alert.messageText = "Empty the Trash?"
+            var lines = ["Everything in the Trash is removed for good."]
+            if case .measured(let split) = reading, split.measured > 0 { lines.append(split.summary(done: false)) }
+            alert.informativeText = lines.joined(separator: " ")
+            let b = alert.addButton(withTitle: "Empty Trash")
+            b.hasDestructiveAction = true
+            alert.addButton(withTitle: "Cancel")
+            let run: (NSApplication.ModalResponse) -> Void = { [weak self] r in
+                guard r == .alertFirstButtonReturn, let self else { return }
+                self.runEmptyTrash()
+            }
+            if let window { alert.beginSheetModal(for: window, completionHandler: run) } else { run(alert.runModal()) }
+        }
+    }
+
+    private func runEmptyTrash() {
+        let url = url, ledger = ledger, path = trashPath
+        show(Toast(symbol: "hourglass", title: "Emptying the Trash…", detail: nil))
+        Task { [weak self] in
+            let started = Date() // before listing: a snapshot taken from here on may hold it
+            let listing = await ledger.refresh()
+            // What's there right before Finder runs, and what's left after:
+            // only the difference is what went.
+            let (before, open) = await Task.detached { () -> (SpaceSplit?, [UInt64]) in
+                let open = SpaceSplit.openFiles(on: path)
+                return (SpaceSplit.measure(path, listing: listing, open: open), open)
+            }.value
+            ledger.beginRemoving(bytes: before?.measured ?? 0, items: 1, deleting: true)
+            let (message, freeBefore, after) = await Task.detached(priority: .userInitiated) {
+                () -> (String?, Int64?, Capacity?) in
+                let freeBefore = Locations.quickCapacity(for: url.path)?.free
                 var error: NSDictionary?
                 NSAppleScript(source: "tell application \"Finder\" to empty trash")?.executeAndReturnError(&error)
-                let message = error?[NSAppleScript.errorMessage] as? String
-                let after = Locations.volumeCapacity(for: url)
-                DispatchQueue.main.async {
-                    MainActor.assumeIsolated {
-                        guard let self else { return }
-                        if let after { self.adoptExactCapacity(after) }
-                        self.recountTrash()
-                        if let message {
-                            self.show(Toast(symbol: "exclamationmark.triangle", title: "Couldn’t empty the Trash", detail: message))
-                        } else {
-                            let gained = (after?.available ?? before) - before
-                            self.freedBytes += max(0, gained)
-                            self.show(Toast(symbol: "checkmark.circle", title: "Emptied the Trash",
-                                            detail: gained > 0 ? "\(Fmt.bytes(gained)) freed" : nil))
-                        }
-                    }
-                }
+                return (error?[NSAppleScript.errorMessage] as? String, freeBefore, Locations.volumeCapacity(for: url))
+            }.value
+            let left = await Task.detached { SpaceSplit.measure(path, listing: listing, open: open) }.value
+            ledger.endRemoving(bytes: before?.measured ?? 0, items: 1, deleting: true)
+            let went = before.map { b in left.map { b.minus($0) } ?? b }
+            let recorded = await ledger.removed(went ?? .unknown, listedBefore: listing,
+                                                during: DateInterval(start: started, end: Date()))
+            guard let self else { return }
+            if let after { self.adoptExactCapacity(after) }
+            self.recountTrash()
+            if let message, went.map({ $0.measured == 0 }) ?? true {
+                self.show(Toast(symbol: "exclamationmark.triangle", title: "Couldn’t empty the Trash", detail: message))
+                return
             }
+            // Without a measure of the Trash, say what free space did.
+            let gained = (after?.free ?? 0) - (freeBefore ?? after?.free ?? 0)
+            let detail = went != nil ? recorded.summary(done: true)
+                : gained > 0 ? "Free space went up \(Fmt.bytes(gained))." : nil
+            self.show(Toast(symbol: "checkmark.circle", title: "Emptied the Trash", detail: detail), seconds: 8)
         }
-        if let window { alert.beginSheetModal(for: window, completionHandler: run) } else { run(alert.runModal()) }
+    }
+
+    /// What cleaning up everything marked would give back: the items that
+    /// would actually go (not the copies kept as the last of their kind),
+    /// measured on disk against the snapshots listed afresh.
+    func estimateMarked() async -> SpaceSplit {
+        let paths = cleanupPlan().ok.map(\.url.path)
+        guard !paths.isEmpty else { return SpaceSplit() }
+        let listing = await ledger.refresh()
+        return await Task.detached(priority: .userInitiated) {
+            SpaceSplit.measureAll(paths, listing: listing, within: 10)
+        }.value
+    }
+
+    enum TrashReading: Equatable {
+        case measured(SpaceSplit)
+        /// Silt can't look inside it (no Full Disk Access).
+        case needsAccess
+    }
+
+    /// What's in this volume's Trash, measured on disk, and what emptying it
+    /// would give back.
+    func measureTrash(deadline: TimeInterval = 10) async -> TrashReading {
+        let path = trashPath
+        let listing = await ledger.refresh()
+        return await Task.detached(priority: .userInitiated) {
+            guard FileManager.default.fileExists(atPath: path) else { return .measured(SpaceSplit()) }
+            let open = SpaceSplit.openFiles(on: path)
+            guard let split = SpaceSplit.measure(path, listing: listing, open: open, deadline: deadline) else { return .needsAccess }
+            return .measured(split)
+        }.value
+    }
+
+    @ObservationIgnored var trashPathOverride: String?
+
+    /// This volume's Trash for the current user (tests point it elsewhere).
+    var trashPath: String {
+        if let trashPathOverride { return trashPathOverride }
+        let mount = SpaceVolume.snapshotMount(for: url.path)?.mount
+        if mount == nil || mount == "/System/Volumes/Data" {
+            return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".Trash").path
+        }
+        return (mount! as NSString).appendingPathComponent(".Trashes/\(getuid())")
     }
 
     /// Undoes a Move to Trash: each item goes back where it was, unless
@@ -2036,30 +2109,37 @@ final class Session: Identifiable {
             performDelete(items)
             return
         }
-        let bytes = items.reduce(Int64(0)) { $0 + $1.size }
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = items.count == 1
-            ? "Delete “\(items[0].url.lastPathComponent)” immediately?"
-            : "Delete \(items.count) items immediately?"
-        // A folder left out of the scan has no size Silt knows.
-        let unscanned = tree.withLock {
-            items.filter { t in
-                tree.entry(t.entry).flags & UInt8(SILT_FLAG_EXCLUDED) != 0
-                    || appliedExclusions.contains { $0.hasPrefix(t.url.path + "/") }
-            }.count
+        Task { [weak self] in
+            guard let self else { return }
+            // A preview, measured on disk (briefly: a huge folder isn't held
+            // up for it). What's recorded is measured again as it goes.
+            let preview = await self.preview(items)
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = items.count == 1
+                ? "Delete “\(items[0].url.lastPathComponent)” immediately?"
+                : "Delete \(items.count) items immediately?"
+            alert.informativeText = ["It can’t be undone.", preview.summary(done: false)]
+                .filter { !$0.isEmpty }.joined(separator: " ")
+            let delete = alert.addButton(withTitle: "Delete")
+            delete.hasDestructiveAction = true
+            alert.addButton(withTitle: "Cancel")
+            let run: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+                guard response == .alertFirstButtonReturn else { return }
+                self?.performDelete(items)
+            }
+            if let window { alert.beginSheetModal(for: window, completionHandler: run) } else { run(alert.runModal()) }
         }
-        alert.informativeText = unscanned > 0
-            ? "It can’t be undone. Silt doesn’t scan all of \(unscanned == items.count ? (items.count == 1 ? "it" : "them") : "\(unscanned) of them"), so how much this frees isn’t known."
-            : "This frees \(Fmt.bytes(bytes)) right away and can’t be undone."
-        let delete = alert.addButton(withTitle: "Delete")
-        delete.hasDestructiveAction = true
-        alert.addButton(withTitle: "Cancel")
-        let run: (NSApplication.ModalResponse) -> Void = { [weak self] response in
-            guard response == .alertFirstButtonReturn else { return }
-            self?.performDelete(items)
-        }
-        if let window { alert.beginSheetModal(for: window, completionHandler: run) } else { run(alert.runModal()) }
+    }
+
+    /// What removing `items` would give back, measured on disk against the
+    /// snapshots listed afresh, for at most two seconds in all.
+    private func preview(_ items: [Target]) async -> SpaceSplit {
+        let listing = await ledger.refresh()
+        let paths = items.map(\.url.path)
+        return await Task.detached(priority: .userInitiated) {
+            SpaceSplit.measureAll(paths, listing: listing, within: 2)
+        }.value
     }
 
     /// `note`: what was left out of `confirmed`, for the result's toast.
@@ -2078,60 +2158,78 @@ final class Session: Identifiable {
         selection = []
         showChangesNow()
         show(Toast(symbol: "hourglass", title: "Deleting…", detail: nil))
-        Task.detached(priority: .userInitiated) {
-            var failures: [URL: String] = [:]
-            for t in items {
-                if let problem = Self.quarantineAndDelete(t) { failures[t.url] = problem }
-            }
-            let failed = failures
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                let done = items.filter { failed[$0.url] == nil }
-                let bytes = done.reduce(Int64(0)) { $0 + $1.size }
-                self.freedBytes += bytes
-                self.refreshParents(of: items)
-                self.checkCapacity(now: ProcessInfo.processInfo.systemUptime, exact: true)
-                if let first = failed.first {
-                    let title = failed.count == 1 ? "Couldn’t delete \(first.key.lastPathComponent)"
-                        : "Couldn’t delete \(failed.count) of \(items.count) items"
-                    let freed = done.isEmpty ? nil : "Freed \(Fmt.bytes(bytes))."
-                    let why = failed.count == 1 ? first.value : "\(first.key.lastPathComponent): \(first.value)"
-                    self.show(Toast(symbol: "exclamationmark.triangle", title: title,
-                                    detail: [freed, why, note].compactMap { $0 }.joined(separator: " ")), seconds: 8)
-                } else {
-                    self.show(Toast(symbol: "checkmark.circle", title: "Freed \(Fmt.bytes(bytes))", detail: note),
-                              seconds: note == nil ? 4 : 8)
+        let ledger = ledger
+        ledger.beginRemoving(bytes: items.reduce(0) { $0 + $1.size }, items: items.count, deleting: true)
+        Task { [weak self] in
+            let started = Date() // before listing: a snapshot taken from here on may hold it
+            let listing = await ledger.refresh()
+            let (failed, measured) = await Task.detached(priority: .userInitiated) {
+                var failures: [URL: String] = [:]
+                var measured = SpaceSplit()
+                let open = items.first.map { SpaceSplit.openFiles(on: $0.url.deletingLastPathComponent().path) } ?? []
+                for t in items {
+                    let (problem, split) = Self.quarantineAndDelete(t, measuring: listing, open: open)
+                    if let problem { failures[t.url] = problem }
+                    if let split { measured.add(split) }
+                    await MainActor.run { ledger.endRemoving(bytes: t.size, items: 1, deleting: true) }
                 }
+                return (failures, measured)
+            }.value
+            // Recorded even if the window (and this scan) went meanwhile.
+            let recorded = await ledger.removed(listing == nil ? .unknown : measured, listedBefore: listing,
+                                                during: DateInterval(start: started, end: Date()))
+            guard let self else { return }
+            let done = items.filter { failed[$0.url] == nil }
+            let bytes = recorded.measured > 0 ? recorded.measured : done.reduce(Int64(0)) { $0 + $1.size }
+            self.refreshParents(of: items)
+            self.checkCapacity(now: ProcessInfo.processInfo.systemUptime, exact: true)
+            let what = recorded.summary(done: true)
+            if let first = failed.first {
+                let title = failed.count == 1 ? "Couldn’t delete \(first.key.lastPathComponent)"
+                    : "Couldn’t delete \(failed.count) of \(items.count) items"
+                let deleted = done.isEmpty ? nil : "Deleted \(Fmt.bytes(bytes)). \(what)"
+                let why = failed.count == 1 ? first.value : "\(first.key.lastPathComponent): \(first.value)"
+                self.show(Toast(symbol: "exclamationmark.triangle", title: title,
+                                detail: [deleted, why, note].compactMap { $0 }.joined(separator: " ")), seconds: 8)
+            } else {
+                self.show(Toast(symbol: "checkmark.circle", title: "Deleted \(Fmt.bytes(bytes))",
+                                detail: [what, note].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " ")),
+                          seconds: 8)
             }
         }
     }
 
     /// Renames the target to a private name first (atomic, same folder), then
-    /// checks that what moved is the object the user confirmed, and only then
-    /// deletes it. A lookalike that appeared at the path is moved back
-    /// untouched. Returns a problem description, or nil on success.
-    nonisolated private static func quarantineAndDelete(_ t: Target) -> String? {
+    /// checks that what moved is the object the user confirmed, measures it
+    /// (on disk, against `listing`: exactly what's about to go), and only
+    /// then deletes it. A lookalike that appeared at the path is moved back
+    /// untouched. Returns a problem description (nil on success) and the
+    /// measure of what went (nil unless all of it did).
+    nonisolated private static func quarantineAndDelete(_ t: Target, measuring listing: SnapshotListing?,
+                                                        open: [UInt64]) -> (problem: String?, split: SpaceSplit?) {
         let path = t.url.path
         let volume = "It’s another volume mounted there, so it was left alone."
-        guard !isVolumeRoot(path) else { return volume }
+        guard !isVolumeRoot(path) else { return (volume, nil) }
         let parked = t.url.deletingLastPathComponent()
             .appendingPathComponent(".silt-deleting-\(UUID().uuidString)").path
-        guard rename(path, parked) == 0 else { return String(cString: strerror(errno)) }
+        guard rename(path, parked) == 0 else { return (String(cString: strerror(errno)), nil) }
         guard !isVolumeRoot(parked) else {
             _ = renamex_np(parked, path, UInt32(RENAME_EXCL))
-            return volume
+            return (volume, nil)
         }
         guard Identity(path: parked) == t.identity else {
             _ = renamex_np(parked, path, UInt32(RENAME_EXCL))
-            return "It changed on disk after you confirmed, so it was left alone."
+            return ("It changed on disk after you confirmed, so it was left alone.", nil)
         }
+        let split = SpaceSplit.measure(parked, listing: listing, open: open)
         do {
             try FileManager.default.removeItem(atPath: parked)
-            return nil
+            return (nil, split)
         } catch {
             // Partly deleted: put what's left back where the user expects it.
+            // What did go isn't counted: better to under-promise.
             _ = renamex_np(parked, path, UInt32(RENAME_EXCL))
-            return error.localizedDescription
+            return (error.localizedDescription, nil)
         }
     }
 
@@ -2254,6 +2352,11 @@ final class Session: Identifiable {
     /// a trash, a delete or Empty Trash), and estimated in between.
     private func checkCapacity(now: TimeInterval, exact: Bool = false) {
         lastCapacityCheck = now
+        // Held space comes back as snapshots go: look now and then.
+        if !ledger.held.isEmpty, now - lastLedgerRefresh >= 180 {
+            lastLedgerRefresh = now
+            Task { await ledger.refresh() }
+        }
         if let quick = Locations.quickCapacity(for: url.path) {
             let available = min(quick.total, max(0, quick.free + (purgeable ?? 0)))
             let next = Capacity(total: quick.total, available: available, free: quick.free)
@@ -2313,13 +2416,15 @@ final class Session: Identifiable {
             }
         }
         let next = HiddenSpace.measure(url: url, scanned: stats.bytes, capacity: capacity,
-                                       unreadable: stats.denied, excluded: appliedExclusions.count, snapshots: snapshots)
+                                       unreadable: stats.denied, excluded: appliedExclusions.count, snapshots: snapshots,
+                                       held: ledger.held.total)
         if next != hidden { hidden = next }
     }
 
     /// Deletes the volume's local Time Machine snapshots, after asking.
     func deleteLocalSnapshots(window: NSWindow?) {
-        guard !snapshots.isEmpty, !deletingSnapshots else { return }
+        let any = !snapshots.isEmpty || ledger.listing?.snapshots.isEmpty == false
+        guard any, !deletingSnapshots else { return }
         let alert = NSAlert()
         alert.alertStyle = .warning
         // No count: the list may have changed since it was last read. The
@@ -2331,12 +2436,15 @@ final class Session: Identifiable {
         alert.addButton(withTitle: "Cancel")
         let run: (NSApplication.ModalResponse) -> Void = { [weak self] r in
             guard r == .alertFirstButtonReturn, let url = self?.url else { return }
+            // tmutil wants the volume: the startup disk's Data volume is "/".
+            let mount = SpaceVolume.snapshotMount(for: url.path)?.mount ?? url.path
+            let volume = mount == "/System/Volumes/Data" ? "/" : mount
             self?.deletingSnapshots = true
             DispatchQueue.global(qos: .userInitiated).async {
                 // Snapshot space already counts as available (it's
                 // purgeable): what deleting them changes is free space.
                 let before = Locations.volumeCapacity(for: url)?.free
-                let result = LocalSnapshots.deleteAll(on: url.path)
+                let result = LocalSnapshots.deleteAll(on: volume)
                 let after = Locations.volumeCapacity(for: url)
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
@@ -2346,7 +2454,9 @@ final class Session: Identifiable {
                         if let after { self.adoptExactCapacity(after) }
                         else { self.measureHidden(now: ProcessInfo.processInfo.systemUptime) }
                         let gained = max(0, (after?.free ?? 0) - (before ?? after?.free ?? 0))
-                        self.freedBytes += gained
+                        // What it gave back of Silt's own removals is
+                        // released by listing what's left.
+                        Task { await self.ledger.refresh() }
                         let n = result.deleted
                         let deleted = n == 1 ? "1 local snapshot" : "\(n) local snapshots"
                         let freed = gained > 0 ? "\(Fmt.bytes(gained)) freed." : nil
@@ -2709,9 +2819,16 @@ extension Session {
         var id: String { rawValue }
     }
 
-    /// Removes everything marked. Marks for items that went away, or were
-    /// replaced since they were marked, are dropped instead.
-    func cleanUp(_ method: CleanupMethod) {
+    /// What cleaning up the marks would do: the items that would go, and
+    /// why the rest wouldn't. Removes nothing.
+    fileprivate struct CleanupPlan {
+        var ok: [Target] = []
+        var refused: [(name: String, why: Refusal)] = []
+        var changed = 0
+        var kept = 0
+    }
+
+    fileprivate func cleanupPlan() -> CleanupPlan {
         let items = markedItems()
         // The object each mark was made on, to hold every target to.
         var expected: [String: MarkInfo] = [:]
@@ -2719,8 +2836,6 @@ extension Session {
             if let m = marks[item.key] { expected[item.path] = m }
         }
         let refs = tree.withLock { items.map { ref(forEntry: $0.entry) } }
-        marks = [:]
-        marksChanged()
         let (all, refused) = targets(refs)
         var ok = all.filter { t in
             guard let e = expected[t.url.path], e.dev == t.identity.dev, e.ino == t.identity.ino, t.unchanged
@@ -2730,29 +2845,38 @@ extension Session {
         }
         let changed = all.count - ok.count
         let kept = Self.keepLastCopies(&ok) { expected[$0.url.path]?.copy }
+        return CleanupPlan(ok: ok, refused: refused, changed: changed, kept: kept)
+    }
+
+    /// Removes everything marked. Marks for items that went away, or were
+    /// replaced since they were marked, are dropped instead.
+    func cleanUp(_ method: CleanupMethod) {
+        let plan = cleanupPlan()
+        marks = [:]
+        marksChanged()
         // One summary at the end: a toast now would be replaced by the result.
         var notes: [String] = []
-        if !refused.isEmpty {
-            notes.append("Silt won’t delete \(refused.map(\.name).joined(separator: ", ")): "
-                + (refused.allSatisfy({ $0.why == .volume }) ? "another volume is mounted there."
+        if !plan.refused.isEmpty {
+            notes.append("Silt won’t delete \(plan.refused.map(\.name).joined(separator: ", ")): "
+                + (plan.refused.allSatisfy({ $0.why == .volume }) ? "another volume is mounted there."
                     : "it’s a system or home folder location, or another volume."))
         }
-        if changed > 0 {
-            notes.append(changed == 1 ? "1 item changed since it was marked and was left alone."
-                                      : "\(changed) items changed since they were marked and were left alone.")
+        if plan.changed > 0 {
+            notes.append(plan.changed == 1 ? "1 item changed since it was marked and was left alone."
+                                           : "\(plan.changed) items changed since they were marked and were left alone.")
         }
-        if kept > 0 {
-            notes.append(kept == 1 ? "1 copy was kept: it’s the last of its contents."
-                                   : "\(kept) copies were kept: they’re the last of their contents.")
+        if plan.kept > 0 {
+            notes.append(plan.kept == 1 ? "1 copy was kept: it’s the last of its contents."
+                                        : "\(plan.kept) copies were kept: they’re the last of their contents.")
         }
         let note = notes.isEmpty ? nil : notes.joined(separator: " ")
-        if ok.isEmpty {
+        if plan.ok.isEmpty {
             if let note { show(Toast(symbol: "exclamationmark.triangle", title: "Nothing was removed", detail: note)) }
             return
         }
         switch method {
-        case .trash: recycle(ok, note: note)
-        case .delete: performDelete(ok, note: note)
+        case .trash: recycle(plan.ok, note: note)
+        case .delete: performDelete(plan.ok, note: note)
         }
     }
 

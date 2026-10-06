@@ -42,6 +42,9 @@ struct CleanupSheet: View {
     @State private var items: [Session.MarkedItem] = []
     @State private var verdicts: [MarkKey: Guidance] = [:]
     @State private var nested = 0
+    /// What deleting it all would give back, measured against the
+    /// snapshots when the sheet opened (and when the marks change).
+    @State private var split: SpaceSplit?
 
     private var total: Int64 { items.reduce(0) { $0 + $1.size } }
     private var safeFindings: [Finding] { session.findings.filter { $0.safety == .safe && !$0.isTrash } }
@@ -59,6 +62,10 @@ struct CleanupSheet: View {
         .frame(width: 640, height: 580)
         .onAppear(perform: reload)
         .onChange(of: session.markedCount) { reload() }
+        .task(id: session.markedCount) {
+            split = nil
+            split = await session.estimateMarked()
+        }
     }
 
     private func reload() {
@@ -175,11 +182,12 @@ struct CleanupSheet: View {
     private var projection: String {
         switch method {
         case .trash:
-            return "Recoverable from the Trash. \(Fmt.bytes(total)) comes back when you empty it."
+            let held = split.map { $0.known && $0.heldBytes > 0 ? " Even then, up to \(Fmt.bytes($0.heldBytes)) stays held by local Time Machine snapshots until they’re gone." : "" } ?? ""
+            return "Recoverable from the Trash. Space comes back when you empty it." + held
         case .delete:
-            // Measured: a deleted file a local Time Machine snapshot still
-            // holds frees nothing until that snapshot goes.
-            return "Deletes \(Fmt.bytes(total)) for good. Whatever Time Machine’s local snapshots still hold comes back as they expire (within a day), or when you delete them. This can’t be undone."
+            guard let split else { return "Deletes them for good. Working out how much comes back…" }
+            return ["Deletes \(Fmt.bytes(split.measured)) for good.", split.summary(done: false), "This can’t be undone."]
+                .filter { !$0.isEmpty }.joined(separator: " ")
         }
     }
 

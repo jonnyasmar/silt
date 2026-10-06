@@ -128,6 +128,7 @@ final class Node: NSObject {
         case .hiddenPart:
             let symbol = switch partKind {
             case .purgeable: "clock.arrow.circlepath"
+            case .held: "clock.badge.checkmark"
             case .volume: "internaldrive"
             case .unmounted: "externaldrive.badge.minus"
             case .unreadable: "lock"

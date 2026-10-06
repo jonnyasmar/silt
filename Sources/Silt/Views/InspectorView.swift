@@ -695,6 +695,7 @@ private struct HiddenSpaceCard: View {
         private var symbol: String {
             switch part.kind {
             case .purgeable: "clock.arrow.circlepath"
+            case .held: "clock.badge.checkmark"
             case .volume: "internaldrive"
             case .unmounted: "externaldrive.badge.minus"
             case .unreadable: "lock"

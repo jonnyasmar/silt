@@ -5,7 +5,7 @@ import Foundation
 /// Machine snapshots, evictable caches), and folders only macOS can read.
 struct HiddenSpace: Equatable {
     struct Part: Identifiable, Equatable {
-        enum Kind { case purgeable, volume, unmounted, unreadable }
+        enum Kind { case purgeable, held, volume, unmounted, unreadable }
         let id: String
         let kind: Kind
         let title: String
@@ -22,8 +22,9 @@ struct HiddenSpace: Equatable {
     /// Breaks down `used − scanned` for the volume at `url`. `capacity` is the
     /// container's (APFS volumes share it); nil if the gap is too small to
     /// mention.
+    /// `held`: what local snapshots still keep of what Silt removed.
     static func measure(url: URL, scanned: Int64, capacity: Capacity,
-                        unreadable: Int, excluded: Int = 0, snapshots: [String]) -> HiddenSpace? {
+                        unreadable: Int, excluded: Int = 0, snapshots: [String], held: Int64 = 0) -> HiddenSpace? {
         let used = capacity.total - capacity.free
         let gap = used - scanned
         guard gap > capacity.total / 200 else { return nil }
@@ -49,6 +50,17 @@ struct HiddenSpace: Equatable {
                               detail: "Space macOS frees by itself when it needs room: local snapshots and caches it can rebuild.\(snaps)",
                               bytes: purgeable))
             onVolume -= purgeable
+        }
+
+        // What Silt removed that snapshots still keep: named, so the
+        // popover and this breakdown agree. Out of what's left, since macOS
+        // may or may not count it as purgeable.
+        let kept = min(held, onVolume)
+        if kept >= 100_000_000 {
+            parts.append(Part(id: "held", kind: .held, title: "Removed by Silt, kept by snapshots",
+                              detail: "What Silt deleted that local Time Machine snapshots still hold. It comes back as they go.",
+                              bytes: kept))
+            onVolume -= kept
         }
 
         // Other volumes in the same container: swap, startup files.

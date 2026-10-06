@@ -27,6 +27,8 @@ func settle(_ seconds: TimeInterval) async {
 /// run at Automatic on (pretend) mains power, whatever the machine is doing.
 @MainActor
 func pinPace() {
+    // And no real snapshots: tests that need them give a scan its own ledger.
+    if !SpaceLedger.testing { SpaceLedger.testing = true }
     let speed = SpeedController.shared
     if speed.pinnedConditions == nil { speed.pinnedConditions = PowerConditions() }
     if speed.mode != .automatic { speed.mode = .automatic }

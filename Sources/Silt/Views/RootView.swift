@@ -678,6 +678,7 @@ struct StatusBar: View {
     let model: WindowModel
     @State private var showingChanges = false
     @State private var showingBusy = false
+    @State private var showingSpace = false
 
     var body: some View {
         let s = session.stats
@@ -708,16 +709,23 @@ struct StatusBar: View {
             if showChips { chips(s) }
             SpeedMenu(compact: !showChips)
             if showCapacity, let cap = session.capacity {
-                HStack(spacing: 6) {
-                    CapacityBar(fraction: Double(cap.total - cap.available) / Double(max(cap.total, 1)),
-                                marked: Double(session.markedBytes) / Double(max(cap.total, 1)))
-                        .frame(width: 54, height: 5)
-                    Text("\(Fmt.bytes(cap.available)) available")
-                        .monospacedDigit()
+                Button { showingSpace.toggle() } label: {
+                    HStack(spacing: 6) {
+                        CapacityBar(fraction: Double(cap.total - cap.available) / Double(max(cap.total, 1)),
+                                    marked: Double(session.markedBytes) / Double(max(cap.total, 1)))
+                            .frame(width: 54, height: 5)
+                        Text("\(Fmt.bytes(cap.available)) available")
+                            .monospacedDigit()
+                    }
+                    .contentShape(Rectangle())
                 }
-                .help(session.markedBytes > 0
-                      ? "\(Fmt.bytes(session.markedBytes)) marked for cleanup (hatched)"
-                      : "\(Fmt.bytes(cap.available)) available of \(Fmt.bytes(cap.total))")
+                .buttonStyle(.plain)
+                .help("Where the space is: free, in the Trash, marked, and held by local snapshots")
+                .popover(isPresented: $showingSpace, arrowEdge: .top) {
+                    SpacePopover(session: session, window: model.window, reviewCleanup: { model.reviewingCleanup = true }) {
+                        showingSpace = false
+                    }
+                }
             }
         }
     }
@@ -730,11 +738,26 @@ struct StatusBar: View {
                 FullDiskAccess.openSettings()
             }
         }
+        let ledger = session.ledger
+        if !ledger.removing.isEmpty {
+            let r = ledger.removing
+            Chip(symbol: "hourglass", text: r.deleting > 0 ? "Deleting · \(Fmt.bytesShort(r.deletingBytes)) to go"
+                                                           : "Moving to the Trash…", tint: .secondary) {
+                showingSpace = true
+            }
+        }
         if session.waitingInTrash > 0 {
             Chip(symbol: "trash", text: "\(Fmt.bytes(session.waitingInTrash)) waiting in the Trash · Empty…", tint: Brand.color) {
                 session.emptyTrash(window: model.window)
             }
-        } else if session.freedBytes > 0 {
+        }
+        if ledger.held.total > 0 {
+            Chip(symbol: "clock.badge.checkmark", text: "\(Fmt.bytesShort(ledger.held.total)) held by snapshots",
+                 tint: .secondary) {
+                showingSpace = true
+            }
+            .help("Space Silt removed that local Time Machine snapshots still keep")
+        } else if session.freedBytes > 0, session.waitingInTrash == 0 {
             Label("Freed \(Fmt.bytes(session.freedBytes))", systemImage: "checkmark.circle")
                 .foregroundStyle(.green)
         }
@@ -935,8 +958,9 @@ private struct ChangesPopover: View {
     }
 }
 
-private extension String {
+extension String {
     var capitalizedFirstLetter: String { prefix(1).uppercased() + dropFirst() }
+    var lowercasedFirstLetter: String { prefix(1).lowercased() + dropFirst() }
 }
 
 struct ToastView: View {
