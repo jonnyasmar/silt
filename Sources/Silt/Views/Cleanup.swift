@@ -177,8 +177,9 @@ struct CleanupSheet: View {
         case .trash:
             return "Recoverable from the Trash. \(Fmt.bytes(total)) comes back when you empty it."
         case .delete:
-            guard let cap = session.capacity else { return "Frees \(Fmt.bytes(total)) right away. This can’t be undone." }
-            return "Frees \(Fmt.bytes(total)) right away: \(Fmt.bytes(cap.available)) → \(Fmt.bytes(cap.available + total)) available. This can’t be undone."
+            // Measured: a deleted file a local Time Machine snapshot still
+            // holds frees nothing until that snapshot goes.
+            return "Deletes \(Fmt.bytes(total)) for good. Whatever Time Machine’s local snapshots still hold comes back as they expire (within a day), or when you delete them. This can’t be undone."
         }
     }
 

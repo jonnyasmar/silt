@@ -259,6 +259,17 @@ final class WindowModel {
         pressure.resume()
         memoryPressure = pressure
         refineLocations()
+        // Free space moves on its own (and with every cleanup, here or
+        // anywhere): the sidebar's figures follow while the window is seen.
+        let t = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.windowShown else { return }
+                self.refreshLocations()
+            }
+        }
+        t.tolerance = 5
+        RunLoop.main.add(t, forMode: .common)
+        locationsTimer = t
     }
 
     /// Visibility and the park timer follow changes to what's shown, a turn
@@ -284,6 +295,7 @@ final class WindowModel {
     /// tried the moment it settles).
     private static let parkRetry: TimeInterval = 15
     @ObservationIgnored private var parkTimer: Timer?
+    @ObservationIgnored private var locationsTimer: Timer?
     @ObservationIgnored private var memoryPressure: DispatchSourceMemoryPressure?
 
     /// Puts away scans that have been out of sight for `after` seconds (all of
@@ -375,6 +387,8 @@ final class WindowModel {
         windowClosed = true
         parkTimer?.invalidate()
         parkTimer = nil
+        locationsTimer?.invalidate()
+        locationsTimer = nil
         let center = NotificationCenter.default
         for o in windowObservers + appObservers { center.removeObserver(o) }
         for o in workspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(o) }

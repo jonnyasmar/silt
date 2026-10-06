@@ -187,7 +187,8 @@ private struct LocationRow: View {
         let own = session?.url.path == location.url.path
         if let session, own, let activity = session.activity {
             ActivityBadge(activity: activity)
-        } else if let avail = location.available {
+        } else if let avail = (own ? session?.capacity?.available : nil) ?? location.available {
+            // The scan of this volume checks its space every few seconds.
             Text("\(Fmt.bytesShort(avail)) free")
         } else if let session, let size = session.size(ofView: location.url.path) {
             Text(Fmt.bytes(size))
