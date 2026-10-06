@@ -1340,3 +1340,17 @@ private func progress(_ s: OpaquePointer) -> silt_progress {
 }
 
 private func link_ok(_ from: String, _ to: String) -> Bool { link(from, to) == 0 }
+
+/// Deleting a tree counts each file and folder as it goes.
+@Test func removeTreeCountsWhatItRemoves() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("silt-remove-\(UUID().uuidString)")
+    for rel in ["a/1", "a/2", "a/b/3", "c/4"] {
+        let u = root.appendingPathComponent(rel)
+        try FileManager.default.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: u)
+    }
+    var done: UInt64 = 0
+    #expect(silt_remove_tree(root.path, &done) == 0)
+    #expect(!FileManager.default.fileExists(atPath: root.path))
+    #expect(done == 4 + 4) // four files, four folders (root, a, a/b, c)
+}

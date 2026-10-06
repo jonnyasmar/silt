@@ -81,6 +81,7 @@ static struct attrlist attrs(bool extended) {
 
 // Measures the folder open at `fd` (closed here) and everything under it.
 static void walk(measurer *m, int fd) {
+  m->out->dirs++;
   enum { BUF = 128 * 1024 };
   char *buf = malloc(BUF);
   char **subdirs = NULL;

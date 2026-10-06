@@ -711,8 +711,7 @@ struct StatusBar: View {
             if showCapacity, let cap = session.capacity {
                 Button { showingSpace.toggle() } label: {
                     HStack(spacing: 6) {
-                        CapacityBar(fraction: Double(cap.total - cap.available) / Double(max(cap.total, 1)),
-                                    marked: Double(session.markedBytes) / Double(max(cap.total, 1)))
+                        SpaceBar(parts: .init(capacity: cap, held: session.ledger.held.total, marked: session.markedBytes))
                             .frame(width: 54, height: 5)
                         Text("\(Fmt.bytes(cap.available)) available")
                             .monospacedDigit()
@@ -741,7 +740,7 @@ struct StatusBar: View {
         let ledger = session.ledger
         if !ledger.removing.isEmpty {
             let r = ledger.removing
-            Chip(symbol: "hourglass", text: r.deleting > 0 ? "Deleting · \(Fmt.bytesShort(r.deletingBytes)) to go"
+            Chip(symbol: "hourglass", text: r.deleting > 0 ? "Deleting · \(Fmt.bytesShort(r.deletingLeft)) to go"
                                                            : "Moving to the Trash…", tint: .secondary) {
                 showingSpace = true
             }

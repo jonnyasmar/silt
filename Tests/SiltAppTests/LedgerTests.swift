@@ -255,6 +255,25 @@ private struct Scene {
     await scene.cleanUp()
 }
 
+/// A file mapped into memory (its descriptor closed, like a running app's
+/// own binary) frees nothing until it's unmapped: it isn't counted as freed.
+@Test func fileMappedIntoMemoryIsNotCountedAsFreed() async throws {
+    let scene = try await Scene([listing([Date(timeIntervalSinceNow: -3 * 3600)])])
+    let fd = open(scene.file.path, O_RDONLY)
+    #expect(fd >= 0)
+    let length = 400_000
+    let map = mmap(nil, length, PROT_READ, MAP_SHARED, fd, 0)
+    close(fd) // only the mapping is left
+    #expect(map != MAP_FAILED)
+    defer { munmap(map, length) }
+    await MainActor.run { scene.delete() }
+    #expect(await wait { scene.session.toast?.title.hasPrefix("Deleted") == true && scene.ledger.removing.isEmpty })
+    let state = await MainActor.run { (scene.ledger.freed, scene.session.toast?.detail ?? "") }
+    #expect(state.0 == 0)
+    #expect(state.1.contains("open in a running app"))
+    await scene.cleanUp()
+}
+
 /// Snapshots that can't be listed mean nothing is promised or recorded.
 @Test func unlistableSnapshotsPromiseNothing() async throws {
     let scene = try await Scene([nil])
@@ -347,4 +366,45 @@ func realSnapshotHoldsADeletedFile() async throws {
     #expect(state.1 == size)
     await MainActor.run { s.close() }
     Snapshots.discard(for: root)
+}
+
+/// Progress through deletes: how far into the current item, as a fraction
+/// of everything there was to delete.
+@Test @MainActor func deleteProgressAddsUp() {
+    let ledger = SpaceLedger(volume: "test-\(UUID().uuidString)", mount: "/", persists: false)
+    ledger.beginRemoving(bytes: 1_000, items: 2, deleting: true)
+    #expect(ledger.removing.fractionDeleted == 0)
+    ledger.progress(250)
+    #expect(ledger.removing.deletingLeft == 750 && ledger.removing.fractionDeleted == 0.25)
+    ledger.endRemoving(bytes: 500, items: 1, deleting: true) // first item done
+    #expect(ledger.removing.deletingLeft == 500 && ledger.removing.fractionDeleted == 0.5)
+    ledger.endRemoving(bytes: 500, items: 1, deleting: true)
+    #expect(ledger.removing.isEmpty && ledger.removing.fractionDeleted == nil)
+}
+
+/// The bar's parts always add up to the disk, whatever overlaps.
+@Test func spaceBarPartsAddUp() {
+    let cap = Capacity(total: 1_000, available: 300, free: 100)
+    let p = SpaceBar.Parts(capacity: cap, trash: 50, held: 80, marked: 40)
+    #expect(p.files + p.trash + p.held + p.purgeable + p.free == 1_000)
+    #expect(p.purgeable == 200 && p.free == 100 && p.trash == 50 && p.held == 80 && p.files == 570)
+    // Held space that macOS already counts as purgeable can't push files below zero.
+    let squeezed = SpaceBar.Parts(capacity: cap, trash: 600, held: 600)
+    #expect(squeezed.files >= 0 && squeezed.files + squeezed.trash + squeezed.held + squeezed.purgeable + squeezed.free == 1_000)
+}
+
+/// What emptying the Trash and the snapshots letting go would bring free
+/// space to, in bounds.
+@Test func projectionsAreBounds() {
+    var trash = SpaceSplit(freesNow: 2_000_000_000)
+    trash.addHold(["s"], 1_000_000_000)
+    trash.measured = 3_000_000_000
+    let both = SpacePopover.projection(free: 10_000_000_000, trash: trash, held: 500_000_000)
+    #expect(both == "Emptying the Trash would bring free space to at least 12.0 GB, and up to 13.5 GB once local snapshots let go.")
+    #expect(SpacePopover.projection(free: 10_000_000_000, trash: nil, held: 500_000_000)
+        == "Once local snapshots let go, free space would reach up to 10.5 GB.")
+    #expect(SpacePopover.projection(free: 10_000_000_000, trash: nil, held: 1_000) == nil) // too small to mention
+    var unknown = trash
+    unknown.known = false
+    #expect(SpacePopover.projection(free: 10_000_000_000, trash: unknown, held: 0) == nil) // no promise
 }

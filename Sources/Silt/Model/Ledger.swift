@@ -88,6 +88,8 @@ struct SpaceSplit: Equatable, Sendable {
 
     /// Everything measured, however it splits (also when it can't be).
     var measured: Int64 = 0
+    /// Files and folders measured, for progress while it's deleted.
+    var items: UInt64 = 0
 
     var heldBytes: Int64 { held.reduce(0) { $0 + $1.bytes } }
     var total: Int64 { freesNow + heldBytes + shared + inUse }
@@ -99,6 +101,7 @@ struct SpaceSplit: Equatable, Sendable {
         shared += other.shared
         inUse += other.inUse
         measured += other.measured
+        items += other.items
         known = known && other.known
         partial = partial || other.partial
         for h in other.held { addHold(h.holders, h.bytes) }
@@ -150,9 +153,6 @@ struct SpaceSplit: Equatable, Sendable {
     /// set: a minute of slack, erring toward held.
     static let margin: TimeInterval = 60
 
-    /// Measures `path` on disk, now, against `listing`. With a `deadline`
-    /// (seconds) it stops early and says so (`partial`). Blocks: call it off
-    /// the main thread.
     /// Measures `paths` in turn, all within `seconds`; past that, the rest
     /// isn't measured and the sum says so (`partial`).
     static func measureAll(_ paths: [String], listing: SnapshotListing?, within seconds: TimeInterval) -> SpaceSplit {
@@ -182,7 +182,10 @@ struct SpaceSplit: Equatable, Sendable {
         return Array(inodes.prefix(Int(n)))
     }
 
-    /// Nil if `path` can't be read at all. `open`: from `openFiles(on:)`.
+    /// Measures `path` on disk, now, against `listing`; files in `open`
+    /// (from `openFiles(on:)`) count as in use. With a `deadline` (seconds)
+    /// it stops early and says so (`partial`). Nil if `path` can't be read
+    /// at all. Blocks: call it off the main thread.
     static func measure(_ path: String, listing: SnapshotListing?, open: [UInt64] = [],
                         deadline: TimeInterval = 0) -> SpaceSplit? {
         let estimable = listing?.estimable == true
@@ -194,6 +197,7 @@ struct SpaceSplit: Equatable, Sendable {
                                 deadline, &out) else { return nil }
         var split = SpaceSplit(shared: out.shared, known: estimable, partial: !out.complete || out.unreadable > 0)
         split.inUse = out.in_use
+        split.items = out.files + out.dirs
         split.measured = out.total
         guard estimable else { return split } // its size, but no promise
         split.freesNow = buckets[cutoffs.count]
@@ -281,7 +285,16 @@ final class SpaceLedger {
         /// which gives nothing back until it's emptied).
         var deleting = 0
         var deletingBytes: Int64 = 0
+        /// How far into the item being deleted now.
+        var progressBytes: Int64 = 0
+        /// All there was to delete since deleting last started, for a
+        /// fraction done.
+        var startedBytes: Int64 = 0
         var isEmpty: Bool { items == 0 }
+        var deletingLeft: Int64 { max(0, deletingBytes - progressBytes) }
+        var fractionDeleted: Double? {
+            startedBytes > 0 ? min(1, max(0, 1 - Double(deletingLeft) / Double(startedBytes))) : nil
+        }
     }
 
     let volume: String
@@ -375,17 +388,26 @@ final class SpaceLedger {
         removing.bytes += bytes
         removing.items += items
         if deleting {
+            if removing.deleting == 0 { removing.startedBytes = 0 }
             removing.deleting += items
             removing.deletingBytes += bytes
+            removing.startedBytes += bytes
         }
+    }
+
+    /// `bytes` of the item being deleted now are gone.
+    func progress(_ bytes: Int64) {
+        removing.progressBytes = bytes
     }
 
     func endRemoving(bytes: Int64, items: Int, deleting: Bool) {
         removing.bytes -= bytes
         removing.items -= items
         if deleting {
+            removing.progressBytes = 0
             removing.deleting -= items
             removing.deletingBytes -= bytes
+            if removing.deleting == 0 { removing.startedBytes = 0 }
         }
     }
 

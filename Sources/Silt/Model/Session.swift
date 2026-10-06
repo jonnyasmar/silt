@@ -2168,7 +2168,9 @@ final class Session: Identifiable {
                 var measured = SpaceSplit()
                 let open = items.first.map { SpaceSplit.openFiles(on: $0.url.deletingLastPathComponent().path) } ?? []
                 for t in items {
-                    let (problem, split) = Self.quarantineAndDelete(t, measuring: listing, open: open)
+                    let (problem, split) = Self.quarantineAndDelete(t, measuring: listing, open: open) { f in
+                        Task { @MainActor in ledger.progress(Int64(Double(t.size) * f)) }
+                    }
                     if let problem { failures[t.url] = problem }
                     if let split { measured.add(split) }
                     await MainActor.run { ledger.endRemoving(bytes: t.size, items: 1, deleting: true) }
@@ -2206,7 +2208,8 @@ final class Session: Identifiable {
     /// untouched. Returns a problem description (nil on success) and the
     /// measure of what went (nil unless all of it did).
     nonisolated private static func quarantineAndDelete(_ t: Target, measuring listing: SnapshotListing?,
-                                                        open: [UInt64]) -> (problem: String?, split: SpaceSplit?) {
+                                                        open: [UInt64], progress: @escaping @Sendable (Double) -> Void)
+        -> (problem: String?, split: SpaceSplit?) {
         let path = t.url.path
         let volume = "It’s another volume mounted there, so it was left alone."
         guard !isVolumeRoot(path) else { return (volume, nil) }
@@ -2222,15 +2225,26 @@ final class Session: Identifiable {
             return ("It changed on disk after you confirmed, so it was left alone.", nil)
         }
         let split = SpaceSplit.measure(parked, listing: listing, open: open)
-        do {
-            try FileManager.default.removeItem(atPath: parked)
-            return (nil, split)
-        } catch {
-            // Partly deleted: put what's left back where the user expects it.
-            // What did go isn't counted: better to under-promise.
-            _ = renamex_np(parked, path, UInt32(RENAME_EXCL))
-            return (error.localizedDescription, nil)
+        // Deleted file by file, with how far it's got every quarter second.
+        let done = UnsafeMutablePointer<UInt64>.allocate(capacity: 1)
+        done.initialize(to: 0)
+        defer { done.deallocate() }
+        let total = Double(max(1, split?.items ?? 1))
+        let ticker = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        ticker.schedule(deadline: .now() + 0.25, repeating: 0.25)
+        let counter = UInt(bitPattern: done)
+        ticker.setEventHandler {
+            let n = silt_load_count(UnsafePointer(bitPattern: counter))
+            progress(min(1, Double(n) / total))
         }
+        ticker.resume()
+        let err = silt_remove_tree(parked, done)
+        ticker.cancel()
+        if err == 0 { return (nil, split) }
+        // Partly deleted: put what's left back where the user expects it.
+        // What did go isn't counted: better to under-promise.
+        _ = renamex_np(parked, path, UInt32(RENAME_EXCL))
+        return (String(cString: strerror(err)), nil)
     }
 
     private func refreshParents(of items: [Target]) {

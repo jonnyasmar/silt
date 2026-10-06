@@ -416,6 +416,7 @@ typedef struct silt_measure {
   int64_t shared;
   int64_t in_use; // open in a running app: freed only once it's closed
   uint64_t files;
+  uint64_t dirs; // folders under it (itself included)
   uint32_t unreadable; // folders that couldn't be opened
   bool complete;
 } silt_measure;
@@ -424,6 +425,12 @@ typedef struct silt_measure {
 bool silt_measure_path(const char *path, const int64_t *cutoffs, uint32_t k, int64_t *buckets,
                        const uint64_t *open_inodes, uint32_t open_count, double deadline_seconds,
                        silt_measure *out);
+
+// Deletes `path` and everything under it (removefile), adding one to
+// `*done` for each file or folder removed, for another thread to read with
+// silt_load_count. Returns 0, or the errno that stopped it.
+int silt_remove_tree(const char *path, uint64_t *done);
+uint64_t silt_load_count(const uint64_t *count);
 
 // The inodes of files on device `dev` that the user's processes hold open
 // (sorted, deduplicated, at most `cap`). Returns how many.
