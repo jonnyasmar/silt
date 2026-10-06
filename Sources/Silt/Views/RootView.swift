@@ -615,10 +615,14 @@ struct PathBar: View {
     var body: some View {
         let _ = session.version
         let crumbs = chain()
-        let total = session.tree.withLock { () -> (Int64, Int) in
+        let scanned = session.tree.withLock { () -> (Int64, Int) in
             let d = session.tree.dir(session.focus)
             return (session.tree.entry(d.entry).size, Int(d.items))
         }
+        // A volume's top level lists the space no folder accounts for as a
+        // row of its own: the total counts it too, so it adds up to the rows
+        // (and to the volume's used space).
+        let total = (scanned.0 + (session.focus == 0 ? session.unseenBytes : 0), scanned.1)
         HStack(spacing: 2) {
             ForEach(Array(crumbs.enumerated()), id: \.element.id) { i, c in
                 if i > 0 {
