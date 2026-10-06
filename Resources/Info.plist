@@ -4,48 +4,8 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
-	<key>CFBundleExecutable</key>
-	<string>Silt</string>
-	<key>CFBundleIconFile</key>
-	<string>AppIcon</string>
-	<key>CFBundleIconName</key>
-	<string>AppIcon</string>
-	<key>CFBundleIdentifier</key>
-	<string>com.jonnyasmar.silt</string>
-	<key>CFBundleInfoDictionaryVersion</key>
-	<string>6.0</string>
-	<key>CFBundleName</key>
-	<string>Silt</string>
 	<key>CFBundleDisplayName</key>
 	<string>Silt</string>
-	<key>CFBundlePackageType</key>
-	<string>APPL</string>
-	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
-	<key>CFBundleVersion</key>
-	<string>1</string>
-	<key>LSMinimumSystemVersion</key>
-	<string>15.0</string>
-	<key>LSApplicationCategoryType</key>
-	<string>public.app-category.utilities</string>
-	<key>NSHighResolutionCapable</key>
-	<true/>
-	<key>NSSupportsAutomaticTermination</key>
-	<false/>
-	<key>NSHumanReadableCopyright</key>
-	<string>© 2026 Jonny Asmar</string>
-	<key>NSDesktopFolderUsageDescription</key>
-	<string>Silt measures how much space your files use.</string>
-	<key>NSDocumentsFolderUsageDescription</key>
-	<string>Silt measures how much space your files use.</string>
-	<key>NSDownloadsFolderUsageDescription</key>
-	<string>Silt measures how much space your files use.</string>
-	<key>NSRemovableVolumesUsageDescription</key>
-	<string>Silt measures how much space your files use.</string>
-	<key>NSNetworkVolumesUsageDescription</key>
-	<string>Silt measures how much space your files use.</string>
-	<key>NSAppleEventsUsageDescription</key>
-	<string>Silt asks Finder to empty the Trash when you tell it to.</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>
@@ -62,5 +22,45 @@
 			</array>
 		</dict>
 	</array>
+	<key>CFBundleExecutable</key>
+	<string>Silt</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.jonnyasmar.silt</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Silt</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.2.0</string>
+	<key>CFBundleVersion</key>
+	<string>2</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>15.0</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Silt asks Finder to empty the Trash when you tell it to.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Silt measures how much space your files use.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Silt measures how much space your files use.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Silt measures how much space your files use.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>© 2026 Jonny Asmar</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Silt measures how much space your files use.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Silt measures how much space your files use.</string>
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
 </dict>
 </plist>
